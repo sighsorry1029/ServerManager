@@ -1,0 +1,317 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')"/>
+    <Import Project="environment.props"/>
+    <PropertyGroup>
+        <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+        <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+        <ProjectGuid>{4358610B-F3F4-4843-B7AF-98B7BC60DCDE}</ProjectGuid>
+        <OutputType>Library</OutputType>
+        <AppDesignerFolder>Properties</AppDesignerFolder>
+        <RootNamespace>ServerManager</RootNamespace>
+        <AssemblyName>ServerManager</AssemblyName>
+        <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+        <FileAlignment>512</FileAlignment>
+        <LangVersion>10.0</LangVersion>
+        <Nullable>enable</Nullable>
+        <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+        <ILRepackTargetsFile>$(MSBuildThisFileDirectory)Build\Bundle.targets</ILRepackTargetsFile>
+    </PropertyGroup>
+    <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+        <PlatformTarget>AnyCPU</PlatformTarget>
+        <DebugSymbols>true</DebugSymbols>
+        <DebugType>full</DebugType>
+        <Optimize>false</Optimize>
+        <OutputPath>bin\Debug\</OutputPath>
+        <DefineConstants>DEBUG;TRACE</DefineConstants>
+        <ErrorReport>prompt</ErrorReport>
+        <WarningLevel>4</WarningLevel>
+    </PropertyGroup>
+    <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+        <PlatformTarget>AnyCPU</PlatformTarget>
+        <DebugSymbols>false</DebugSymbols>
+        <DebugType>pdbonly</DebugType>
+        <Optimize>true</Optimize>
+        <OutputPath>bin\Release\</OutputPath>
+        <DefineConstants>TRACE</DefineConstants>
+        <ErrorReport>prompt</ErrorReport>
+        <WarningLevel>4</WarningLevel>
+    </PropertyGroup>
+    <Choose>
+        <When Condition="($(OS) == 'Unix' OR $(OS) == 'OSX') AND $(GamePath) == ''">
+            <PropertyGroup>
+                <GamePath Condition="!Exists('$(GamePath)')">$(HOME)/.steam/steam/steamapps/common/Valheim</GamePath>
+                <GamePath Condition="!Exists('$(GamePath)')">$(HOME)/Library/Application Support/Steam/steamapps/common/Valheim/Contents/MacOS</GamePath>
+                <CorlibPath Condition="!Exists('$(CorlibPath)') AND Exists('$(GamePath)')">$(GamePath)\valheim_Data\Managed</CorlibPath>
+                <CorlibPath Condition="!Exists('$(CorlibPath)')">$(GamePath)/unstripped_corelib</CorlibPath>
+            </PropertyGroup>
+        </When>
+        <When Condition="($(OS) == 'Windows_NT') AND $(GamePath) == ''">
+            <PropertyGroup>
+                <GamePath Condition="!Exists('$(GamePath)')">$([MSBuild]::GetRegistryValueFromView('HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 892970', 'InstallLocation', null, RegistryView.Registry64, RegistryView.Registry32))</GamePath>
+                <_SteamLibraryPath>$([MSBuild]::GetRegistryValueFromView('HKEY_CURRENT_USER\SOFTWARE\Valve\Steam', 'SteamPath', null, RegistryView.Registry32))</_SteamLibraryPath>
+                <GamePath Condition="!Exists('$(GamePath)') AND '$(_SteamLibraryPath)' != ''">$(_SteamLibraryPath)\steamapps\common\Valheim</GamePath>
+                <GamePath Condition="!Exists('$(GamePath)') AND Exists('$(ValheimGamePath)')">$(ValheimGamePath)</GamePath>
+                <GamePath Condition="!Exists('$(GamePath)')">C:\Program Files\Steam\steamapps\common\Valheim</GamePath>
+                <GamePath Condition="!Exists('$(GamePath)')">C:\Program Files (x86)\Steam\steamapps\common\Valheim</GamePath>
+                <GamePath Condition="!Exists('$(GamePath)')">D:\SteamLibrary\steamapps\common\Valheim</GamePath>
+                <BepInExPath Condition="!Exists('$(BepInExPath)')AND Exists('$(GamePath)')">$(GamePath)\BepInEx</BepInExPath>
+                <CorlibPath Condition="!Exists('$(CorlibPath)') AND Exists('$(GamePath)')">$(GamePath)\valheim_Data\Managed</CorlibPath>
+                <CorlibPath Condition="!Exists('$(CorlibPath)') AND Exists('$(GamePath)')">$(GamePath)\unstripped_corlib</CorlibPath>
+            </PropertyGroup>
+        </When>
+    </Choose>
+    <PropertyGroup>
+        <!-- Derive dependent paths only after GamePath has been resolved, so an
+             explicit cross-platform GamePath cannot inherit Windows defaults. -->
+        <GamePath Condition="'$(GamePath)' == '' And '$(ValheimGamePath)' != ''">$(ValheimGamePath)</GamePath>
+        <BepInExPath Condition="'$(BepInExPath)' == '' And '$(GamePath)' != ''">$([System.IO.Path]::Combine('$(GamePath)', 'BepInEx'))</BepInExPath>
+        <CorlibPath Condition="'$(CorlibPath)' == '' And '$(GamePath)' != ''">$([System.IO.Path]::Combine('$(GamePath)', 'valheim_Data', 'Managed'))</CorlibPath>
+    </PropertyGroup>
+    <ItemGroup>
+        <Reference Include="0Harmony">
+            <HintPath>$(BepInExPath)\core\0Harmony.dll</HintPath>
+        </Reference>
+        <Reference Include="assembly_utils">
+            <HintPath>$(CorlibPath)\assembly_utils.dll</HintPath>
+        </Reference>
+        <Reference Include="assembly_guiutils">
+            <HintPath>$(CorlibPath)\assembly_guiutils.dll</HintPath>
+        </Reference>
+        <Reference Include="assembly_valheim">
+            <HintPath>$(CorlibPath)\assembly_valheim.dll</HintPath>
+        </Reference>
+        <Reference Include="BepInEx">
+            <HintPath>$(BepInExPath)\core\BepInEx.dll</HintPath>
+        </Reference>
+        <Reference Include="com.rlabrecque.steamworks.net">
+            <HintPath>$(CorlibPath)\com.rlabrecque.steamworks.net.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
+        <Reference Include="Mono.Cecil">
+            <HintPath>$(BepInExPath)\core\Mono.Cecil.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
+        <Reference Include="netstandard">
+            <HintPath>$(CorlibPath)\netstandard.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
+        <Reference Include="System"/>
+        <Reference Include="System.Core"/>
+        <Reference Include="System.Net.Http"/>
+        <Reference Include="Newtonsoft.Json">
+            <HintPath>$(PkgNewtonsoft_Json)\lib\net45\Newtonsoft.Json.dll</HintPath>
+            <Private>true</Private>
+        </Reference>
+        <Reference Include="YamlDotNet">
+            <HintPath>$(PkgYamlDotNet)\lib\net47\YamlDotNet.dll</HintPath>
+            <Private>true</Private>
+        </Reference>
+        <Reference Include="Cronos">
+            <HintPath>$(PkgCronos)\lib\net45\Cronos.dll</HintPath>
+            <Private>true</Private>
+        </Reference>
+        <Reference Include="UnityEngine">
+            <HintPath>$(CorlibPath)\UnityEngine.dll</HintPath>
+        </Reference>
+        <Reference Include="UnityEngine.CoreModule">
+            <HintPath>$(CorlibPath)\UnityEngine.CoreModule.dll</HintPath>
+        </Reference>
+        <Reference Include="UnityEngine.PhysicsModule">
+            <HintPath>$(CorlibPath)\UnityEngine.PhysicsModule.dll</HintPath>
+        </Reference>
+        <Reference Include="UnityEngine.IMGUIModule">
+            <HintPath>$(CorlibPath)\UnityEngine.IMGUIModule.dll</HintPath>
+        </Reference>
+        <Reference Include="UnityEngine.ImageConversionModule">
+            <HintPath>$(CorlibPath)\UnityEngine.ImageConversionModule.dll</HintPath>
+        </Reference>
+        <Reference Include="UnityEngine.TextRenderingModule">
+            <HintPath>$(CorlibPath)\UnityEngine.TextRenderingModule.dll</HintPath>
+        </Reference>
+        <Reference Include="UnityEngine.UI">
+            <HintPath>$(CorlibPath)\UnityEngine.UI.dll</HintPath>
+        </Reference>
+        <Reference Include="Unity.TextMeshPro">
+            <HintPath>$(GamePath)\valheim_Data\Managed\Unity.TextMeshPro.dll</HintPath>
+        </Reference>
+    </ItemGroup>
+    <ItemGroup>
+        <Compile Include="ClientMenuBranding.cs"/>
+        <Compile Include="Plugin.cs"/>
+        <Compile Include="LocalizationManager.cs"/>
+        <Compile Include="ServerSettings.cs"/>
+        <Compile Include="Properties\AssemblyInfo.cs"/>
+        <Compile Include="RuntimePatches.cs"/>
+        <Compile Include="AntiCheat\**\*.cs"/>
+        <Compile Include="Character\**\*.cs"/>
+        <Compile Include="Commands\**\*.cs"/>
+        <Compile Include="Discord\**\*.cs"/>
+        <Compile Include="Events\**\*.cs"/>
+        <Compile Include="Integrity\**\*.cs"/>
+        <Compile Include="Networking\**\*.cs"/>
+        <Compile Include="PlayerLogging\**\*.cs"/>
+        <Compile Include="Scheduling\**\*.cs"/>
+    </ItemGroup>
+    <ItemGroup>
+        <EmbeddedResource Include="translations\*.yml"/>
+        <EmbeddedResource Include="LICENSE.txt">
+            <LogicalName>ServerManager.LICENSE.txt</LogicalName>
+        </EmbeddedResource>
+        <EmbeddedResource Include="THIRD_PARTY_NOTICES.md">
+            <LogicalName>ServerManager.THIRD_PARTY_NOTICES.md</LogicalName>
+        </EmbeddedResource>
+        <Content Include=".gitignore"/>
+        <Content Include="environment.props"/>
+        <Content Include="LICENSE.txt"/>
+        <Content Include="README.md"/>
+        <Content Include="Thunderstore\CHANGELOG.md"/>
+        <Content Include="Thunderstore\icon.png"/>
+        <Content Include="Thunderstore\manifest.json"/>
+        <Content Include="UpdateManifest.ps1"/>
+    </ItemGroup>
+    <ItemGroup>
+        <None Include="Tests\RuntimeSecuritySmoke.ps1"/>
+        <None Include="Tests\PlayerLocalizationSmoke.ps1"/>
+        <None Include="Tests\AdminStatCapSmoke.ps1"/>
+        <None Include="Tests\CharacterSavePipelineSmoke.ps1"/>
+        <None Include="Tests\PoisonPersistenceSmoke.ps1"/>
+        <None Include="Tests\PoisonPersistenceSmoke.cs"/>
+        <None Include="Tests\CharacterCreationAdminSmoke.ps1"/>
+        <None Include="Tests\DeathCauseSmoke.ps1"/>
+        <None Include="Tests\DeathCauseSmoke.cs"/>
+        <None Include="Tests\EventMessageSmoke.ps1"/>
+        <None Include="Tests\EventMessageSmoke.cs"/>
+        <None Include="Tests\OperationalKickSmoke.ps1"/>
+        <None Include="Tests\CommonCommandsSmoke.ps1"/>
+        <None Include="Tests\AdminCommandTransportSmoke.ps1"/>
+        <None Include="Tests\CharacterAdminSmoke.ps1"/>
+        <None Include="Tests\CharacterInventoryFastPathSmoke.ps1"/>
+        <None Include="Tests\CharacterShadowCheckpointSmoke.ps1"/>
+        <None Include="Tests\LocalHostCharacterServiceSmoke.ps1"/>
+        <None Include="Tests\LocalHostCharacterSmoke.ps1"/>
+        <None Include="Tests\CharacterDirectStorageSmoke.ps1"/>
+        <None Include="Tests\CharacterSemanticPolicySplitSmoke.ps1"/>
+        <None Include="Tests\CharacterSemanticValidationSmoke.ps1"/>
+        <None Include="Tests\IntegritySmoke.ps1"/>
+        <None Include="Tests\ManifestPreparationSmoke.ps1"/>
+        <None Include="Tests\ManifestPreparationSmoke.cs"/>
+        <None Include="Tests\ClientMenuBrandingSmoke.ps1"/>
+        <None Include="Tests\OptionalMod*.ps1"/>
+        <None Include="Tests\OptionalMod*.cs"/>
+        <None Include="Tests\Fixtures\OptionalModQueryFixture.cs"/>
+        <None Include="Tests\LogoUrlSmoke.ps1"/>
+        <None Include="Tests\LogoUrlSmoke.cs"/>
+        <None Include="Tests\RuntimeMemberAccessSmoke.ps1"/>
+        <None Include="Tests\PlayerTelemetryLogWriterSmoke.ps1"/>
+        <None Include="Tests\PlayerActivityIntegrationSmoke.ps1"/>
+        <None Include="Tests\ChatLoggingSmoke.ps1"/>
+        <None Include="Tests\Run-SmokeTests.ps1"/>
+        <None Include="Tests\ItemDataPresetsSmoke.ps1"/>
+        <None Include="Tests\ItemDataPresetsSmoke.cs"/>
+        <None Include="Tests\CharacterItemDataGrantSmoke.ps1"/>
+        <None Include="Tests\CharacterItemDataGrantSmoke.cs"/>
+        <None Include="Tests\ConfigurationSurfaceSmoke.ps1"/>
+        <None Include="Tests\ServerSettingsSmoke.ps1"/>
+        <None Include="Tests\ServerPlayerCapacitySmoke.ps1"/>
+        <None Include="Tests\PluginIncompatibilitySmoke.ps1"/>
+        <None Include="Tests\ServerSchedule*.ps1"/>
+        <None Include="Tests\ServerSchedule*.cs"/>
+        <None Include="Tests\UpgradeWorldSchedule*.ps1"/>
+        <None Include="Tests\UpgradeWorldSchedule*.cs"/>
+        <None Include="Tests\ServerConsoleExecutorSmoke.ps1"/>
+        <None Include="Tests\ServerConsoleExecutorSmoke.cs"/>
+        <None Include="Tests\ServerSettingsSmoke.cs"/>
+        <None Include="Tests\CharacterStarterItemsSmoke.ps1"/>
+        <None Include="Tests\CharacterStarterItemsHarness.cs"/>
+        <None Include="Tests\CharacterAuditSmoke.ps1"/>
+        <None Include="Tests\RaidEventsSmoke.ps1"/>
+        <None Include="Tests\Discord*.ps1"/>
+        <None Include="Tests\Discord*.cs"/>
+    </ItemGroup>
+    <ItemGroup>
+        <PackageReference Include="Newtonsoft.Json" Version="13.0.4" GeneratePathProperty="true"/>
+        <PackageReference Include="YamlDotNet" Version="18.1.0" GeneratePathProperty="true"/>
+        <PackageReference Include="Cronos" Version="0.13.0" GeneratePathProperty="true"/>
+        <PackageReference Include="ILRepack.Lib.MSBuild.Task" Version="2.0.46" PrivateAssets="all"/>
+    </ItemGroup>
+    <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
+    <Target Name="GetAssemblyVersion" AfterTargets="Build">
+        <GetAssemblyIdentity AssemblyFiles="$(TargetPath)">
+            <Output TaskParameter="Assemblies" ItemName="Targets"/>
+        </GetAssemblyIdentity>
+        <ItemGroup>
+            <AssemblyVersions Include="@(Targets->'%(Version)')"/>
+        </ItemGroup>
+        <Error Text="Failed to get Assembly Version." Condition="'%(AssemblyVersions.Identity)' == ''"/>
+        <PropertyGroup>
+            <AssemblyVersion>%(AssemblyVersions.Identity)</AssemblyVersion>
+            <Major>$(AssemblyVersion.Split('.')[0])</Major>
+            <Minor>$(AssemblyVersion.Split('.')[1])</Minor>
+            <Patch>$(AssemblyVersion.Split('.')[2])</Patch>
+            <PackageName>$(AssemblyName)_v$(Major).$(Minor).$(Patch)</PackageName>
+            <PackageVersion>$(Major).$(Minor).$(Patch)</PackageVersion>
+            <VersionString>$(Major).$(Minor).$(Patch)</VersionString>
+            <PackageDir>$(ProjectDir)\Thunderstore\$(PackageName)</PackageDir>
+            <NexusPackageDir>$(ProjectDir)\Nexus\$(PackageName)</NexusPackageDir>
+        </PropertyGroup>
+    </Target>
+    <Target Name="CopyOutputDLL" AfterTargets="GetAssemblyVersion">
+        <Error Text="DLL not found in target directory." Condition="!Exists('$(TargetDir)$(AssemblyName).dll')"/>
+        <Copy SourceFiles="$(TargetDir)$(AssemblyName).dll" DestinationFolder="$(CopyOutputDLLPath)" OverwriteReadOnlyFiles="true"/>
+        <Copy SourceFiles="$(TargetDir)$(AssemblyName).dll" DestinationFolder="$(CopyOutputDLLPath2)" OverwriteReadOnlyFiles="true" Condition="Exists('$(CopyOutputDLLPath2)')"/>
+        <Copy SourceFiles="$(TargetDir)$(AssemblyName).dll" DestinationFolder="$(CopyOutputDLLPath3)" OverwriteReadOnlyFiles="true" Condition="Exists('$(CopyOutputDLLPath3)')"/>
+    </Target>
+    <Target Name="MakeThunderstorePackage" DependsOnTargets="GetAssemblyVersion" Condition=" ('$(Configuration)|$(Platform)' == 'Release|AnyCPU') And ('$(OS)' == 'Windows_NT') ">
+        <Error Text="ServerManager.dll was not built before packaging." Condition="!Exists('$(TargetDir)$(AssemblyName).dll')"/>
+        <Error Text="README.md not found in project directory; refusing to create an incomplete release package." Condition="!Exists('$(ProjectDir)README.md')"/>
+        <Error Text="manifest.json not found in Thunderstore directory." Condition="!Exists('$(ProjectDir)\Thunderstore\manifest.json')"/>
+        <Error Text="icon.png not found in Thunderstore directory. Please note that Thunderstore requires this image to be 256x256 in dimension" Condition="!Exists('$(ProjectDir)\Thunderstore\icon.png')"/>
+        <Error Text="CHANGELOG.md not found in Thunderstore directory." Condition="!Exists('$(ProjectDir)\Thunderstore\CHANGELOG.md')"/>
+        <Error Text="English.yml not found in translations directory." Condition="!Exists('$(ProjectDir)\translations\English.yml')"/>
+        <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)UpdateManifest.ps1&quot; -manifestFile &quot;$(ProjectDir)Thunderstore\manifest.json&quot; -versionString &quot;$(PackageVersion)&quot;"/>
+        <RemoveDir Directories="$(PackageDir)" Condition="Exists('$(PackageDir)')"/>
+        <MakeDir Directories="$(PackageDir)"/>
+        <ItemGroup>
+            <PackageFiles Include="$(TargetDir)$(AssemblyName).dll"/>
+            <PackageFiles Include="$(ProjectDir)\Thunderstore\CHANGELOG.md"/>
+            <PackageFiles Include="$(ProjectDir)\Thunderstore\icon.png"/>
+            <PackageFiles Include="$(ProjectDir)\Thunderstore\manifest.json"/>
+            <PackageFiles Include="$(ProjectDir)\README.md"/>
+        </ItemGroup>
+        <Copy SourceFiles="@(PackageFiles)" DestinationFolder="$(PackageDir)"/>
+        <Copy SourceFiles="$(ProjectDir)translations\English.yml" DestinationFiles="$(PackageDir)\ServerManager.English.yml"/>
+        <ZipDirectory SourceDirectory="$(PackageDir)" DestinationFile="Thunderstore\$(PackageName).zip" Overwrite="true"/>
+        <RemoveDir Directories="$(PackageDir)"/>
+    </Target>
+    <Target Name="MakeNexusPackage" DependsOnTargets="GetAssemblyVersion" Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+        <Error Text="ServerManager.dll was not built before packaging." Condition="!Exists('$(TargetDir)$(AssemblyName).dll')"/>
+        <MakeDir Directories="$(ProjectDir)\Nexus"/>
+        <RemoveDir Directories="$(NexusPackageDir)" Condition="Exists('$(NexusPackageDir)')"/>
+        <MakeDir Directories="$(NexusPackageDir)"/>
+        <Copy SourceFiles="$(TargetDir)$(AssemblyName).dll" DestinationFolder="$(NexusPackageDir)"/>
+        <ZipDirectory SourceDirectory="$(NexusPackageDir)" DestinationFile="Nexus\$(PackageName).zip" Overwrite="true"/>
+        <RemoveDir Directories="$(NexusPackageDir)"/>
+    </Target>
+    <Target Name="PackageRelease" AfterTargets="Build"
+            DependsOnTargets="GetAssemblyVersion;MakeThunderstorePackage;MakeNexusPackage"
+            Condition="'$(Configuration)|$(Platform)' == 'Release|AnyCPU' And '$(DesignTimeBuild)' != 'true'"/>
+    <!-- Deploy only the final bundled plugin after a successful Debug build.
+         Ordinary builds and DeployToGame=false leave the game installation alone. -->
+    <Target Name="DeployDebugToGame" AfterTargets="Build" DependsOnTargets="BundleServerManager"
+            Condition="'$(Configuration)' == 'Debug' And '$(DeployToGame)' == 'true' And '$(DesignTimeBuild)' != 'true'">
+        <PropertyGroup>
+            <DeployToGamePath Condition="'$(DeployToGamePath)' == ''">$(BepInExPath)\plugins</DeployToGamePath>
+        </PropertyGroup>
+        <Error Text="Final ServerManager DLL is missing; game deployment was skipped." Condition="!Exists('$(TargetPath)')"/>
+        <Error Text="BepInEx directory is missing; game deployment was skipped." Condition="!Exists('$(BepInExPath)')"/>
+        <MakeDir Directories="$(DeployToGamePath)"/>
+        <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DeployToGamePath)" OverwriteReadOnlyFiles="true"/>
+        <Message Importance="high" Text="Debug plugin deployed: $(DeployToGamePath)\$(TargetFileName)"/>
+    </Target>
+    <Target Name="ValidatePackConfiguration">
+        <Error Text="Pack requires Configuration=Release and Platform=AnyCPU." Condition=" '$(Configuration)|$(Platform)' != 'Release|AnyCPU' "/>
+    </Target>
+    <Target Name="Pack" DependsOnTargets="ValidatePackConfiguration;Build;MakeThunderstorePackage;MakeNexusPackage"/>
+
+</Project>

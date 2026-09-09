@@ -1,0 +1,35 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Always start from the compiler's unmerged obj output. Never repack an
+       already bundled bin DLL on incremental builds. The normal bin artifact
+       and every deployment/package target therefore contain the same DLL. -->
+  <Target Name="BundleServerManager" AfterTargets="CopyFilesToOutputDirectory"
+          BeforeTargets="GetAssemblyVersion;CopyOutputDLL"
+          Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <_RawServerManager>$(IntermediateOutputPath)$(TargetFileName)</_RawServerManager>
+      <_BundledServerManager>$(IntermediateOutputPath)bundled\$(TargetFileName)</_BundledServerManager>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_RawServerManager)')" Text="Unmerged compiler output is missing."/>
+    <Error Condition="!Exists('$(TargetDir)Newtonsoft.Json.dll')" Text="Newtonsoft.Json dependency is missing; restore packages before building."/>
+    <Error Condition="!Exists('$(TargetDir)YamlDotNet.dll')" Text="YamlDotNet dependency is missing; restore packages before building."/>
+    <Error Condition="!Exists('$(TargetDir)Cronos.dll')" Text="Cronos dependency is missing; restore packages before building."/>
+    <ItemGroup>
+      <_ServerManagerBundleInput Include="$(_RawServerManager)"/>
+      <_ServerManagerBundleInput Include="$(TargetDir)Newtonsoft.Json.dll"/>
+      <_ServerManagerBundleInput Include="$(TargetDir)YamlDotNet.dll"/>
+      <_ServerManagerBundleInput Include="$(TargetDir)Cronos.dll"/>
+      <_ServerManagerBundleLibrary Include="$(TargetDir)"/>
+      <_ServerManagerBundleLibrary Include="$(BepInExPath)\core"/>
+      <_ServerManagerBundleLibrary Include="$(CorlibPath)"/>
+    </ItemGroup>
+    <MakeDir Directories="$(IntermediateOutputPath)bundled"/>
+    <ILRepack Parallel="false" Internalize="true" DebugInfo="false"
+              InputAssemblies="@(_ServerManagerBundleInput)"
+              OutputFile="$(_BundledServerManager)"
+              TargetKind="SameAsPrimaryAssembly"
+              LibraryPath="@(_ServerManagerBundleLibrary)"/>
+    <Copy SourceFiles="$(_BundledServerManager)" DestinationFiles="$(TargetPath)"/>
+    <ItemGroup><FileWrites Include="$(_BundledServerManager)"/></ItemGroup>
+    <Message Importance="high" Text="Single-DLL ServerManager bundled: $(TargetPath)"/>
+  </Target>
+</Project>

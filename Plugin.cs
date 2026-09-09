@@ -1,204 +1,234 @@
-﻿using System;
+using System;
 using System.IO;
-using System.Linq;
 using System.Reflection;
-using System.Timers;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
-using JetBrains.Annotations;
-using ServerSync;
 using UnityEngine;
 
-namespace ServerSyncModTemplate;
+namespace ServerManager;
 
-[BepInPlugin(ModGUID, ModName, ModVersion)]
-public class ServerSyncModTemplatePlugin : BaseUnityPlugin
+[BepInPlugin(ModGuid, ModName, ModVersion)]
+[BepInIncompatibility("Azumatt.MaxPlayerCount")]
+[BepInDependency("sighsorry.Clan", BepInDependency.DependencyFlags.SoftDependency)]
+[BepInDependency("upgrade_world", BepInDependency.DependencyFlags.SoftDependency)]
+public sealed class ServerManagerPlugin : BaseUnityPlugin
 {
-    internal const string ModName = "ServerSyncModTemplate";
+    internal const string ModName = "ServerManager";
     internal const string ModVersion = "1.0.0";
-    internal const string Author = "{Azumatt}";
-    private const string ModGUID = $"{Author}.{ModName}";
-    private static string ConfigFileName = $"{ModGUID}.cfg";
-    private static string ConfigFileFullPath = Paths.ConfigPath + Path.DirectorySeparatorChar + ConfigFileName;
-    internal static string ConnectionError = "";
-    private readonly Harmony _harmony = new(ModGUID);
-    public static readonly ManualLogSource ServerSyncModTemplateLogger = BepInEx.Logging.Logger.CreateLogSource(ModName);
-    private static readonly ConfigSync ConfigSync = new(ModGUID) { DisplayName = ModName, CurrentVersion = ModVersion, MinimumRequiredVersion = ModVersion };
-    private FileSystemWatcher _watcher;
-    private readonly object _reloadLock = new();
-    private DateTime _lastConfigReloadTime;
-    private const long RELOAD_DELAY = 10000000; // One second
+    internal const string Author = "sighsorry";
+    internal const string ModGuid = "sighsorry.ServerManager";
+    internal const bool DefaultEnforceModPolicy = true;
 
-    public enum Toggle
-    {
-        On = 1,
-        Off = 0
-    }
+    internal static ManualLogSource Log { get; private set; } = null!;
+    internal static string ConnectionError { get; set; } = string.Empty;
 
-    public void Awake()
+    internal static ConfigEntry<string> BrandingServerAddress { get; private set; } = null!;
+    internal static ConfigEntry<string> BrandingServerPassword { get; private set; } = null!;
+    internal static ConfigEntry<string> BrandingButtonText { get; private set; } = null!;
+    internal static ConfigEntry<string> BrandingLogoPath { get; private set; } = null!;
+    internal static ConfigEntry<bool> ShowEventNotifications { get; private set; } = null!;
+
+    internal static string DataRoot => ServerDataRoot.ActivePath;
+    internal static string CharacterRoot => Path.Combine(DataRoot, "characters");
+
+    private readonly Harmony _harmony = new(ModGuid);
+    private bool _shuttingDown;
+    private bool _quitHandlerRegistered;
+
+    private void Awake()
     {
+        Log = Logger;
+
         bool saveOnSet = Config.SaveOnConfigSet;
         Config.SaveOnConfigSet = false;
-
-        // Uncomment the line below to use the LocalizationManager for localizing your mod.
-        // Make sure to populate the English.yml file in the translation folder with your keys to be localized and the values associated before uncommenting!.
-        //Localizer.Load(); // Use this to initialize the LocalizationManager (for more information on LocalizationManager, see the LocalizationManager documentation https://github.com/blaxxun-boop/LocalizationManager#example-project).
-
-        _serverConfigLocked = config("1 - General", "Lock Configuration", Toggle.On, "If on, the configuration is locked and can be changed by server admins only.");
-        _ = ConfigSync.AddLockingConfigEntry(_serverConfigLocked);
-
-
-        Assembly assembly = Assembly.GetExecutingAssembly();
-        _harmony.PatchAll(assembly);
-        SetupWatcher();
-
-        Config.Save();
-        if (saveOnSet)
+        try
+        {
+            BindConfiguration();
+            Config.Save();
+        }
+        finally
         {
             Config.SaveOnConfigSet = saveOnSet;
+        }
+
+        bool runtimeInitialized = false;
+        bool wantsToQuitHooked = false;
+        bool quittingHooked = false;
+        try
+        {
+            PlayerLocalizer.Initialize();
+            ServerManagerRuntime.Initialize();
+            runtimeInitialized = true;
+            _harmony.PatchAll(Assembly.GetExecutingAssembly());
+            ServerManagerTerminalCommands.EnsureRegistered();
+            Application.wantsToQuit += OnWantsToQuit;
+            wantsToQuitHooked = true;
+            Application.quitting += OnQuitting;
+            quittingHooked = true;
+            _quitHandlerRegistered = true;
+            Log.LogInfo($"{ModName} {ModVersion} initialized without a preloader patcher.");
+        }
+        catch (Exception exception)
+        {
+            Log.LogFatal($"Failed to initialize {ModName}: {exception}");
+            if (quittingHooked)
+            {
+                Application.quitting -= OnQuitting;
+            }
+
+            if (wantsToQuitHooked)
+            {
+                Application.wantsToQuit -= OnWantsToQuit;
+            }
+
+            _quitHandlerRegistered = false;
+            try
+            {
+                _harmony.UnpatchSelf();
+            }
+            catch (Exception cleanupException) when (
+                !IntegrityCanonical.IsFatal(cleanupException))
+            {
+                Log.LogWarning(
+                    "ServerManager patch rollback failed: " +
+                    cleanupException.Message);
+            }
+
+            if (runtimeInitialized)
+            {
+                try
+                {
+                    ServerManagerRuntime.Shutdown();
+                }
+                catch (Exception cleanupException) when (
+                    !IntegrityCanonical.IsFatal(cleanupException))
+                {
+                    Log.LogWarning(
+                        "ServerManager runtime rollback failed: " +
+                        cleanupException.Message);
+                }
+            }
+
+            throw;
+        }
+    }
+
+    private void Update()
+    {
+        if (!_shuttingDown)
+        {
+            ServerManagerRuntime.Tick();
         }
     }
 
     private void OnDestroy()
     {
-        SaveWithRespectToConfigSet();
-        _watcher?.Dispose();
-    }
-
-    private void SetupWatcher()
-    {
-        _watcher = new FileSystemWatcher(Paths.ConfigPath, ConfigFileName);
-        _watcher.Changed += ReadConfigValues;
-        _watcher.Created += ReadConfigValues;
-        _watcher.Renamed += ReadConfigValues;
-        _watcher.IncludeSubdirectories = true;
-        _watcher.SynchronizingObject = ThreadingHelper.SynchronizingObject;
-        _watcher.EnableRaisingEvents = true;
-    }
-
-    private void ReadConfigValues(object sender, FileSystemEventArgs e)
-    {
-        DateTime now = DateTime.Now;
-        long time = now.Ticks - _lastConfigReloadTime.Ticks;
-        if (time < RELOAD_DELAY)
+        if (_shuttingDown)
         {
             return;
         }
 
-        lock (_reloadLock)
+        _shuttingDown = true;
+        try
         {
-            if (!File.Exists(ConfigFileFullPath))
+            if (_quitHandlerRegistered)
             {
-                ServerSyncModTemplateLogger.LogWarning("Config file does not exist. Skipping reload.");
-                return;
+                Application.wantsToQuit -= OnWantsToQuit;
+                Application.quitting -= OnQuitting;
+                _quitHandlerRegistered = false;
             }
 
             try
             {
-                ServerSyncModTemplateLogger.LogDebug("Reloading configuration...");
-                SaveWithRespectToConfigSet(true);
-                ServerSyncModTemplateLogger.LogInfo("Configuration reload complete.");
+                ServerManagerRuntime.Shutdown();
             }
-            catch (Exception ex)
+            finally
             {
-                ServerSyncModTemplateLogger.LogError($"Error reloading configuration: {ex.Message}");
+                ConnectionErrorPanelPresentation.Shutdown();
+                ClientMenuBranding.Shutdown();
             }
         }
-
-        _lastConfigReloadTime = now;
-    }
-
-    private void SaveWithRespectToConfigSet(bool reload = false)
-    {
-        bool originalSaveOnSet = Config.SaveOnConfigSet;
-        Config.SaveOnConfigSet = false;
-        if (reload)
-            Config.Reload();
-        Config.Save();
-        if (originalSaveOnSet)
+        finally
         {
-            Config.SaveOnConfigSet = originalSaveOnSet;
-        }
-        
-        // If you want to do something once localization completes, LocalizationManager has a hook for that.
-        /*Localizer.OnLocalizationComplete += () =>
-        {
-            // Do something
-            ItemManagerModTemplateLogger.LogDebug("OnLocalizationComplete called");
-        };*/
-    }
-
-
-    #region ConfigOptions
-
-    private static ConfigEntry<Toggle> _serverConfigLocked = null!;
-
-    private ConfigEntry<T> config<T>(string group, string name, T value, ConfigDescription description, bool synchronizedSetting = true)
-    {
-        ConfigDescription extendedDescription = new(description.Description + (synchronizedSetting ? " [Synced with Server]" : " [Not Synced with Server]"), description.AcceptableValues, description.Tags);
-        ConfigEntry<T> configEntry = Config.Bind(group, name, value, extendedDescription);
-        //var configEntry = Config.Bind(group, name, value, description);
-
-        SyncedConfigEntry<T> syncedConfigEntry = ConfigSync.AddConfigEntry(configEntry);
-        syncedConfigEntry.SynchronizedConfig = synchronizedSetting;
-
-        return configEntry;
-    }
-
-    private ConfigEntry<T> config<T>(string group, string name, T value, string description, bool synchronizedSetting = true)
-    {
-        return config(group, name, value, new ConfigDescription(description), synchronizedSetting);
-    }
-
-    private class ConfigurationManagerAttributes
-    {
-        [UsedImplicitly] public int? Order = null!;
-        [UsedImplicitly] public bool? Browsable = null!;
-        [UsedImplicitly] public string? Category = null!;
-        [UsedImplicitly] public Action<ConfigEntryBase>? CustomDrawer = null!;
-    }
-
-    class AcceptableShortcuts() : AcceptableValueBase(typeof(KeyboardShortcut))
-    {
-        public override object Clamp(object value) => value;
-        public override bool IsValid(object value) => true;
-
-        public override string ToDescriptionString() => $"# Acceptable values: {string.Join(", ", UnityInput.Current.SupportedKeyCodes)}";
-    }
-
-    #endregion
-}
-
-public static class KeyboardExtensions
-{
-    extension(KeyboardShortcut shortcut)
-    {
-        public bool IsKeyDown()
-        {
-            return shortcut.MainKey != KeyCode.None && Input.GetKeyDown(shortcut.MainKey) && shortcut.Modifiers.All(Input.GetKey);
-        }
-
-        public bool IsKeyHeld()
-        {
-            return shortcut.MainKey != KeyCode.None && Input.GetKey(shortcut.MainKey) && shortcut.Modifiers.All(Input.GetKey);
+            _harmony.UnpatchSelf();
         }
     }
-}
 
-public static class ToggleExtentions
-{
-    extension(ServerSyncModTemplatePlugin.Toggle value)
+    private bool OnWantsToQuit()
     {
-        public bool IsOn()
-        {
-            return value == ServerSyncModTemplatePlugin.Toggle.On;
-        }
+        return ServerManagerRuntime.BeforeApplicationQuit();
+    }
 
-        public bool IsOff()
-        {
-            return value == ServerSyncModTemplatePlugin.Toggle.Off;
-        }
+    private void OnQuitting()
+    {
+        ServerManagerRuntime.BeforeApplicationQuitting();
+    }
+
+    private void BindConfiguration()
+    {
+        BrandingServerAddress = Bind(
+            "1 - Client",
+            "Server Address",
+            string.Empty,
+            "Dedicated Steamworks host or IP with an optional port, for example " +
+            "example.com:2456. A missing port defaults to 2456. For a Steam local-host server, " +
+            "use steam:<host Steam64 ID>, not a lobby ID or IP address. Optional preview requires " +
+            "Steam friendship, a visible Valheim lobby and ServerManager on the host. Empty or invalid values leave the " +
+            "vanilla Start flow unchanged. Client-local; restart after editing. " +
+            "Hold Alt while clicking Start for the world/server menu; this never bypasses server security.", 5);
+
+        BrandingServerPassword = Bind(
+            "1 - Client",
+            "Server Password",
+            string.Empty,
+            "Optional password submitted through Valheim's normal handshake. Leave empty to " +
+            "show the vanilla password prompt. A configured value is stored as plaintext in " +
+            "this BepInEx config file and is never synchronized by ServerManager.", 4);
+
+        BrandingButtonText = Bind(
+            "1 - Client",
+            "Server Button Text",
+            "Start Modded Valheim Server",
+            "Literal text used for the main-menu Start button and the character Start button " +
+            "while the configured server flow is active. Restart the client after changing it.", 3);
+
+        BrandingLogoPath = Bind(
+            "1 - Client",
+            "Logo Path",
+            "https://i.ibb.co/23XsG7tz/download.png",
+            "PNG path relative to BepInEx (for example plugins/MyModpack/logo.png), or an " +
+            "HTTPS URL returning PNG data. Local folders are not searched. HTTPS loads in the " +
+            "background with a 30-second total timeout, an 8 MiB limit and a last-good cache " +
+            "under Valheim's local save path/ServerManager/cache/logos. Failures keep the cached or vanilla logo. " +
+            "Absolute file paths, escaping paths, HTTP URLs, URL credentials and fragments " +
+            "are rejected. Leave empty for the vanilla logo. Restart the client after changing it.", 2);
+
+        ShowEventNotifications = Bind(
+            "1 - Client",
+            "Show Event Notifications",
+            true,
+            "Show ServerManager announcements, deaths, PvP and boss kills at the top center. " +
+            "Client-local; Config Manager changes apply immediately. " +
+            "Turning this off clears visible messages without affecting server logs, Discord " +
+            "webhooks or vanilla messages. Direct file edits require a client restart.", 1);
+    }
+
+    // Read by Configuration Manager through ConfigDescription.Tags; no hard dependency.
+    private sealed class ConfigurationManagerAttributes
+    {
+        public int? Order;
+    }
+
+    private ConfigEntry<T> Bind<T>(
+        string section,
+        string key,
+        T defaultValue,
+        string description,
+        int order)
+    {
+        return Config.Bind(section, key, defaultValue,
+            new ConfigDescription(description, null, new ConfigurationManagerAttributes { Order = order }));
     }
 }

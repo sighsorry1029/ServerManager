@@ -5,4 +5,10 @@ riderModule.iml
 /_ReSharper.Caches/
 .idea/
 .vs/
-ServerSyncModTemplate.sln.DotSettings.user
+/artifacts/
+/Nexus/
+/Thunderstore/*.zip
+/Thunderstore/*_v*/
+# Server-only Discord credentials must never be distributed with source or modpacks.
+**/discord.cfg
+**/discord.yml

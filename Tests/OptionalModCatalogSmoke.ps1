@@ -1,0 +1,53 @@
+param(
+    [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$GamePath = 'C:\Program Files (x86)\Steam\steamapps\common\Valheim',
+    [string]$Configuration = 'Debug'
+)
+$ErrorActionPreference = 'Stop'
+$frameworkPath = Join-Path ${env:ProgramFiles(x86)} 'Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8'
+$sdkLine = @(& dotnet --list-sdks | Select-Object -Last 1)[0]
+if ($sdkLine -notmatch '^([^ ]+) \[(.+)\]$') { throw 'A modern .NET SDK is required.' }
+$compiler = Join-Path (Join-Path $Matches[2] $Matches[1]) 'Roslyn\bincore\csc.dll'
+$cecilPath = Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll'
+$bepPath = Join-Path $GamePath 'BepInEx\core\BepInEx.dll'
+$temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
+$testDirectory = Join-Path $temporaryRoot ('ServerManager-OptionalCatalog-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $testDirectory | Out-Null
+$ownedProcess = $null
+try {
+    $harness = Join-Path $testDirectory 'OptionalModCatalogSmoke.exe'
+    $compileArgs = @($compiler, '/nologo', '/noconfig', '/nostdlib+', '/langversion:10.0', '/nullable:enable', '/target:exe', "/out:$harness",
+        ("/reference:" + (Join-Path $frameworkPath 'mscorlib.dll')),
+        ("/reference:" + (Join-Path $frameworkPath 'System.dll')),
+        ("/reference:" + (Join-Path $frameworkPath 'System.Core.dll')),
+        "/reference:$cecilPath", "/reference:$bepPath",
+        (Join-Path $ProjectRoot 'Integrity\IntegrityModels.cs'),
+        (Join-Path $ProjectRoot 'Integrity\IntegrityPolicyStore.cs'),
+        (Join-Path $ProjectRoot 'Integrity\ReferencePluginPolicyScanner.cs'),
+        (Join-Path $ProjectRoot 'Integrity\OptionalModCatalog.cs'),
+        (Join-Path $ProjectRoot 'Tests\OptionalModCatalogSmoke.cs'))
+    & dotnet @compileArgs
+    if ($LASTEXITCODE -ne 0) { throw "Optional catalog harness compilation failed ($LASTEXITCODE)." }
+    Copy-Item -LiteralPath $cecilPath -Destination (Join-Path $testDirectory 'Mono.Cecil.dll')
+    Copy-Item -LiteralPath $bepPath -Destination (Join-Path $testDirectory 'BepInEx.dll')
+    $stdout = Join-Path $testDirectory 'stdout.txt'
+    $stderr = Join-Path $testDirectory 'stderr.txt'
+    $ownedProcess = Start-Process -FilePath $harness -ArgumentList ('"' + (Join-Path $testDirectory 'data') + '"') -WorkingDirectory $testDirectory -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+    $null = $ownedProcess.Handle
+    $finished = $ownedProcess.WaitForExit(45000)
+    if (-not $finished) { $ownedProcess.Kill(); $null = $ownedProcess.WaitForExit(5000) }
+    if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -TotalCount 100 }
+    if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -TotalCount 100 }
+    if (-not $finished) { throw 'Optional catalog test timed out; only its owned helper was stopped.' }
+    if ($ownedProcess.ExitCode -ne 0) { throw "Optional catalog test failed ($($ownedProcess.ExitCode))." }
+}
+finally {
+    if ($null -ne $ownedProcess -and -not $ownedProcess.HasExited) { $ownedProcess.Kill(); $null = $ownedProcess.WaitForExit(5000) }
+    if ($null -ne $ownedProcess) { $ownedProcess.Dispose() }
+    $resolved = [IO.Path]::GetFullPath($testDirectory)
+    if (-not $resolved.StartsWith($temporaryRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+        (Split-Path -Parent $resolved) -ne $temporaryRoot -or (Split-Path -Leaf $resolved) -notmatch '^ServerManager-OptionalCatalog-[0-9a-f]{32}$') {
+        throw 'Refusing to remove an unexpected optional catalog test directory.'
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+}
