@@ -4,8 +4,8 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using ServerManager.Configuration;
 using YamlDotNet.Core;
-using YamlDotNet.Core.Events;
 using YamlDotNet.RepresentationModel;
 
 namespace ServerManager.Discord;
@@ -110,7 +110,7 @@ internal sealed class DiscordSettings
         try
         {
             using StringReader reader = new(yaml);
-            document.Load(new BoundedParser(reader));
+            document.Load(new BoundedYamlParser(reader, 16384, 16, Invalid));
         }
         catch (YamlException exception)
         {
@@ -373,30 +373,6 @@ internal sealed class DiscordSettings
 
     private static InvalidDataException Invalid(string reason) =>
         new("Discord YAML configuration: " + reason + ".");
-
-    // Bound the event stream before the YAML model allocates or resolves nodes.
-    private sealed class BoundedParser : IParser
-    {
-        private readonly Parser _inner;
-        private int _events, _depth, _documents;
-        internal BoundedParser(TextReader reader) => _inner = new Parser(reader);
-        public ParsingEvent? Current => _inner.Current;
-        public bool MoveNext()
-        {
-            if (!_inner.MoveNext()) return false;
-            if (++_events > 16384) throw Invalid("YAML event limit exceeded");
-            ParsingEvent? value = Current;
-            if (value is AnchorAlias || value is NodeEvent node && (!node.Anchor.IsEmpty || !node.Tag.IsEmpty))
-                throw Invalid("YAML anchors, aliases and explicit tags are not supported");
-            if (value is DocumentStart && ++_documents > 1) throw Invalid("multiple YAML documents are not supported");
-            if (value is MappingStart || value is SequenceStart)
-            {
-                if (++_depth > 16) throw Invalid("YAML nesting exceeds 16 levels");
-            }
-            else if (value is MappingEnd || value is SequenceEnd) --_depth;
-            return true;
-        }
-    }
 
     private const string DefaultYaml = @"# Server-only UTF-8. Keep bot tokens and webhook URLs private.
 # Valid edits reload automatically; invalid edits keep the active settings.

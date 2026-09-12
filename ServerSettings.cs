@@ -8,8 +8,8 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using ServerManager.Configuration;
 using YamlDotNet.Core;
-using YamlDotNet.Core.Events;
 using YamlDotNet.RepresentationModel;
 
 namespace ServerManager;
@@ -82,7 +82,7 @@ internal sealed class ServerSettings
         try
         {
             using StringReader reader = new(yaml);
-            stream.Load(new BoundedParser(reader));
+            stream.Load(new BoundedYamlParser(reader, 4096, 8, Invalid));
         }
         catch (YamlException exception)
         {
@@ -285,29 +285,6 @@ internal sealed class ServerSettings
     }
 
     internal static InvalidDataException Invalid(string reason) => new("ServerManager.yml: " + reason + ".");
-
-    private sealed class BoundedParser : IParser
-    {
-        private readonly Parser _inner;
-        private int _events, _depth, _documents;
-        internal BoundedParser(TextReader reader) => _inner = new Parser(reader);
-        public ParsingEvent? Current => _inner.Current;
-        public bool MoveNext()
-        {
-            if (!_inner.MoveNext()) return false;
-            if (++_events > 4096) throw Invalid("YAML event limit exceeded");
-            ParsingEvent? value = Current;
-            if (value is AnchorAlias || value is NodeEvent node && (!node.Anchor.IsEmpty || !node.Tag.IsEmpty))
-                throw Invalid("YAML anchors, aliases and explicit tags are not supported");
-            if (value is DocumentStart && ++_documents > 1) throw Invalid("multiple YAML documents are not supported");
-            if (value is MappingStart || value is SequenceStart)
-            {
-                if (++_depth > 8) throw Invalid("YAML nesting exceeds 8 levels");
-            }
-            else if (value is MappingEnd || value is SequenceEnd) --_depth;
-            return true;
-        }
-    }
 
     internal const string DefaultYaml = @"# ServerManager server settings. Keep this file on the server only.
 # UTF-8 YAML. Existing files/comments are never rewritten or imported from cfg.

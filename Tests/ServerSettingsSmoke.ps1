@@ -26,6 +26,7 @@ try {
         ("/reference:" + (Join-Path $frameworkPath 'System.dll')),
         ("/reference:" + (Join-Path $frameworkPath 'System.Core.dll')),
         "/reference:$YamlDotNetPath",
+        (Join-Path $ProjectRoot 'Configuration\BoundedYamlParser.cs'),
         (Join-Path $ProjectRoot 'ServerSettings.cs'),
         (Join-Path $ProjectRoot 'Tests\ServerSettingsSmoke.cs')
     )

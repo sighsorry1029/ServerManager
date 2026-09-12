@@ -141,6 +141,7 @@
         <Compile Include="Plugin.cs"/>
         <Compile Include="LocalizationManager.cs"/>
         <Compile Include="ServerSettings.cs"/>
+        <Compile Include="Configuration\**\*.cs"/>
         <Compile Include="Properties\AssemblyInfo.cs"/>
         <Compile Include="RuntimePatches.cs"/>
         <Compile Include="AntiCheat\**\*.cs"/>
