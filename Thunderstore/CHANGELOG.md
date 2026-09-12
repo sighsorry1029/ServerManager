@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.6
+
+- Centralized YAML safety checks while retaining each configuration's existing limits and behavior.
+- Simplified internal connection-session identity checks without changing authentication or character handling.
+
 ## 1.0.5
 
 - Preserved Valheim's used-cheats achievement flag for auditing without rejecting otherwise valid character revisions.
