@@ -20,6 +20,7 @@ try {
         $compileArgs += '/reference:' + (Join-Path $frameworkPath $name)
     }
     $compileArgs += @("/reference:$YamlDotNetPath", "/reference:$JsonPath",
+        (Join-Path $ProjectRoot 'Configuration\BoundedYamlParser.cs'),
         (Join-Path $ProjectRoot 'Discord\DiscordSettings.cs'),
         (Join-Path $ProjectRoot 'Discord\DiscordCommands.cs'),
         (Join-Path $ProjectRoot 'Events\IntegrationApi.cs'),

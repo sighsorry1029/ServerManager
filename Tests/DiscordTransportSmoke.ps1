@@ -34,6 +34,7 @@ try {
         ("/resource:" + (Join-Path $ProjectRoot 'translations\English.yml') + ',ServerManager.translations.English.yml'),
         ("/resource:" + (Join-Path $ProjectRoot 'translations\Korean.yml') + ',ServerManager.translations.Korean.yml'),
         (Join-Path $ProjectRoot 'LocalizationManager.cs'),
+        (Join-Path $ProjectRoot 'Configuration\BoundedYamlParser.cs'),
         (Join-Path $ProjectRoot 'Discord\DiscordSettings.cs'),
         (Join-Path $ProjectRoot 'Discord\DiscordHttp.cs'),
         (Join-Path $ProjectRoot 'Discord\DiscordWebhooks.cs'),
