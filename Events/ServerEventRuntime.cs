@@ -2289,13 +2289,14 @@ namespace ServerManager.Events
                     return false;
                 }
 
-                string[] existing = ServerManager.Commands.ServerCommands.GetSteamListEntries(list.GetList(), accountId);
                 if (banned)
                 {
-                    if (existing.Length == 0) list.Add(accountId);
+                    string canonical = ServerManager.Commands.ServerCommands.GetCanonicalSteamListEntry(accountId);
+                    if (!list.GetList().Contains(canonical)) list.Add(canonical);
                 }
                 else
                 {
+                    string[] existing = ServerManager.Commands.ServerCommands.GetSteamListEntries(list.GetList(), accountId);
                     foreach (string entry in existing) list.Remove(entry);
                 }
 

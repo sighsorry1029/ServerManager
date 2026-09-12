@@ -65,24 +65,33 @@ if ((Test-Path -LiteralPath $starterGameAssembly) -and (Test-Path -LiteralPath $
         }
         $inventoryType = $starterDefinition.MainModule.Types | Where-Object Name -eq 'Inventory'
         $save = $inventoryType.Methods | Where-Object Name -eq 'Save'
-        $equipmentWrite = @($save.Body.Instructions | Where-Object {
-            $_.OpCode.Name -eq 'ldfld' -and $_.Operand.Name -eq 'm_equipped' -and
-            $_.Next.Operand -is [Mono.Cecil.MethodReference] -and $_.Next.Operand.Name -eq 'Write' -and
-            $_.Next.Operand.Parameters.Count -eq 1 -and
-            $_.Next.Operand.Parameters[0].ParameterType.FullName -eq 'System.Boolean'
-        })
-        Assert-Source ($equipmentWrite.Count -eq 1) 'Vanilla Inventory.Save must persist the m_equipped boolean.'
+        Assert-Source (@($save.Body.Instructions | Where-Object {
+            $_.Operand -is [Mono.Cecil.MethodReference] -and
+            $_.Operand.DeclaringType.FullName -eq 'ItemDrop/ItemData' -and $_.Operand.Name -eq 'Save'
+        }).Count -eq 1) 'Inventory.Save must delegate compact item serialization to ItemData.Save.'
+        $itemSave = $itemData.Methods | Where-Object Name -eq 'Save'
+        Assert-Source (@($itemSave.Body.Instructions | Where-Object {
+            $_.OpCode.Name -eq 'ldfld' -and $_.Operand.Name -eq 'm_equipped'
+        }).Count -eq 1 -and @($itemSave.Body.Instructions | Where-Object {
+            $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq 'Write' -and
+            $_.Operand.Parameters.Count -eq 1 -and $_.Operand.Parameters[0].ParameterType.FullName -eq 'System.Byte'
+        }).Count -ge 4) 'ItemData.Save must retain equipment intent in compact flags.'
+        $itemLoad = $itemData.Methods | Where-Object { $_.Name -eq 'Load' -and $_.Parameters.Count -eq 3 }
+        Assert-Source (@($itemLoad.Body.Instructions | Where-Object {
+            $_.OpCode.Name -eq 'stfld' -and $_.Operand.Name -eq 'm_equipped'
+        }).Count -eq 1) 'ItemData.Load must decode equipment intent.'
         $addLoadedItem = @($inventoryType.Methods | Where-Object {
-            $_.Name -eq 'AddItem' -and @($_.Parameters | Where-Object Name -eq 'equipped').Count -eq 1
+            $_.Name -eq 'AddItem' -and $_.Parameters[0].ParameterType.FullName -eq 'System.Int32' -and
+            @($_.Parameters | Where-Object Name -eq 'equipped').Count -eq 1
         })
         Assert-Source ($addLoadedItem.Count -eq 1 -and @($addLoadedItem[0].Body.Instructions | Where-Object {
             $_.OpCode.Name -eq 'stfld' -and $_.Operand.Name -eq 'm_equipped'
-        }).Count -eq 1) 'Vanilla loaded inventory construction must restore the equipment boolean.'
-        $inventoryLoad = $inventoryType.Methods | Where-Object Name -eq 'Load'
+        }).Count -eq 1) 'Loaded inventory construction must preserve decoded equipment intent.'
+        $inventoryLoad = $inventoryType.Methods | Where-Object { $_.Name -eq 'Load' -and $_.Parameters.Count -eq 1 }
         Assert-Source (@($inventoryLoad.Body.Instructions | Where-Object {
             $_.Operand -is [Mono.Cecil.MethodReference] -and
-            $_.Operand.FullName -eq $addLoadedItem[0].FullName
-        }).Count -ge 1) 'Vanilla Inventory.Load must pass serialized equipment flags to loaded item construction.'
+            $_.Operand.DeclaringType.FullName -eq 'ItemDrop/ItemData' -and $_.Operand.Name -eq 'Load'
+        }).Count -eq 1) 'Inventory.Load must consume compact item data.'
         $playerType = $starterDefinition.MainModule.Types | Where-Object Name -eq 'Player'
         $playerLoad = $playerType.Methods | Where-Object Name -eq 'Load'
         $loadInventory = @($playerLoad.Body.Instructions | Where-Object {

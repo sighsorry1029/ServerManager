@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'Valheim107Fixtures.ps1')
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -582,7 +583,7 @@ Assert-True (
         [Text.RegularExpressions.RegexOptions]::Singleline)) `
     "SaveWorldThread observation hooks can escape into vanilla, completion regressed to a success-only postfix, or the original exception is no longer preserved."
 Assert-True (
-    $patchSource.Contains('PrimarySaveSuccessLogPrefix = "World saved ( ";') -and
+    $patchSource.Contains('PrimarySaveSuccessLogPrefix = "World save (5/5) done. Total time [";') -and
     $patchSource.Contains("nameof(ServerManagerRuntime.MarkWorldSaveWorkerSucceeded)") -and
     $patchSource.Contains("anchorCount != 1 || insertionIndex < 0") -and
     [Text.RegularExpressions.Regex]::IsMatch(
@@ -1577,21 +1578,15 @@ try {
             [byte]$Marker
         )
 
-        $package = [Activator]::CreateInstance($zPackageType)
-        $zWriteInt.Invoke($package, [object[]]@([int]43)) | Out-Null
-        $zWriteInt.Invoke($package, [object[]]@([int]105)) | Out-Null
-        for ($index = 0; $index -lt 105; ++$index) {
-            $zWriteSingle.Invoke($package, [object[]]@([single]0)) | Out-Null
-        }
-        $zWriteBool.Invoke($package, [object[]]@($false)) | Out-Null
-        $zWriteInt.Invoke($package, [object[]]@([int]0)) | Out-Null
-        $zWriteString.Invoke($package, [object[]]@($CharacterName)) | Out-Null
-        $zWriteLong.Invoke($package, [object[]]@($PlayerId)) | Out-Null
-        [byte[]]$header = $zGetArray.Invoke($package, [object[]]@())
-        [byte[]]$payload = [byte[]]::new($header.Length + 1)
-        [Array]::Copy($header, $payload, $header.Length)
-        $payload[$payload.Length - 1] = $Marker
-        return ,$payload
+        $stream = [IO.MemoryStream]::new()
+        $writer = [IO.BinaryWriter]::new($stream)
+        try {
+            $writer.Write([int]46); [Valheim107Fixture]::Statistics($writer)
+            $writer.Write($false); $writer.Write([int]0)
+            $writer.Write($CharacterName); $writer.Write($PlayerId); $writer.Write($Marker)
+            $writer.Flush(); return ,$stream.ToArray()
+        } finally { $writer.Dispose(); $stream.Dispose() }
+
     }
 
     function New-Envelope {

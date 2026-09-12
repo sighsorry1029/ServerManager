@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading;
 using BepInEx.Bootstrap;
 using HarmonyLib;
+using ServerManager.Commands;
 using ServerManager.Events;
 using ServerManager.PlayerLogging;
 using Steamworks;
@@ -224,6 +225,8 @@ internal static partial class ServerManagerRuntime
 
         internal int ProcessedCallbackCount { get; set; }
 
+        internal int PendingCallbackCount { get; set; }
+
         internal bool CallbackOverflowed { get; set; }
 
         internal bool StaleCallbackCaptured { get; set; }
@@ -241,6 +244,10 @@ internal static partial class ServerManagerRuntime
         internal bool BeginAuthExecutionFaulted { get; set; }
 
         internal bool DuplicateBeginAuthInvocation { get; set; }
+
+        internal bool ReachedActive { get; set; }
+
+        internal bool ActiveRevocationCaptured { get; set; }
 
         internal EAuthSessionResponse LatestResponse { get; set; }
     }
@@ -565,12 +572,10 @@ internal static partial class ServerManagerRuntime
             try
             {
                 _pendingAdminManifests.Remove(peerIdentity.Rpc);
-                ZNet server = ZNet.instance;
-                bool adminCandidate = server != null && server.IsServer() &&
-                    IsCurrentServerAdmin(server, peerIdentity);
                 ManifestValidationDecision decision =
                     EnsureIntegrityService().ValidateForAdmission(
-                        peerIdentity, manifestPayload, adminCandidate,
+                        peerIdentity, manifestPayload,
+                        allowAuthenticatedAdminReview: true,
                         out IntegrityManifest? pendingManifest);
                 if (decision.Accepted && _libraryChecks.TryGetValue(peerIdentity.Rpc, out LibraryCheck libraries))
                 {
@@ -1276,6 +1281,11 @@ internal static partial class ServerManagerRuntime
 
     internal static bool BeforeNetworkStart(ZNet znet)
     {
+        if (!ReferenceEquals(znet, _unsafePlayerLoadNetwork))
+        {
+            _unsafePlayerLoadGame = null;
+            _unsafePlayerLoadNetwork = null;
+        }
         BeginOptionalModPublication(znet);
         CaptureLocalHostIntent(znet);
         if (ZNet.m_onlineBackend == OnlineBackendType.Steamworks)
@@ -1602,7 +1612,7 @@ internal static partial class ServerManagerRuntime
 
     internal static bool AllowLocalHostSave()
     {
-        return !_localHostStartupFailed &&
+        return !CharacterLoadSaveSuppressed && !_localHostStartupFailed &&
                (!_localHostRequested || LocalHostCharacterRuntime.IsActive);
     }
 
@@ -1850,7 +1860,7 @@ internal static partial class ServerManagerRuntime
                 return;
             }
 
-            if (attempt.EnqueuedCallbackCount >=
+            if (attempt.PendingCallbackCount >=
                     MaximumQueuedSteamCallbacksPerAttempt ||
                 Volatile.Read(
                     ref _queuedSteamAuthenticationCallbackCount) >=
@@ -1860,7 +1870,11 @@ internal static partial class ServerManagerRuntime
                 return;
             }
 
-            ++attempt.EnqueuedCallbackCount;
+            ++attempt.PendingCallbackCount;
+            if (attempt.EnqueuedCallbackCount < int.MaxValue)
+            {
+                ++attempt.EnqueuedCallbackCount;
+            }
             // Capture the attempt generation now. Looking up only by SteamID
             // in Tick could attach a stale callback to a rapid reconnect.
             Interlocked.Increment(
@@ -3147,6 +3161,53 @@ internal static partial class ServerManagerRuntime
                 : "invalid";
         return "raw_potential=" + measured + "; limit=" +
             limit.ToString("R", CultureInfo.InvariantCulture);
+    }
+
+    private static Game? _unsafePlayerLoadGame;
+    private static ZNet? _unsafePlayerLoadNetwork;
+
+    internal static bool CharacterLoadSaveBlocked => _unsafePlayerLoadGame is not null &&
+        ReferenceEquals(Game.instance, _unsafePlayerLoadGame);
+
+    // Also cover synchronous saves from other mods' Load postfixes, before
+    // our finalizer has a chance to handle a load failure.
+    internal static bool CharacterLoadSaveSuppressed => CharacterLoadSaveBlocked ||
+        (IsPlayerLoadInProgress && ShouldValidatePlayerLoad(Player.m_localPlayer));
+
+    internal static bool ShouldValidatePlayerLoad(Player player) =>
+        _initialized && !_shuttingDown && player != null &&
+        ReferenceEquals(player, Player.m_localPlayer) && Game.instance != null &&
+        (CharacterLoadSaveBlocked || LocalHostCharacterRuntime.IsActive ||
+         (_client is { Failed: false, ServerCharacterActive: true } session &&
+          ReferenceEquals(session.Network, ZNet.instance) &&
+          ReferenceEquals(session.ManagedProfile, ValheimPrivateAccess.GetGamePlayerProfile(Game.instance))));
+
+    internal static void RejectUnsafePlayerLoad(Exception error)
+    {
+        // Latch before logging, closing sessions or disconnecting. Keep this
+        // guard through StopAll/scene teardown; only a new network clears it.
+        if (CharacterLoadSaveBlocked) return;
+        _unsafePlayerLoadGame = Game.instance;
+        _unsafePlayerLoadNetwork = ZNet.instance;
+        _localHostFailureExitPending = true;
+        string notice = PlayerLocalizer.Text("sm_character_load_unsafe");
+        ServerManagerPlugin.ConnectionError = notice;
+        try
+        {
+            if (ZNet.instance != null && ZNet.instance.IsServer())
+            {
+                _localHostStartupFailed = true;
+                ValheimPrivateAccess.SetOpenServer(false);
+                LocalHostCharacterRuntime.Close();
+            }
+            else if (_client != null)
+                FailClient(_client.Rpc, "Character loading did not complete successfully.", error, notice);
+        }
+        finally
+        {
+            ServerManagerPlugin.ConnectionError = notice;
+            ServerManagerPlugin.Log.LogError("Character loading was aborted without saving; returning to the lobby. " + error);
+        }
     }
 
     internal static bool IsPlayerLoadInProgress => _inventoryLoadSuppressionDepth != 0;
@@ -5137,8 +5198,9 @@ internal static partial class ServerManagerRuntime
                 attempt.Phase != SteamAuthenticationPhase.Active ||
                 !ReferenceEquals(attempt.Rpc, rpc) ||
                 !ReferenceEquals(attempt.Peer, identity.Peer) ||
-                attempt.EnqueuedCallbackCount != 1 ||
-                attempt.ProcessedCallbackCount != 1 ||
+                !attempt.ReachedActive ||
+                attempt.EnqueuedCallbackCount < 1 ||
+                attempt.ProcessedCallbackCount < 1 ||
                 attempt.CallbackOverflowed ||
                 attempt.StaleCallbackCaptured ||
                 attempt.LateCallbackCaptured ||
@@ -5356,7 +5418,16 @@ internal static partial class ServerManagerRuntime
             // identity.HostId is derived from the currently connected Steam
             // socket and was revalidated immediately before this call. Never
             // accept an account ID or an admin claim from the report payload.
-            return server.IsAdmin(identity.HostId);
+            if (server.IsAdmin(identity.HostId)) return true;
+
+            // Valheim 1.0 maps Steam to display prefix V_ and its native
+            // ListContainsId overwrites an earlier bare/Steam_ match with the
+            // filtered lookup. Recheck the same live server-owned list so
+            // existing administrator files remain effective. This does not
+            // trust client data or grant a new source of authority.
+            return ServerCommands.GetSteamListEntries(
+                ValheimPrivateAccess.GetAdminList(server).GetList(),
+                identity.HostId).Length != 0;
         }
         catch (Exception exception)
             when (!IntegrityCanonical.IsFatal(exception))
@@ -5966,7 +6037,8 @@ internal static partial class ServerManagerRuntime
                 // A peer named after another account's numeric Steam64 could
                 // therefore redirect the ban. The identity here is already
                 // pinned to the live Steam socket, so write that exact value.
-                ValheimPrivateAccess.GetBannedList(server).Add(identity.HostId);
+                ValheimPrivateAccess.GetBannedList(server).Add(
+                    ServerCommands.GetCanonicalSteamListEntry(identity.HostId));
                 RecordDetectionResponse(identity, state, action, "banlist_add_returned");
             }
             catch (Exception exception)
@@ -8523,15 +8595,37 @@ internal static partial class ServerManagerRuntime
             SteamAuthenticationAttempt attempt = callbackEvent.Attempt;
             lock (SteamAuthenticationGate)
             {
+                if (attempt.PendingCallbackCount > 0)
+                {
+                    --attempt.PendingCallbackCount;
+                }
                 if (!IsCurrentSteamAuthenticationLocked(attempt) ||
                     attempt.Phase == SteamAuthenticationPhase.Rejected)
                 {
                     continue;
                 }
 
-                ++attempt.ProcessedCallbackCount;
+                if (attempt.ProcessedCallbackCount < int.MaxValue)
+                {
+                    ++attempt.ProcessedCallbackCount;
+                }
                 attempt.LatestResponse =
                     callbackEvent.Response.m_eAuthSessionResponse;
+
+                // ValidateAuthTicketResponse_t is also a lifetime status
+                // callback. Once the generation has reached Active, repeated
+                // OK notifications are harmless and the original handshake
+                // deadline no longer applies. A later non-OK response still
+                // revokes the active session below.
+                if (attempt.Phase == SteamAuthenticationPhase.Active)
+                {
+                    if (attempt.LatestResponse !=
+                        EAuthSessionResponse.k_EAuthSessionResponseOK)
+                    {
+                        attempt.ActiveRevocationCaptured = true;
+                    }
+                    continue;
+                }
                 if (attempt.ProcessedCallbackCount == 1)
                 {
                     attempt.FirstCallbackReceivedTimestamp =
@@ -8572,6 +8666,7 @@ internal static partial class ServerManagerRuntime
             bool rejectDuplicate = false;
             bool rejectPremature = false;
             bool rejectLate = false;
+            bool rejectRevoked = false;
             bool processFirstResponse = false;
             bool revokeActive = false;
             EAuthSessionResponse response =
@@ -8584,7 +8679,24 @@ internal static partial class ServerManagerRuntime
                     continue;
                 }
 
-                if (attempt.LateCallbackCaptured)
+                if (attempt.Phase == SteamAuthenticationPhase.Active)
+                {
+                    if (attempt.CallbackOverflowed)
+                    {
+                        rejectDuplicate = true;
+                        revokeActive = true;
+                    }
+                    else if (attempt.ActiveRevocationCaptured)
+                    {
+                        response = attempt.LatestResponse;
+                        rejectRevoked = true;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                }
+                else if (attempt.LateCallbackCaptured)
                 {
                     rejectLate = true;
                 }
@@ -8630,6 +8742,20 @@ internal static partial class ServerManagerRuntime
                         revokeActive
                             ? "Steam revoked the authenticated session."
                             : "Duplicate Steam authentication responses were rejected."),
+                    disconnectImmediately: true);
+                continue;
+            }
+
+            if (rejectRevoked)
+            {
+                ServerManagerPlugin.Log.LogWarning(
+                    "Steam revoked an active peer authentication with response " +
+                    response + ".");
+                RejectSteamAuthentication(
+                    attempt,
+                    new ProtocolRejection(
+                        ProtocolRejectCode.PeerInfoAuthenticationIncomplete,
+                        "Steam revoked the authenticated session."),
                     disconnectImmediately: true);
                 continue;
             }
@@ -8750,6 +8876,7 @@ internal static partial class ServerManagerRuntime
             }
 
             attempt.Phase = SteamAuthenticationPhase.Active;
+            attempt.ReachedActive = true;
         }
 
         ServerManagerPlugin.Log.LogInfo(
@@ -9574,7 +9701,7 @@ internal static partial class ServerManagerRuntime
     private static bool QuarantineIncompleteSteamAuthenticationLocked(
         SteamAuthenticationAttempt attempt)
     {
-        if (attempt.Phase == SteamAuthenticationPhase.Active ||
+        if (attempt.ReachedActive ||
             !attempt.BeginAuthInvocationObserved)
         {
             return false;

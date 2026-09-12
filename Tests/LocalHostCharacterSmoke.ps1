@@ -107,7 +107,7 @@ function Assert-FalseArgumentSkipsCall {
 }
 
 function Invoke-SaveGuardIl {
-    param($Method, [bool]$Failed, [bool]$Requested, [bool]$Active)
+    param($Method, [bool]$Failed, [bool]$Requested, [bool]$Active, [bool]$LoadSuppressed = $false)
     # Execute only this tiny boolean guard's IL with simulated state. Unknown
     # opcodes/calls fail the test; no plugin or Unity type is initialized.
     $stack = [Collections.Generic.Stack[int]]::new()
@@ -128,6 +128,11 @@ function Invoke-SaveGuardIl {
                 break
             }
             '^call$' {
+                if ($instruction.Operand.DeclaringType.FullName -eq 'ServerManager.ServerManagerRuntime' -and
+                    $instruction.Operand.Name -eq 'get_CharacterLoadSaveSuppressed') {
+                    $stack.Push([int]$LoadSuppressed)
+                    break
+                }
                 Assert-True ($instruction.Operand.DeclaringType.FullName -eq
                     'ServerManager.LocalHostCharacterRuntime' -and
                     $instruction.Operand.Name -eq 'get_IsActive') `
@@ -333,7 +338,7 @@ try {
     Assert-True ($shutdownCall.Previous.OpCode.Name -eq "ldarg.1") `
         "ContinueLogout no longer forwards the explicit save argument to Shutdown."
     $sceneLoad = Get-Call $continueLogout `
-        "SoftReferenceableAssets.SceneManagement.SceneManager" "LoadScene"
+        "SystemResourceManager" "FastLoadScene"
     Assert-True ($shutdownCall.Offset -lt $sceneLoad.Offset) `
         "ContinueLogout no longer finishes shutdown before returning to the lobby."
 
@@ -354,7 +359,7 @@ try {
         @(Get-Calls $stopAllBody "Game" "SavePlayerProfile").Count -eq 0) `
         "ZNet.StopAll now starts a save even on no-save shutdown."
 
-    $profileSave = Get-Method $game "Game" "SavePlayerProfile" 1
+    $profileSave = Get-Method $game "Game" "SavePlayerProfile" 2
     $capturePlayer = Get-Call $profileSave "PlayerProfile" "SavePlayerData"
     $saveSlot = Get-Call $profileSave "PlayerProfile" "Save"
     Assert-True ($capturePlayer.Offset -lt $saveSlot.Offset) `
@@ -448,10 +453,12 @@ try {
                 $actual = Invoke-SaveGuardIl $saveGuard $failed $requested $active
                 Assert-True ($actual -eq (-not $failed -and (-not $requested -or $active))) `
                     "Save guard violated failed=$failed, hosted=$requested, active=$active."
+                Assert-True (-not (Invoke-SaveGuardIl $saveGuard $failed $requested $active $true)) `
+                    "A suppressed character load must block saving for every host state."
             }
         }
     }
-    foreach ($spec in @(@("ServerManager.ManagedCharacterSavePatch", "Prefix", 0),
+    foreach ($spec in @(@("ServerManager.ManagedCharacterSavePatch", "Prefix", 2),
         @("ServerManager.ServerEventWorldSavePatch", "Prefix", 0),
         @($runtimeName, "BeforeGameShutdown", 1))) {
         $guarded = Get-Method $plugin $spec[0] $spec[1] $spec[2]

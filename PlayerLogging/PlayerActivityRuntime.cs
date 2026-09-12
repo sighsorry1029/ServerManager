@@ -45,9 +45,11 @@ internal static class PlayerActivityRuntime
     private static readonly long _inventorySnapshotTicks =
         SecondsToTicks(InventorySnapshotIntervalSeconds);
     private static readonly Dictionary<ZRpc, ActivityPeerState> Peers = new();
+    private static readonly Dictionary<int, string> ItemPrefabNames = new();
 
     private static PlayerTelemetryLogWriter? _writer;
     private static ActivityPeerState? _listenHost;
+    private static ObjectDB? _itemPrefabNameSource;
     private static bool _started;
     private static long _nextSweepTimestamp;
 
@@ -73,6 +75,7 @@ internal static class PlayerActivityRuntime
 
         Peers.Clear();
         _listenHost = null;
+        ResetItemPrefabNames();
         if (string.IsNullOrWhiteSpace(dataRoot))
         {
             throw new ArgumentException(
@@ -147,9 +150,19 @@ internal static class PlayerActivityRuntime
         CharacterSession? characterSession)
     {
         if (!_started || rpc == null || identity == null ||
-            !identity.HasAuthenticatedIdentity || Peers.ContainsKey(rpc) ||
-            !TryResolveAuthenticatedSteam64(rpc, identity, out string steamId))
+            !identity.HasAuthenticatedIdentity || Peers.ContainsKey(rpc))
         {
+            return;
+        }
+
+        if (!TryResolveAuthenticatedSteam64(rpc, identity, out string steamId))
+        {
+            // This callback is reached only after Ready passed the same final
+            // authentication boundary, so a mismatch here is operationally
+            // useful and should not disappear as a silent missing log.
+            ServerManagerPlugin.Log.LogWarning(
+                "Per-player activity log registration skipped because the " +
+                "final Steam identity could not be revalidated.");
             return;
         }
 
@@ -459,6 +472,7 @@ internal static class PlayerActivityRuntime
     {
         ServerEventRuntime.AuthenticatedPlayerDeathPublished -=
             OnAuthenticatedPlayerDeath;
+        ResetItemPrefabNames();
 
         if (!_started && _writer == null)
         {
@@ -1172,8 +1186,8 @@ internal static class PlayerActivityRuntime
                 continue;
             }
 
-            string message = prefix + " Inventory changed: " +
-                             Clip(prefab, 256) + " " +
+            string message = prefix + " Inv: " +
+                             InventoryDeltaItemName(prefab) + " " +
                              Invariant(oldValue) + " -> " +
                              Invariant(newValue) + ".";
             if (included >= MaximumInventoryEntries ||
@@ -1229,7 +1243,7 @@ internal static class PlayerActivityRuntime
         CharacterSemanticItemState item)
     {
         lines.Add(
-            "  - " + Clip(item.PrefabName, 256) +
+            "  - " + InventoryItemName(item) +
             (item.Stack == 1 ? string.Empty : " x" + Invariant(item.Stack)) +
             (item.Quality == 1 ? string.Empty : " Q" + Invariant(item.Quality)));
 
@@ -1245,6 +1259,86 @@ internal static class PlayerActivityRuntime
                 "      " + QuoteJsonString(pair.Key) + ": " +
                 QuoteJsonString(pair.Value));
         }
+    }
+
+    private static string InventoryItemName(CharacterSemanticItemState item)
+    {
+        if (!TryReadPrefabHashLabel(item.PrefabName, out int prefabHash) ||
+            prefabHash != item.PrefabHash)
+        {
+            return Clip(item.PrefabName, 256);
+        }
+
+        return ResolveInventoryItemName(prefabHash);
+    }
+
+    private static string InventoryDeltaItemName(string savedIdentity)
+    {
+        return TryReadPrefabHashLabel(savedIdentity, out int prefabHash)
+            ? ResolveInventoryItemName(prefabHash)
+            : Clip(savedIdentity, 256);
+    }
+
+    private static string ResolveInventoryItemName(int prefabHash)
+    {
+        try
+        {
+            ObjectDB? objectDb = ObjectDB.instance;
+            if (objectDb != null)
+            {
+                if (!ReferenceEquals(_itemPrefabNameSource, objectDb))
+                {
+                    ItemPrefabNames.Clear();
+                    _itemPrefabNameSource = objectDb;
+                }
+
+                if (ItemPrefabNames.TryGetValue(prefabHash, out string cached))
+                {
+                    return cached;
+                }
+
+                if (objectDb.TryGetItemPrefab(prefabHash, out GameObject prefab) &&
+                    prefab != null)
+                {
+                    string name = ClientEventObservation.CleanPrefabInstanceName(
+                        Clip(prefab.name, 256));
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        ItemPrefabNames[prefabHash] = name;
+                        return name;
+                    }
+                }
+            }
+        }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        {
+            // The ObjectDB can disappear during world teardown. Player logging
+            // remains best effort and keeps a stable identity for unresolved items.
+        }
+
+        return "unknown:" + unchecked((uint)prefabHash).ToString(
+            "X8", CultureInfo.InvariantCulture);
+    }
+
+    private static bool TryReadPrefabHashLabel(string value, out int prefabHash)
+    {
+        prefabHash = 0;
+        if (value.Length != 13 ||
+            !value.StartsWith("hash:", StringComparison.Ordinal) ||
+            !uint.TryParse(value.Substring(5), NumberStyles.HexNumber,
+                CultureInfo.InvariantCulture, out uint raw))
+        {
+            return false;
+        }
+
+        prefabHash = unchecked((int)raw);
+        return true;
+    }
+
+    private static void ResetItemPrefabNames()
+    {
+        ItemPrefabNames.Clear();
+        _itemPrefabNameSource = null;
     }
 
     private static string QuoteJsonString(string value)
@@ -1685,7 +1779,9 @@ internal static class PlayerActivityRuntime
         steamId = string.Empty;
         try
         {
-            if (ZNet.m_onlineBackend != OnlineBackendType.Steamworks ||
+            ZNet? server = ZNet.instance;
+            if (server == null || !server.IsServer() ||
+                ZNet.m_onlineBackend != OnlineBackendType.Steamworks ||
                 !ReferenceEquals(identity.Rpc, rpc) ||
                 identity.Peer == null ||
                 !ReferenceEquals(identity.Peer.m_rpc, rpc))
@@ -1693,16 +1789,29 @@ internal static class PlayerActivityRuntime
                 return false;
             }
 
-            ISocket? socket = identity.Peer.m_socket ?? rpc.GetSocket();
-            while (socket is BufferedWorldSocket buffered)
+            // Ready registration already passed this generation-bound final
+            // authentication gate. Resolve it again so the log key comes from
+            // the pinned Steam reservation, while allowing server-installed
+            // socket wrappers to remain around the live transport.
+            if (!ServerManagerRuntime.TryResolveActiveDetectionPeer(
+                    server,
+                    rpc,
+                    out ServerPeerIdentity current,
+                    out _) ||
+                !ReferenceEquals(current.Rpc, rpc) ||
+                !ReferenceEquals(current.Peer, identity.Peer) ||
+                !string.Equals(
+                    current.HostId,
+                    identity.HostId,
+                    StringComparison.Ordinal) ||
+                !PlayerTelemetryLogWriter.IsValidIndividualSteam64(
+                    current.HostId))
             {
-                socket = buffered.Original;
+                return false;
             }
 
-            return socket is ZSteamSocket steamSocket &&
-                   TryFormatIndividualSteam64(
-                       steamSocket.GetPeerID(),
-                       out steamId);
+            steamId = current.HostId;
+            return true;
         }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
         {

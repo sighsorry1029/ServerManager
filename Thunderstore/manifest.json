@@ -1,9 +1,9 @@
 {
   "name": "ServerManager",
-  "version_number": "1.0.0",
+  "version_number": "1.0.5",
   "website_url": "",
   "description": "Manage your Valheim server with approved mods, server-side characters, backups, player logs and Discord chat. Monitor suspicious activity, run admin commands, schedule tasks, and offer quick connect, a custom logo and optional mods in one plugin.",
   "dependencies": [
-    "denikson-BepInExPack_Valheim-5.4.2333"
+    "denikson-BepInExPack_Valheim-5.4.2350"
   ]
 }

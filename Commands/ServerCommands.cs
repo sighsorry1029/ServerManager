@@ -284,15 +284,18 @@ internal static class ServerCommands
         if (list == null) return Failure("list_unavailable", "The server list is unavailable.");
         if (a[1] == "list") return Success(a[0] + "_list", ListText(list.GetList()));
         bool add = a[1] == "add";
-        string[] existing = GetSteamListEntries(list.GetList(), a[2]);
         if (add)
         {
-            // Either native spelling already grants the same identity. Do not
-            // create an alias duplicate or rewrite existing configuration.
-            if (existing.Length == 0) list.Add(a[2]);
+            // Valheim 1.0 filters Steam to its display prefix (V_) during the
+            // final list lookup. Keep recognizing older literal spellings,
+            // but always ensure the spelling used by the current runtime is
+            // present so the game's own IsAdmin/IsAllowed checks agree.
+            string canonical = GetCanonicalSteamListEntry(a[2]);
+            if (!list.GetList().Contains(canonical)) list.Add(canonical);
         }
         else
         {
+            string[] existing = GetSteamListEntries(list.GetList(), a[2]);
             // SyncedList.Remove removes only one exact occurrence. Loaded
             // files may contain duplicates and both supported Steam spellings.
             foreach (string entry in existing) list.Remove(entry);
@@ -308,18 +311,32 @@ internal static class ServerCommands
         return Success(a[0] + "_updated", message);
     }
 
-    // Match only known literal spellings accepted by ZNet.ListContainsId.
+    // Match only known literal spellings used by Valheim across the Steam
+    // platform-prefix change. V_ is the current filtered/display spelling.
     // Preserve every occurrence so callers can remove duplicates one by one;
     // never reinterpret a numeric player name or migrate unrelated list entries.
     internal static string[] GetSteamListEntries(IEnumerable<string> entries, string accountId)
     {
-        string bare = accountId.StartsWith("Steam_", StringComparison.Ordinal)
-            ? accountId.Substring(6) : accountId;
+        string bare = StripSteamListPrefix(accountId);
         bool steam = IsSteam64(bare);
         return entries.Where(entry => string.Equals(entry, accountId, StringComparison.Ordinal) ||
             steam && (string.Equals(entry, bare, StringComparison.Ordinal) ||
-                      string.Equals(entry, "Steam_" + bare, StringComparison.Ordinal))).ToArray();
+                      string.Equals(entry, "Steam_" + bare, StringComparison.Ordinal) ||
+                      string.Equals(entry, "V_" + bare, StringComparison.Ordinal))).ToArray();
     }
+
+    internal static string GetCanonicalSteamListEntry(string accountId)
+    {
+        string bare = StripSteamListPrefix(accountId);
+        return IsSteam64(bare) ? "V_" + bare : accountId;
+    }
+
+    private static string StripSteamListPrefix(string accountId) =>
+        accountId.StartsWith("Steam_", StringComparison.Ordinal)
+            ? accountId.Substring(6)
+            : accountId.StartsWith("V_", StringComparison.Ordinal)
+                ? accountId.Substring(2)
+                : accountId;
 
     private static ServerManagerCommandResult EditKey(string[] a)
     {

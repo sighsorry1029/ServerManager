@@ -53,6 +53,11 @@ if (-not $SkipBuild) {
 
 $smokeTests = @(
     [pscustomobject]@{
+        Name = "Valheim 1.0.7 serialization compatibility"
+        File = "Valheim107CompatibilitySmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
         Name = "Optional mod catalog metadata and framing"
         File = "OptionalModCatalogSmoke.ps1"
         NeedsGamePath = $true
@@ -198,6 +203,16 @@ $smokeTests = @(
         NeedsGamePath = $false
     },
     [pscustomobject]@{
+        Name = "Character load failure protection"
+        File = "CharacterLoadValidationSmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
+        Name = "Valheim PeerInfo bounded preflight"
+        File = "PeerInfoPreflightSmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
         Name = "Integrity"
         File = "IntegritySmoke.ps1"
         NeedsGamePath = $true
@@ -339,6 +354,12 @@ $smokeTests += @(
     [pscustomobject]@{ Name = "Discord transport"; File = "DiscordTransportSmoke.ps1"; NeedsGamePath = $false },
     [pscustomobject]@{ Name = "Discord actual game Mono"; File = "DiscordMonoSmoke.ps1"; NeedsGamePath = $true }
 )
+
+$smokeTests += [pscustomobject]@{
+    Name = "Cecil control flow and guard mutations"
+    File = "CecilControlFlowSmoke.ps1"
+    NeedsGamePath = $true
+}
 
 foreach ($smokeTest in $smokeTests) {
     $scriptPath = Join-Path $PSScriptRoot $smokeTest.File

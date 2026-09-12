@@ -165,7 +165,7 @@ try {
     Assert-True ((Find-Method $effectType 'GetRemaningTime').ReturnType.FullName -eq 'System.Single') 'Installed remaining status duration API changed.'
     $effectsType = $vanilla.MainModule.Types | Where-Object FullName -eq 'SEMan'
     Assert-True (@($effectsType.Methods | Where-Object {
-        $_.Name -eq 'AddStatusEffect' -and $_.ReturnType.FullName -eq 'StatusEffect' -and $_.Parameters.Count -eq 4 -and
+        $_.Name -eq 'AddStatusEffect' -and $_.ReturnType.FullName -eq 'StatusEffect' -and $_.Parameters.Count -eq 5 -and
         $_.Parameters[0].ParameterType.FullName -eq 'System.Int32' -and $_.Parameters[1].ParameterType.FullName -eq 'System.Boolean'
     }).Count -eq 1) 'Installed poison creation overload changed.'
     Write-Host 'Installed vanilla poison/customData API assumptions passed (metadata only).'

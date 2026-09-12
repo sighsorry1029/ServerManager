@@ -407,9 +407,10 @@ $readerConstructorArguments[0] =
 $readerConstructorArguments[1] = [int]8192
 $dictionaryReader = $innerReaderConstructor.Invoke(
     $readerConstructorArguments)
-$readDictionaryArguments = [object[]]::new(2)
+$readDictionaryArguments = [object[]]::new(3)
 $readDictionaryArguments[0] = "item custom data"
 $readDictionaryArguments[1] = $null
+$readDictionaryArguments[2] = $false
 $semanticDictionary = $readSemanticDictionary.Invoke(
     $dictionaryReader,
     $readDictionaryArguments)

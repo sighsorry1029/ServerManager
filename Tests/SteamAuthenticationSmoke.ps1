@@ -297,6 +297,8 @@ function Prepare-Join {
 }
 function Assert-Activated([string]$Context) {
     Assert-True ((Get-Property $script:attempt 'Phase').ToString() -eq 'Active' -and
+        (Get-Property $script:attempt 'ReachedActive') -and
+        (Get-Property $script:attempt 'PendingCallbackCount') -eq 0 -and
         (Get-Property $script:attempt 'EnqueuedCallbackCount') -eq 1 -and (Get-Property $script:attempt 'ProcessedCallbackCount') -eq 1 -and
         [SteamAuthenticationEnvironment]::Completed -eq 1 -and
         [object]::ReferenceEquals([SteamAuthenticationEnvironment]::CompletedRpc, $script:rpc) -and
@@ -408,6 +410,60 @@ Prepare-Join
 [SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
 Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
 Assert-Denied 'HandshakeTimedOut' 'A late final callback bypassed the deadline.'
+
+# Steam may publish later lifetime status callbacks for an already active
+# session. A repeated OK after the handshake deadline must stay attached to
+# the same generation, while a later negative response must revoke it without
+# misclassifying the completed generation as an incomplete-auth quarantine.
+Reset-Fixture
+Prepare-Join
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+[SteamAuthenticationEnvironment]::Now = (Get-Property $attempt 'DeadlineTimestamp') + 1
+foreach ($repeat in 1..3) {
+    [SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+    Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+}
+Assert-True ((Get-Property $attempt 'Phase').ToString() -eq 'Active' -and
+    (Get-Property $attempt 'ReachedActive') -and
+    -not (Get-Property $attempt 'LateCallbackCaptured') -and
+    (Get-Property $attempt 'EnqueuedCallbackCount') -eq 4 -and
+    (Get-Property $attempt 'ProcessedCallbackCount') -eq 4 -and
+    [SteamAuthenticationEnvironment]::Completed -eq 1 -and
+    [SteamAuthenticationEnvironment]::Rejected -eq 0) `
+    'A repeated active-session OK was treated as a late or duplicate handshake callback.'
+Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
+$quarantinedIds = $script:runtime.GetField(
+    'QuarantinedIncompleteSteamIds', $script:static).GetValue($null)
+Assert-True ($null -ne $quarantinedIds -and
+    -not ($quarantinedIds.Contains($script:steamId.m_SteamID))) `
+    ('A cleanly removed active authentication generation was quarantined as incomplete. ' +
+     'reachedActive=' + (Get-Property $attempt 'ReachedActive') +
+     '; phase=' + (Get-Property $attempt 'Phase') +
+     '; quarantined=' + ($quarantinedIds -join ','))
+[SteamAuthenticationEnvironment]::Now += (3 * [Diagnostics.Stopwatch]::Frequency)
+Assert-True (New-Connection) 'A completed authentication generation could not reconnect after the callback drain window.'
+
+Reset-Fixture
+Prepare-Join
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+[SteamAuthenticationEnvironment]::Now = (Get-Property $attempt 'DeadlineTimestamp') + 1
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseAuthTicketCanceled)
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+Assert-True ((Get-Property $attempt 'Phase').ToString() -eq 'Rejected' -and
+    (Get-Property $attempt 'ReachedActive') -and
+    [SteamAuthenticationEnvironment]::Rejected -eq 1 -and
+    [SteamAuthenticationEnvironment]::RejectionCode -eq 'PeerInfoAuthenticationIncomplete') `
+    'A negative active-session Steam status did not revoke the session.'
+Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
+$quarantinedIds = $script:runtime.GetField(
+    'QuarantinedIncompleteSteamIds', $script:static).GetValue($null)
+Assert-True ($null -ne $quarantinedIds -and
+    -not ($quarantinedIds.Contains($script:steamId.m_SteamID))) `
+    'A revoked but previously active authentication generation was quarantined as incomplete.'
+[SteamAuthenticationEnvironment]::Now += (3 * [Diagnostics.Stopwatch]::Frequency)
+Assert-True (New-Connection) 'A previously active revoked generation could not reconnect after the callback drain window.'
 
 Reset-Fixture
 Prepare-Join

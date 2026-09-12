@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using BepInEx;
@@ -16,7 +17,7 @@ namespace ServerManager;
 public sealed class ServerManagerPlugin : BaseUnityPlugin
 {
     internal const string ModName = "ServerManager";
-    internal const string ModVersion = "1.0.0";
+    internal const string ModVersion = "1.0.5";
     internal const string Author = "sighsorry";
     internal const string ModGuid = "sighsorry.ServerManager";
     internal const bool DefaultEnforceModPolicy = true;
@@ -86,7 +87,7 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
             _quitHandlerRegistered = false;
             try
             {
-                _harmony.UnpatchSelf();
+                UnpatchOwnedPatches();
             }
             catch (Exception cleanupException) when (
                 !IntegrityCanonical.IsFatal(cleanupException))
@@ -113,6 +114,25 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
 
             throw;
         }
+    }
+
+    private void UnpatchOwnedPatches()
+    {
+        // HarmonyX can rebuild a method between individual removals. Remove
+        // our finalizers first while their prefix state/__runOriginal still
+        // exists, including initialization rollback after a partial PatchAll.
+        foreach (MethodBase original in new List<MethodBase>(Harmony.GetAllPatchedMethods()))
+        {
+            Patches? patches = Harmony.GetPatchInfo(original);
+            if (patches == null) continue;
+            foreach (Patch patch in patches.Finalizers)
+            {
+                if (patch.owner != ModGuid) continue;
+                _harmony.Unpatch(original, HarmonyPatchType.Finalizer, ModGuid);
+                break;
+            }
+        }
+        _harmony.UnpatchSelf();
     }
 
     private void Update()
@@ -152,7 +172,7 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
         }
         finally
         {
-            _harmony.UnpatchSelf();
+            UnpatchOwnedPatches();
         }
     }
 

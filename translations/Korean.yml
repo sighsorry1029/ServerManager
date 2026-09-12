@@ -30,6 +30,7 @@ sm_mod_restart: "모드를 변경한 뒤 Valheim을 다시 시작하고 접속�
 sm_mod_report_invalid: "로드된 모드 목록을 확인하지 못했습니다. Valheim을 다시 시작하고 ServerManager를 업데이트하거나 재설치하세요. 문제가 계속되면 서버 관리자에게 문의하세요."
 sm_fresh_character_required: "선택한 계정과 이름에 해당하는 서버 캐릭터가 없습니다. 로컬 캐릭터에 기존 월드 진행 기록이 있어 덮어쓰지 않았습니다. 로비로 돌아가 다른 이름의 새 캐릭터를 만드세요. 기존 캐릭터를 사용하려면 관리자가 서버를 끈 상태에서 해당 .fch를 ServerManager/characters 아래의 알맞은 SteamID 폴더에 넣어야 합니다."
 sm_character_apply_failed: "서버 캐릭터를 불러오거나 적용하지 못했습니다. 다시 접속하세요. 문제가 계속되면 서버 관리자에게 문의하세요."
+sm_character_load_unsafe: "캐릭터 로딩이 완료되지 않아 입장을 중단하고 저장을 차단했습니다. 모드 호환성을 확인한 뒤 발헤임을 다시 실행하세요. 자세한 원인은 ServerManager 로그를 확인하거나 서버 관리자에게 문의하세요."
 sm_character_save_failed: "서버에서 캐릭터 저장을 승인하지 못했습니다. 다시 접속하세요. 문제가 계속되면 서버 관리자에게 문의하세요."
 sm_character_active: "이미 접속 중인 캐릭터입니다. 이전 연결이 종료된 뒤 다시 시도하세요."
 sm_character_profile_limit: "접속 중인 캐릭터를 포함해 이 계정의 서버 캐릭터 수가 제한({0}개)에 도달했습니다. 서버 관리자에게 문의하세요."

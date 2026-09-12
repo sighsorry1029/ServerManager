@@ -88,12 +88,19 @@ $appendInventoryDetail = $activityType.GetMethod(
 $itemType = $assembly.GetType('ServerManager.CharacterSemanticItemState', $true)
 $detailedItemConstructor = $itemType.GetConstructors(
     [Reflection.BindingFlags]'Instance,NonPublic') | Where-Object {
-    $_.GetParameters().Count -eq 7
+    $_.GetParameters().Count -eq 7 -and
+    $_.GetParameters()[0].ParameterType -eq [string]
+} | Select-Object -First 1
+$hashedItemConstructor = $itemType.GetConstructors(
+    [Reflection.BindingFlags]'Instance,NonPublic') | Where-Object {
+    $_.GetParameters().Count -eq 7 -and
+    $_.GetParameters()[0].ParameterType -eq [int]
 } | Select-Object -First 1
 $bundledYamlType = $assembly.GetType(
     'YamlDotNet.RepresentationModel.YamlStream', $true)
 if ($null -eq $appendInventoryDetail -or
     $null -eq $detailedItemConstructor -or
+    $null -eq $hashedItemConstructor -or
     $bundledYamlType.Assembly -ne $assembly) {
     throw 'The real inventory formatter or bundled YAML parser is missing.'
 }
@@ -386,6 +393,16 @@ try {
         if ($itemHeaders[$index] -cne $itemCases[$index][4]) {
             throw 'Inventory headers must omit x1/Q1 and retain larger stacks/qualities.'
         }
+    }
+    $unknownLines = [Collections.Generic.List[string]]::new()
+    $unknownItem = $hashedItemConstructor.Invoke([object[]]@(
+        [int]0x12345678, [int]1, [int]1, [int]0, [int]0, [int]0,
+        [Collections.Generic.Dictionary[string, string]]::new()))
+    $appendInventoryDetail.Invoke($null, [object[]]@(
+        $unknownLines, $unknownItem)) | Out-Null
+    if ($unknownLines.Count -ne 1 -or
+        $unknownLines[0] -cne '  - unknown:12345678') {
+        throw 'An unresolved inventory hash did not retain its stable unknown-item identity.'
     }
     if (@($blockLines | Where-Object { $_ -ceq '    CustomData:' }).Count -ne 1) {
         throw 'CustomData casing changed or an empty item dictionary produced a block.'

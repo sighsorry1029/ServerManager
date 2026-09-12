@@ -62,28 +62,7 @@ function Get-Integer($Instruction) {
         default { return $null }
     }
 }
-function Test-Reachable($Start, $Target, $Excluded = $null) {
-    $pending = [Collections.Generic.Queue[object]]::new()
-    $visited = @{}
-    if ($null -ne $Start) { $pending.Enqueue($Start) }
-    while ($pending.Count -gt 0) {
-        $current = $pending.Dequeue()
-        if ($visited.ContainsKey($current.Offset) -or
-            ($null -ne $Excluded -and $current.Offset -eq $Excluded.Offset)) { continue }
-        if ($current.Offset -eq $Target.Offset) { return $true }
-        $visited[$current.Offset] = $true
-        $flow = $current.OpCode.FlowControl.ToString()
-        if ($flow -in @('Branch', 'Cond_Branch')) {
-            foreach ($branch in @($current.Operand)) {
-                if ($branch -is [Mono.Cecil.Cil.Instruction]) { $pending.Enqueue($branch) }
-            }
-        }
-        if ($flow -notin @('Branch', 'Return', 'Throw') -and $null -ne $current.Next) {
-            $pending.Enqueue($current.Next)
-        }
-    }
-    return $false
-}
+. (Join-Path $PSScriptRoot 'CecilControlFlow.ps1')
 function Assert-GuardProtectsCall($Method, [string]$GuardName, [string]$EffectName) {
     $guard = @(Get-Calls $Method $GuardName) | Select-Object -First 1
     $effect = @(Get-Calls $Method $EffectName) | Select-Object -First 1
@@ -91,8 +70,8 @@ function Assert-GuardProtectsCall($Method, [string]$GuardName, [string]$EffectNa
     $branch = $guard.Next
     while ($null -ne $branch -and $branch.OpCode.FlowControl.ToString() -ne 'Cond_Branch') { $branch = $branch.Next }
     Assert-True ($null -ne $branch -and
-        -not (Test-Reachable $Method.Body.Instructions[0] $effect $branch) -and
-        ((Test-Reachable $branch.Operand $effect) -xor (Test-Reachable $branch.Next $effect))) `
+        -not (Test-CecilReachable $Method.Body.Instructions[0] $effect $branch) -and
+        ((Test-CecilReachable $branch.Operand $effect) -xor (Test-CecilReachable $branch.Next $effect))) `
         "$GuardName must guard $EffectName on every normal control-flow path."
 }
 
@@ -155,7 +134,7 @@ try {
     $changeBranches = @($apply.Body.Instructions | Where-Object {
         $_.Offset -gt $maxReads[1].Offset -and $_.Offset -lt $applyRefresh[0].Offset -and
         $_.OpCode.FlowControl.ToString() -eq 'Cond_Branch' -and
-        ((Test-Reachable $_.Operand $applyRefresh[0]) -xor (Test-Reachable $_.Next $applyRefresh[0]))
+        ((Test-CecilReachable $_.Operand $applyRefresh[0]) -xor (Test-CecilReachable $_.Next $applyRefresh[0]))
     })
     Assert-True ($changeBranches.Count -ge 1) 'An unchanged cap must skip the live advertisement refresh.'
     foreach ($method in @($refresh, $apply)) {

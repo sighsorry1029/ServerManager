@@ -198,12 +198,13 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
         return CreateValidationDecision(identity, policy, decoded.Manifest, validation);
     }
 
-    // A preliminary admin lookup may defer only optional/unlisted mismatches.
-    // This is permission to begin vanilla authentication, NOT an admin grant.
+    // A caller with a bounded final-authentication gate may defer only
+    // optional/unlisted mismatches. This is permission to begin vanilla
+    // authentication, NOT an admin lookup or grant.
     internal ManifestValidationDecision ValidateForAdmission(
         ServerPeerIdentity peerIdentity,
         byte[] manifestPayload,
-        bool adminCandidate,
+        bool allowAuthenticatedAdminReview,
         out IntegrityManifest? pendingAdminManifest)
     {
         pendingAdminManifest = null;
@@ -229,7 +230,7 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
         IntegrityValidationResult validation =
             IntegrityValidator.Validate(snapshot, decoded);
 
-        if (!validation.Allowed && adminCandidate && decoded.Success &&
+        if (!validation.Allowed && allowAuthenticatedAdminReview && decoded.Success &&
             IntegrityValidator.Validate(snapshot, decoded.Manifest, true).Allowed)
         {
             pendingAdminManifest = decoded.Manifest;

@@ -390,31 +390,40 @@ try {
     $eventAdmission.SetValue($null, $oldAdmission)
 }
 
-# Valheim's IsAdmin/IsAllowed treats bare Steam64 and Steam_<id> as
-# equivalent, but SyncedList.Remove removes only one exact List<string> item.
-# Exercise production membership selection with those actual CLR semantics.
+# Valheim 1.0 filters Steam IDs to V_<id> for its final list comparison.
+# ServerManager must recognize pre-1.0 literal spellings while writing V_, and
+# SyncedList.Remove still removes only one exact List<string> item.
 $listEntries = $commands.GetMethod('GetSteamListEntries', $flags)
+$canonicalListEntry = $commands.GetMethod('GetCanonicalSteamListEntry', $flags)
 $steamId = '76561198000000001'
 $otherSteamId = '76561198000000002'
 foreach ($commandKind in @('adminremove', 'accessremove', 'unban')) {
     $fixture = [Collections.Generic.List[string]]::new()
-    foreach ($entry in @($steamId, ('Steam_' + $steamId), $steamId, ('Steam_' + $steamId),
-        $otherSteamId, ('Steam_' + $otherSteamId), ('steamworks:' + $steamId), 'Other Player')) {
+    foreach ($entry in @($steamId, ('Steam_' + $steamId), ('V_' + $steamId),
+        $steamId, ('Steam_' + $steamId), ('V_' + $steamId),
+        $otherSteamId, ('Steam_' + $otherSteamId), ('V_' + $otherSteamId),
+        ('steamworks:' + $steamId), 'Other Player')) {
         $fixture.Add($entry)
     }
     $selected = [string[]]$listEntries.Invoke($null, [object[]]@($fixture, $steamId))
-    Assert-True ($selected.Length -eq 4) "$commandKind must select every exact native alias occurrence."
+    Assert-True ($selected.Length -eq 6) "$commandKind must select every exact native alias occurrence."
     $prefixed = [string[]]$listEntries.Invoke($null, [object[]]@($fixture, ('Steam_' + $steamId)))
-    Assert-True ($prefixed.Length -eq 4) "$commandKind must also handle an authenticated prefixed transport identity."
+    Assert-True ($prefixed.Length -eq 6) "$commandKind must also handle a Steam_ transport identity."
+    $displayPrefixed = [string[]]$listEntries.Invoke($null, [object[]]@($fixture, ('V_' + $steamId)))
+    Assert-True ($displayPrefixed.Length -eq 6) "$commandKind must handle Valheim 1.0's V_ display identity."
     foreach ($entry in $selected) { $fixture.Remove($entry) | Out-Null }
     $remaining = [string[]]$listEntries.Invoke($null, [object[]]@($fixture, $steamId))
     Assert-True ($remaining.Length -eq 0) "$commandKind must revoke membership, not leave an alias/duplicate."
-    Assert-True ($fixture.Count -eq 4 -and $fixture.Contains($otherSteamId) -and
-        $fixture.Contains('Steam_' + $otherSteamId) -and $fixture.Contains('steamworks:' + $steamId) -and
+    Assert-True ($fixture.Count -eq 5 -and $fixture.Contains($otherSteamId) -and
+        $fixture.Contains('Steam_' + $otherSteamId) -and $fixture.Contains('V_' + $otherSteamId) -and
+        $fixture.Contains('steamworks:' + $steamId) -and
         $fixture.Contains('Other Player')) "$commandKind must not migrate other entries or reinterpret names."
 }
-$prefixOnly = [string[]]@('Steam_' + $steamId)
-Assert-True (([string[]]$listEntries.Invoke($null, [object[]]@($prefixOnly, $steamId))).Length -eq 1) 'Add must recognize an existing native prefixed identity and avoid an alias duplicate.'
+$prefixOnly = [string[]]@('V_' + $steamId)
+Assert-True (([string[]]$listEntries.Invoke($null, [object[]]@($prefixOnly, $steamId))).Length -eq 1) 'Add must recognize an existing V_ identity.'
+foreach ($inputId in @($steamId, ('Steam_' + $steamId), ('V_' + $steamId))) {
+    Assert-True ($canonicalListEntry.Invoke($null, [object[]]@($inputId)) -ceq ('V_' + $steamId)) 'Steam list writes must use Valheim 1.0 canonical V_ spelling.'
+}
 
 # Compiled production paths must use that policy for both selection and
 # post-mutation verification, while retaining literal SyncedList.Remove calls.
@@ -428,6 +437,7 @@ foreach ($method in @(
 )) {
     $calls = @($method.Body.Instructions | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] } | ForEach-Object Operand)
     Assert-True (@($calls | Where-Object Name -eq 'GetSteamListEntries').Count -ge 2) "$($method.Name) must verify actual alias membership after mutation."
+    Assert-True (@($calls | Where-Object Name -eq 'GetCanonicalSteamListEntry').Count -ge 1) "$($method.Name) must write Valheim 1.0's canonical Steam list identity."
     Assert-True (@($calls | Where-Object { $_.Name -eq 'Remove' -and $_.DeclaringType.FullName -eq 'SyncedList' }).Count -ge 1) "$($method.Name) must remove literal entries, never reinterpret a target name."
 }
 $definition.Dispose()

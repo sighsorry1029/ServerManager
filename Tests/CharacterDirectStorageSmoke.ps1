@@ -82,7 +82,7 @@ function Prepare-QuotaCharacter($Fixture, $Identity, [long]$PlayerId) {
         return ,$script:quotaFactoryPayload
     }
     return Invoke-Hidden $Fixture.Repository 'PrepareInitialSnapshot' @(
-        $Identity, $Fixture.Keys.DeriveStorageKey($Identity), [Guid]::NewGuid(), $factory, [int]43)
+        $Identity, $Fixture.Keys.DeriveStorageKey($Identity), [Guid]::NewGuid(), $factory, [int]46)
 }
 function Finalize-QuotaCharacter($Fixture, $Identity, $Prepared) {
     return Invoke-Hidden $Fixture.Repository 'FinalizePreparedInitialSnapshot' @(
@@ -728,13 +728,13 @@ try {
         @{ Id = 1980891425; Level = [single]::MaxValue; Accumulator = [single]123.5 },
         @{ Id = [int]::MaxValue; Level = [single]-42; Accumulator = [single]0 })
     $modItems = @(
-        @{ Prefab = 'Mod_UnregisteredWeapon'; Stack = [int]::MaxValue; Quality = 0;
-            Variant = [int]::MinValue; Durability = [single]::MinValue; X = 0; Y = 0;
+        @{ Prefab = 'Mod_UnregisteredWeapon'; Stack = 65535; Quality = 0;
+            Variant = [int]::MinValue; Durability = [single]-21474836; X = 0; Y = 0;
             Custom = [ordered]@{ 'mod:data' = '{"quality":0,"raw":true}'; 'owner' = 'ModHero' } },
-        @{ Prefab = 'Mod_UnregisteredArmor'; Stack = 1000001; Quality = -17;
-            Variant = [int]::MaxValue; Durability = [single]::MaxValue; X = 255; Y = 255; WorldLevel = 255 },
-        @{ Prefab = 'Mod_UnregisteredUtility'; Quality = [int]::MaxValue; Variant = 40000;
-            Durability = [single]-1; X = -1; Y = -1; WorldLevel = 1 })
+        @{ Prefab = 'Mod_UnregisteredArmor'; Stack = 65534; Quality = 65519;
+            Variant = [int]::MaxValue; Durability = [single]21474836; X = 255; Y = 255; WorldLevel = 255 },
+        @{ Prefab = 'Mod_UnregisteredUtility'; Quality = 65535; Variant = 40000;
+            Durability = [single]-1; X = 254; Y = 255; WorldLevel = 1 })
     [byte[]]$modRaw = New-ProfilePayload 'ModHero' 303 'mod-owned-values' -SkillValues $modSkills -InventoryItems $modItems
     $modDirect = Write-DirectCharacter $modFixture $modIdentity $modRaw
     Validate-DirectStorage $modFixture
@@ -750,7 +750,7 @@ try {
             $actualSkill.Accumulator -eq $expectedSkill.Accumulator) 'Mod skill scalar values were clamped, normalized, or remapped.'
     }
     for ($itemIndex = 0; $itemIndex -lt $modItems.Count; ++$itemIndex) {
-        Assert-True ($modSemantic.Items[$itemIndex].PrefabName -ceq $modItems[$itemIndex].Prefab -and
+        Assert-True ($modSemantic.Items[$itemIndex].PrefabHash -eq [Valheim107Fixture]::Hash($modItems[$itemIndex].Prefab) -and
             $modSemantic.Items[$itemIndex].Quality -eq $modItems[$itemIndex].Quality) 'Unknown item prefab or raw quality was normalized.'
     }
     $modOpened = Invoke-Hidden $modFixture.Service 'OpenOrCreateLocalHostSession' @($modIdentity)
@@ -795,16 +795,11 @@ try {
         [byte[]]$invalidRaw = New-ProfilePayload 'ModHero' 303 'invalid-mod-skill' -SkillValues $invalidSkills
         Assert-Throws { $extract.Invoke($modFixture.Profiles, [object[]]@($modIdentity, $invalidRaw)) }
     }
+    # Durability is now an int and positions/world level are bytes on disk;
+    # negative coordinates and NaN are no longer representable wire values.
     foreach ($invalidItems in @(
         @(@{ Prefab = 'Mod_Item'; Stack = 0 }),
-        @(@{ Prefab = 'Mod_Item'; Stack = -1 }),
         @(@{ Prefab = '' }),
-        @(@{ Prefab = 'Mod_Item'; Durability = [single]::NaN }),
-        @(@{ Prefab = 'Mod_Item'; Durability = [single]::PositiveInfinity }),
-        @(@{ Prefab = 'Mod_Item'; X = -2 }),
-        @(@{ Prefab = 'Mod_Item'; Y = 256 }),
-        @(@{ Prefab = 'Mod_Item'; WorldLevel = -1 }),
-        @(@{ Prefab = 'Mod_Item'; WorldLevel = 256 }),
         @(@{ Prefab = 'Mod_One'; X = 4; Y = 7 }, @{ Prefab = 'Mod_Two'; X = 4; Y = 7 }))) {
         [byte[]]$invalidInventory = New-InventoryPayload $invalidItems
         $validateInventory = $plugin.GetType('ServerManager.ValheimPlayerProfileCodec').GetMethod('ValidateInventorySnapshot', $allInstance)

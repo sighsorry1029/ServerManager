@@ -79,11 +79,11 @@ try {
     $playerDataField = $game.GetType("PlayerProfile").GetField("m_playerData", $allInstance)
     [byte[]]$oldInner = $playerDataField.GetValue($oldProfile)
     [byte[]]$newInner = $playerDataField.GetValue($newProfile)
-    # The fixture ends in skills-v2/count, custom-data count, stamina/eitr (24 bytes).
-    $skillsOffset = $oldInner.Length - 24
+    # Skills-v2/count, custom-data count, stamina/eitr and empty build-menu state (28 bytes).
+    $skillsOffset = $oldInner.Length - 28
     Assert-True ($newInner.Length -eq $oldInner.Length + 12 -and
         (Test-Bytes ([byte[]]$oldInner[0..($skillsOffset - 1)]) ([byte[]]$newInner[0..($skillsOffset - 1)])) -and
-        (Test-Bytes ([byte[]]$oldInner[($oldInner.Length - 16)..($oldInner.Length - 1)]) ([byte[]]$newInner[($newInner.Length - 16)..($newInner.Length - 1)]))) "Skill splice changed non-skill player fields."
+        (Test-Bytes ([byte[]]$oldInner[($oldInner.Length - 20)..($oldInner.Length - 1)]) ([byte[]]$newInner[($newInner.Length - 20)..($newInner.Length - 1)]))) "Skill splice changed non-skill player fields."
     $oldOuterLength = $payload.Length - $oldInner.Length - 4
     Assert-True (Test-Bytes ([byte[]]$payload[0..($oldOuterLength - 1)]) ([byte[]]$materialized[0..($oldOuterLength - 1)])) "Skill splice changed outer identity, stats, or metadata."
     $replaceSkill = $plugin.GetType("ServerManager.ValheimPlayerProfileCodec").GetMethod("ReplaceSkillAdmin", $allInstance)
@@ -176,7 +176,7 @@ try {
     }
     [byte[]]$seedSkillBytes = $encodeSkills.Invoke($null, [object[]]@(,$semanticSkills))
     [byte[]]$modInner = [byte[]]$oldInner[0..($skillsOffset - 1)] + $seedSkillBytes +
-        [byte[]]$oldInner[($oldInner.Length - 16)..($oldInner.Length - 1)]
+        [byte[]]$oldInner[($oldInner.Length - 20)..($oldInner.Length - 1)]
     [byte[]]$modPayload = [byte[]]$payload[0..($oldOuterLength - 1)] +
         [BitConverter]::GetBytes([int]$modInner.Length) + $modInner
     $modEditArguments = [object[]]@($identity, $modPayload, "set", "all", [single]25, $null)
@@ -266,7 +266,7 @@ try {
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($restorePath)) | Out-Null
     $restorePlayerId = [long]76561198012345678
     $createOriginEnvelope = $envelopeType.GetMethod("CreateWithOrigin", [Reflection.BindingFlags]"Static,NonPublic")
-    function New-RestoreEnvelope([object]$Identity, [long]$Revision, [byte[]]$Payload, [bool]$Origin = $false, [int]$ProfileVersion = 43,
+    function New-RestoreEnvelope([object]$Identity, [long]$Revision, [byte[]]$Payload, [bool]$Origin = $false, [int]$ProfileVersion = 46,
         [DateTime]$CreatedUtc = ([DateTime]::UtcNow.AddMinutes(-100 + $Revision))) {
         return $script:createOriginEnvelope.Invoke($null, [object[]]@(
             [Enum]::Parse($script:kindType, "Snapshot"), $Revision, ($Revision - 1),
@@ -387,10 +387,10 @@ try {
     }
 
     [byte[]]$namingPayload = New-ProfilePayload "FilenameHero" 1234567 "filename-precision"
-    $namingPrevious = New-RestoreEnvelope $namingIdentity 8 $namingPayload $false 43 $preciseUtc
+    $namingPrevious = New-RestoreEnvelope $namingIdentity 8 $namingPayload $false 46 $preciseUtc
     [byte[]]$namingPreviousBytes = Convert-ToRestoreFch $namingPayload
     [IO.File]::WriteAllBytes($namingPath, $namingPreviousBytes)
-    $namingNext = New-RestoreEnvelope $namingIdentity 9 $namingPayload $false 43 $preciseUtc.AddTicks(1)
+    $namingNext = New-RestoreEnvelope $namingIdentity 9 $namingPayload $false 46 $preciseUtc.AddTicks(1)
     $namingWarning = Invoke-Hidden $restoreRepository "RestoreAdminSnapshot" @($namingIdentity, $namingKey, $namingPrevious, $namingNext)
     $createdBackups = @(Get-RestoreBackupFiles $namingKey)
     Assert-True ([string]::IsNullOrEmpty($namingWarning) -and $createdBackups.Count -eq 1 -and
@@ -420,7 +420,7 @@ try {
         $restoreOptions.MaxBackups = 1
         Assert-Throws { Invoke-Hidden $restoreRepository "GetAdminBackups" @($namingIdentity, $namingKey) } "*unexpected file*"
         [byte[]]$namingLaterPayload = New-ProfilePayload "FilenameHero" 1234567 "legacy-pre-scan-rejected"
-        $namingLater = New-RestoreEnvelope $namingIdentity 10 $namingLaterPayload $false 43 $preciseUtc.AddTicks(2)
+        $namingLater = New-RestoreEnvelope $namingIdentity 10 $namingLaterPayload $false 46 $preciseUtc.AddTicks(2)
         $replaceForNaming = $repositoryType.GetMethods($allInstance) |
             Where-Object { $_.Name -eq "ReplaceAtomicallyWithBackup" -and $_.GetParameters().Count -eq 3 }
         $replaceArguments = [object[]]::new(3)
@@ -460,17 +460,17 @@ try {
         $rotationKey = $restoreKeys.DeriveStorageKey($rotationIdentity)
         $rotationDirectory = $restoreLayout.GetAccountDirectory($rotationKey)
         [byte[]]$rotationPayload = New-ProfilePayload "RotationHero" 2345678 "revision-retention"
-        $rotationOld = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 20 $rotationPayload $false 43 $preciseUtc.AddDays(-2)) $rotationKey
-        $rotationMiddle = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 2 $rotationPayload $false 43 $preciseUtc) $rotationKey
-        $rotationMiddleCollision = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 999 $rotationPayload $false 43 $preciseUtc) $rotationKey 2
-        $rotationNewest = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 1 $rotationPayload $false 43 $preciseUtc.AddDays(2)) $rotationKey
+        $rotationOld = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 20 $rotationPayload $false 46 $preciseUtc.AddDays(-2)) $rotationKey
+        $rotationMiddle = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 2 $rotationPayload $false 46 $preciseUtc) $rotationKey
+        $rotationMiddleCollision = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 999 $rotationPayload $false 46 $preciseUtc) $rotationKey 2
+        $rotationNewest = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 1 $rotationPayload $false 46 $preciseUtc.AddDays(2)) $rotationKey
         $siblingRotationIdentity = New-Instance "CharacterIdentity" @($rotationIdentity.AccountId, "RotationHeroSibling")
         $siblingRotationKey = $restoreKeys.DeriveStorageKey($siblingRotationIdentity)
         [byte[]]$siblingRotationPayload = New-ProfilePayload "RotationHeroSibling" 2345679 "same-account-preserve"
         $siblingRotationPath = $restoreLayout.GetProfilePath($siblingRotationKey)
         [IO.File]::WriteAllBytes($siblingRotationPath, (Convert-ToRestoreFch $siblingRotationPayload))
         $siblingRotationBackups = @(1..3 | ForEach-Object {
-            Write-RestoreBackup (New-RestoreEnvelope $siblingRotationIdentity $_ $siblingRotationPayload $false 43 $preciseUtc.AddDays(-$_)) $siblingRotationKey
+            Write-RestoreBackup (New-RestoreEnvelope $siblingRotationIdentity $_ $siblingRotationPayload $false 46 $preciseUtc.AddDays(-$_)) $siblingRotationKey
         })
         Assert-True ($restoreLayout.GetAccountDirectory($siblingRotationKey) -ceq $rotationDirectory) "Same-account retention fixtures do not share a folder."
         $rotationListed = Invoke-Hidden $restoreRepository "GetAdminBackups" @($rotationIdentity, $rotationKey)
@@ -482,7 +482,7 @@ try {
         Invoke-Hidden $restoreRepository "PruneBackups" @($rotationKey, $null) | Out-Null
         Assert-True ((Test-Path -LiteralPath $rotationNewest.Path) -and (Test-Path -LiteralPath $rotationMiddleCollision.Path) -and
             -not (Test-Path -LiteralPath $rotationOld.Path) -and -not (Test-Path -LiteralPath $rotationMiddle.Path)) "Retention did not keep the newest timestamp/collision backups."
-        $preservedOld = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 5000 $rotationPayload $false 43 $preciseUtc.AddDays(-3)) $rotationKey
+        $preservedOld = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 5000 $rotationPayload $false 46 $preciseUtc.AddDays(-3)) $rotationKey
         Invoke-Hidden $restoreRepository "PruneBackups" @($rotationKey, $preservedOld.Path) | Out-Null
         Assert-True ((Test-Path -LiteralPath $preservedOld.Path) -and (Test-Path -LiteralPath $rotationNewest.Path) -and
             -not (Test-Path -LiteralPath $rotationMiddleCollision.Path)) "Retention removed the explicitly protected previous primary."
@@ -507,14 +507,14 @@ try {
             [DateTime]::new(2099, 1, 2, 3, 4, 5),
             [DateTimeKind]::Utc)
         $clockFirst = Write-RestoreBackup (
-            New-RestoreEnvelope $clockIdentity 1 $clockPreviousPayload $false 43 $futureUtc) $clockKey
+            New-RestoreEnvelope $clockIdentity 1 $clockPreviousPayload $false 46 $futureUtc) $clockKey
         $clockSecondPath = Join-Path $restoreLayout.GetAccountDirectory($clockKey) ($clockFirst.Name.Substring(0, $clockFirst.Name.Length - 4) + '.02.fch')
         $replaceForNaming.Invoke($restoreRepository, [object[]]@($clockPath, $clockKey, $clockPreviousFch)) | Out-Null
         Assert-True ((Test-Path -LiteralPath $clockSecondPath) -and
             (Test-Bytes ([IO.File]::ReadAllBytes($clockSecondPath)) $clockPreviousFch)) "The second same-second backup did not use the .02 suffix beside the primary."
         [IO.File]::Delete($clockSecondPath)
         $clockThird = Write-RestoreBackup (
-            New-RestoreEnvelope $clockIdentity 3 $clockPreviousPayload $false 43 $futureUtc) $clockKey 3
+            New-RestoreEnvelope $clockIdentity 3 $clockPreviousPayload $false 46 $futureUtc) $clockKey 3
         $clockTimestamp = $clockThird.Name.Substring(($clockKey + '.').Length, "yyyy-MM-dd_HH-mm-ss".Length)
         $clockFourthName = $clockKey + '.' + $clockTimestamp + ".04.fch"
         $clockFourthPath = Join-Path ($restoreLayout.GetAccountDirectory($clockKey)) $clockFourthName
@@ -551,7 +551,7 @@ try {
             [DateTimeKind]::Utc)
         for ($collision = 1; $collision -le 1001; ++$collision) {
             Write-RestoreBackup (
-                New-RestoreEnvelope $overflowIdentity $collision $overflowOldPayload $false 43 $overflowUtc) `
+                New-RestoreEnvelope $overflowIdentity $collision $overflowOldPayload $false 46 $overflowUtc) `
                 $overflowKey $collision | Out-Null
         }
         $restoreOptions.MaxBackups = 1000

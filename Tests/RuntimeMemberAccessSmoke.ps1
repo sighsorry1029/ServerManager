@@ -100,6 +100,7 @@ foreach ($requiredField in @(
     [pscustomobject]@{ Type = "ZNet"; Name = "m_openServer" },
     [pscustomobject]@{ Type = "ZNet"; Name = "m_connectionStatus" },
     [pscustomobject]@{ Type = "ZNet"; Name = "m_bannedList" },
+    [pscustomobject]@{ Type = "ZNet"; Name = "m_adminList" },
     [pscustomobject]@{ Type = "ZRpc"; Name = "m_socket" },
     [pscustomobject]@{ Type = "ZRpc"; Name = "m_functions" },
     [pscustomobject]@{ Type = "ZRpc"; Name = "m_DEBUG" },

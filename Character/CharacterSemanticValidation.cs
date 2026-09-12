@@ -65,6 +65,7 @@ namespace ServerManager
         {
             PrefabName = prefabName ??
                 throw new ArgumentNullException(nameof(prefabName));
+            PrefabHash = StablePrefabHash(prefabName);
             Stack = stack;
             Quality = quality;
             WorldLevel = worldLevel;
@@ -76,6 +77,37 @@ namespace ServerManager
         }
 
         public string PrefabName { get; }
+
+        // Inventory 109 carries only this stable hash. Keep names supplied by
+        // callers; decoded wire items use an explicit hash label, never a Unity
+        // lookup on a repository/validation worker thread.
+        public int PrefabHash { get; }
+
+        internal CharacterSemanticItemState(int prefabHash, int stack, int quality,
+            int worldLevel, int positionX, int positionY,
+            IEnumerable<KeyValuePair<string, string>> customData)
+            : this("hash:" + unchecked((uint)prefabHash).ToString("X8", CultureInfo.InvariantCulture),
+                stack, quality, worldLevel, positionX, positionY, customData)
+        {
+            PrefabHash = prefabHash;
+        }
+
+        internal static int StablePrefabHash(string name)
+        {
+            // Valheim's UTF-16 GetStableHashCode wire algorithm; this is an
+            // identity lookup, not an authentication or integrity hash.
+            unchecked
+            {
+                int first = 5381, second = 5381;
+                for (int index = 0; index < name.Length && name[index] != '\0'; index += 2)
+                {
+                    first = ((first << 5) + first) ^ name[index];
+                    if (index + 1 >= name.Length || name[index + 1] == '\0') break;
+                    second = ((second << 5) + second) ^ name[index + 1];
+                }
+                return first + second * 1566083941;
+            }
+        }
 
         public int Stack { get; }
 
@@ -272,7 +304,9 @@ namespace ServerManager
             UsedCheats = usedCheats;
         }
 
-        // Outer-profile metadata is a policy finding, not corrupt serialization.
+        // Outer-profile metadata is retained for Valheim's achievement policy;
+        // it is diagnostic state, not corrupt serialization or proof that this
+        // server received an invalid character revision.
         // Share immutable collections without mutating the common Empty instance.
         internal CharacterSemanticSnapshot WithUsedCheats(bool usedCheats) =>
             UsedCheats == usedCheats ? this : new CharacterSemanticSnapshot(this, usedCheats);
@@ -343,6 +377,7 @@ namespace ServerManager
             { ',', ';', '\n' };
 
         private readonly HashSet<string> _forbiddenItemPrefabs;
+        private readonly Dictionary<int, string> _forbiddenItemPrefabHashes = new Dictionary<int, string>();
 
         internal static CharacterSemanticPolicy FromSettings(
             ServerSettings settings, CharacterSemanticPolicyMode mode)
@@ -388,6 +423,8 @@ namespace ServerManager
             _forbiddenItemPrefabs = ParseSet(
                 forbiddenItemPrefabs,
                 "Forbidden Item Prefabs");
+            foreach (string name in _forbiddenItemPrefabs)
+                _forbiddenItemPrefabHashes[CharacterSemanticItemState.StablePrefabHash(name)] = name;
         }
 
         public CharacterSemanticPolicyMode Mode { get; }
@@ -411,6 +448,9 @@ namespace ServerManager
         {
             return _forbiddenItemPrefabs.Contains(prefabName);
         }
+
+        internal bool TryGetForbiddenItemPrefab(int prefabHash, out string name) =>
+            _forbiddenItemPrefabHashes.TryGetValue(prefabHash, out name);
 
         private static HashSet<string> ParseSet(
             string value,
@@ -764,19 +804,13 @@ namespace ServerManager
                     findingKeys);
             }
 
-            if (candidate.UsedCheats)
+            if (candidate.UsedCheats &&
+                _policy.Mode != CharacterSemanticPolicyMode.Disabled)
             {
-                const string message = "the PlayerProfile is marked as having used cheats";
-                if (bypassAdminPolicy && _policy.Mode == CharacterSemanticPolicyMode.Enforce)
-                {
-                    AddObservation(observations, auditObservations,
-                        CharacterAuditObservationKind.AdminBypass, "used_cheats",
-                        "[admin_bypass:used_cheats]", message);
-                }
-                else
-                {
-                    AddHardFinding("used_cheats", message, violations, observations, auditObservations, findingKeys);
-                }
+                AddObservation(observations, auditObservations,
+                    CharacterAuditObservationKind.RevisionObserved, "used_cheats",
+                    "[used_cheats]",
+                    "the PlayerProfile retains Valheim's used-cheats achievement eligibility marker");
             }
 
             AddMaximumFinding(
@@ -802,9 +836,10 @@ namespace ServerManager
                 CharacterSemanticItemState item = candidate.Items[itemIndex];
                 string safePrefab = SafeDiagnosticToken(item.PrefabName);
 
-                if (_policy.IsForbiddenItemPrefab(item.PrefabName))
+                if (_policy.TryGetForbiddenItemPrefab(item.PrefabHash, out string forbiddenName))
                 {
-                    string findingKey = "forbidden_prefab:" + item.PrefabName;
+                    safePrefab = SafeDiagnosticToken(forbiddenName);
+                    string findingKey = "forbidden_prefab:" + forbiddenName;
                     string message =
                         "forbidden item prefab '" + safePrefab + "' is present";
                     // Only policy rules use the trusted incoming-session

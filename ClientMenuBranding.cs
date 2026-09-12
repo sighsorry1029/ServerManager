@@ -1,4 +1,5 @@
 using System;
+using SystemVersion = System.Version;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -393,9 +394,9 @@ internal static class ClientMenuBranding
 
     // Main-thread metadata only, once per text/result refresh. No folder search,
     // assembly loading, or additional hashing is needed for this advisory filter.
-    private static IReadOnlyDictionary<string, Version> CaptureLoadedOptionalModVersions()
+    private static IReadOnlyDictionary<string, SystemVersion> CaptureLoadedOptionalModVersions()
     {
-        Dictionary<string, Version> loaded = new(StringComparer.Ordinal);
+        Dictionary<string, SystemVersion> loaded = new(StringComparer.Ordinal);
         try
         {
             foreach (BepInEx.PluginInfo plugin in Chainloader.PluginInfos.Values)
@@ -421,16 +422,16 @@ internal static class ClientMenuBranding
     }
 
     internal static bool IsOptionalModLoaded(OptionalModCatalogEntry entry,
-        IReadOnlyDictionary<string, Version>? loaded)
+        IReadOnlyDictionary<string, SystemVersion>? loaded)
     {
-        if (loaded == null || !loaded.TryGetValue(entry.PluginGuid, out Version installed)) return false;
+        if (loaded == null || !loaded.TryGetValue(entry.PluginGuid, out SystemVersion installed)) return false;
         foreach (string version in entry.Versions)
-            if (Version.TryParse(version, out Version allowed) && allowed.Equals(installed)) return true;
+            if (SystemVersion.TryParse(version, out SystemVersion allowed) && allowed.Equals(installed)) return true;
         return false;
     }
 
     internal static string FormatOptionalList(OptionalModQueryState state, bool stale,
-        IReadOnlyList<OptionalModCatalogEntry> entries, IReadOnlyDictionary<string, Version>? loaded)
+        IReadOnlyList<OptionalModCatalogEntry> entries, IReadOnlyDictionary<string, SystemVersion>? loaded)
     {
         string statusKey = state switch
         {

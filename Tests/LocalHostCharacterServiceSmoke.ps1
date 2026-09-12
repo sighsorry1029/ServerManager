@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'Valheim107Fixtures.ps1')
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -125,10 +126,10 @@ Load-TestDependency (Join-Path $managedRoot "assembly_utils.dll") {
 $game = Load-TestDependency (Join-Path $managedRoot "assembly_valheim.dll") {
     param($definition)
     $version = $definition.MainModule.Types | Where-Object FullName -eq "Version"
-    $field = $version.Fields | Where-Object Name -eq "m_playerVersion"
+    $field = $version.Fields | Where-Object Name -eq "c_PlayerVersion"
     Assert-True ($null -ne $field -and $field.HasConstant) "PlayerProfile version marker changed."
-    # Test the explicitly supported v43 schema, not compatibility with another game version.
-    $field.Constant = [int]43
+    # Assert the installed game marker without altering metadata.
+    Assert-True ($field.Constant -eq 46) 'Expected original Valheim 1.0.7 profile marker.'
 }
 # CoreCLR isolates byte-loaded assemblies; resolve only matching images that
 # this fixture has already loaded, preserving the in-memory native-call shims.
@@ -172,7 +173,7 @@ function New-Request([object]$Identity, [Guid]$SessionId, [long]$Revision,
     [long]$BaseRevision, [byte[]]$Payload, [string]$Kind = "SaveRequest") {
     return $script:createEnvelope.Invoke($null, [object[]]@(
         [Enum]::Parse($script:kindType, $Kind), $Revision, $BaseRevision,
-        $SessionId, $Identity, [DateTime]::UtcNow, [int]43, $Payload))
+        $SessionId, $Identity, [DateTime]::UtcNow, [int]46, $Payload))
 }
 
 function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
@@ -183,16 +184,14 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
     $inner = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($inner)
     try {
-        $writer.Write([int]29)
+        $writer.Write([int]33)
         foreach ($value in @($MaximumHealth, $Health, $MaximumStamina, [single]0)) { $writer.Write($value) }
         $writer.Write(""); $writer.Write([single]0)
-        $writer.Write([int]106)
-        $writer.Write([int]([bool]$ItemPrefab))
+        $writer.Write([int]109)
+        $writer.Write([uint16]([bool]$ItemPrefab))
         if ($ItemPrefab) {
-            $writer.Write($ItemPrefab); $writer.Write([int]1); $writer.Write([single]0)
-            $writer.Write([int]0); $writer.Write([int]0); $writer.Write($false)
-            $writer.Write([int]1); $writer.Write([int]0); $writer.Write([long]0)
-            $writer.Write(""); $writer.Write([int]0); $writer.Write([int]0); $writer.Write($false)
+            [Valheim107Fixture]::Item($writer, $ItemPrefab, 1, 0, 0, 0, $false,
+                1, 0, 0, '', [BitConverter]::GetBytes([int]0), 0, $false, $false)
         }
         for ($index = 0; $index -lt 8; ++$index) { $writer.Write([int]0) }
         $writer.Write(""); $writer.Write("")
@@ -200,6 +199,7 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
         $writer.Write([int]0); $writer.Write([int]0)
         $writer.Write([int]2); $writer.Write([int]0); $writer.Write([int]0)
         $writer.Write($Stamina); $writer.Write($MaximumEitr); $writer.Write($Eitr)
+        $writer.Write([int]0) # build menu byte array
         $writer.Flush()
         [byte[]]$innerBytes = $inner.ToArray()
     }
@@ -207,12 +207,10 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
     $outer = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($outer)
     try {
-        $writer.Write([int]43); $writer.Write([int]105)
-        for ($index = 0; $index -lt 105; ++$index) { $writer.Write([single]0) }
+        $writer.Write([int]46); [Valheim107Fixture]::Statistics($writer)
         $writer.Write($false); $writer.Write([int]0)
         $writer.Write($Name); $writer.Write($PlayerId); $writer.Write($Seed)
         $writer.Write($UsedCheats); $writer.Write([long]0)
-        for ($index = 0; $index -lt 6; ++$index) { $writer.Write([int]0) }
         $writer.Write($true); $writer.Write([int]$innerBytes.Length); $writer.Write($innerBytes)
         $writer.Flush()
         return ,($outer.ToArray())
@@ -258,8 +256,8 @@ try {
     $service = New-Instance "CharacterSnapshotService" @(
         $options, $identityResolver, $keys, $codec, $profiles, $repository, $storedValidator)
     $identity = New-Instance "CharacterIdentity" @("steamworks:76561198000000001", "HostHero")
-    # Cheat usage is preserved by serialization and inventory materialization;
-    # only the authoritative incoming policy may grant the admin exemption.
+    # Valheim's achievement marker is preserved by serialization and inventory
+    # materialization while semantic validation treats it as audit-only state.
     [byte[]]$flaggedBytes = New-ProfilePayload 'HostHero' 76561198012345678 'cheat-fixture' -UsedCheats $true
     $profileCodecType = $plugin.GetType('ServerManager.ValheimPlayerProfileCodec')
     $extractValidated = $profileCodecType.GetMethods($allInstance) | Where-Object {
@@ -276,7 +274,7 @@ try {
     [byte[]]$flaggedRoundTrip = $serializeProfile.Invoke($profiles, [object[]]@($flaggedProfile))
     Assert-True ((Get-Hidden ($extractValidated.Invoke($profiles, [object[]]@($identity, $flaggedRoundTrip))) 'SemanticSnapshot').UsedCheats) `
         'Profile serialization rejected or cleared the cheat flag.'
-    [byte[]]$emptyInventory = @([BitConverter]::GetBytes([int]106) + [BitConverter]::GetBytes([int]0))
+    [byte[]]$emptyInventory = @([BitConverter]::GetBytes([int]109) + [BitConverter]::GetBytes([uint16]0))
     $spliceArguments = [object[]]@($identity, $flaggedRoundTrip, $emptyInventory, $null)
     [byte[]]$flaggedSplice = $profileCodecType.GetMethod('ReplaceInventorySnapshot', $allInstance).Invoke($profiles, $spliceArguments)
     Assert-True ((Get-Hidden $spliceArguments[3] 'SemanticSnapshot').UsedCheats -and
@@ -414,7 +412,7 @@ try {
     }
 
     # Inventory requests reuse the same revision path and expose full materialized profiles.
-    [byte[]]$inventory = @([BitConverter]::GetBytes([int]106) + [BitConverter]::GetBytes([int]0))
+    [byte[]]$inventory = @([BitConverter]::GetBytes([int]109) + [BitConverter]::GetBytes([uint16]0))
     $inventoryRequest = New-Request $identity $sessionId 3 2 $inventory "InventorySaveRequest"
     $inventoryAccepted = Invoke-Hidden $service "HandleLocalHostSaveRequest" @($sessionId, $inventoryRequest)
     Assert-True ($inventoryAccepted.Accepted -and $inventoryAccepted.StatLimitFindings.Count -eq 0 -and
@@ -530,44 +528,40 @@ try {
     $lookup = [object[]]@($afterReloadReopen.Snapshot.SessionId, $null)
     Assert-True (Invoke-Hidden $service 'TryGetLocalHostSession' $lookup) 'Reloaded reconnect session is missing.'
     $finalSession = $lookup[1]
-    [byte[]]$adminPayload = New-ProfilePayload 'HostHero' $finalSession.PlayerId 'admin-roundtrip' -UsedCheats $true
-    $adminRequest = New-Request $identity $afterReloadReopen.Snapshot.SessionId 6 5 $adminPayload
-    $deniedFlag = Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($afterReloadReopen.Snapshot.SessionId, $adminRequest)
-    Assert-True (-not $deniedFlag.Accepted -and $deniedFlag.Error -like '*used_cheats*' -and
-        $finalSession.CurrentRevision -eq 5) 'Non-admin cheat flag changed the live revision.'
-    $script:fixturePolicyAdmin = $true
-    $acceptedFlag = Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($afterReloadReopen.Snapshot.SessionId, $adminRequest)
+    [byte[]]$flaggedPayload = New-ProfilePayload 'HostHero' $finalSession.PlayerId 'flagged-roundtrip' -UsedCheats $true
+    $flaggedRequest = New-Request $identity $afterReloadReopen.Snapshot.SessionId 6 5 $flaggedPayload
+    $acceptedFlag = Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($afterReloadReopen.Snapshot.SessionId, $flaggedRequest)
     Assert-True ($acceptedFlag.Accepted -and $finalSession.CurrentRevision -eq 6 -and
-        $acceptedFlag.SemanticObservations[0] -like '*admin_bypass:used_cheats*') `
-        'Verified admin cheat flag did not pass the real local-host repository path.'
+        $acceptedFlag.SemanticObservations[0] -like '[[]used_cheats[]]*') `
+        'Valheim achievement metadata did not pass the real local-host repository path.'
     $acceptedAudit = Get-Hidden (Get-Hidden $acceptedFlag 'AuditFindings') 'AuditObservations'
     Assert-True ($acceptedAudit.Count -eq 1 -and (Get-Hidden $acceptedAudit[0] 'ReasonCode') -eq 'used_cheats') `
         'Accepted repository/service result lost its generated audit classification.'
-    $adminInventory = New-Request $identity $afterReloadReopen.Snapshot.SessionId 7 6 $emptyInventory 'InventorySaveRequest'
-    Assert-True (Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($afterReloadReopen.Snapshot.SessionId, $adminInventory)).Accepted `
-        'Admin inventory fast path rejected the retained flagged full profile.'
-    $adminCheckpoint = Invoke-Hidden $service 'BeginCheckpoint'
-    foreach ($entry in (Get-Hidden $adminCheckpoint 'Entries')) {
-        Invoke-Hidden $service 'CommitCheckpointEntry' @($adminCheckpoint, $entry) | Out-Null
+    $flaggedInventory = New-Request $identity $afterReloadReopen.Snapshot.SessionId 7 6 $emptyInventory 'InventorySaveRequest'
+    Assert-True (Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($afterReloadReopen.Snapshot.SessionId, $flaggedInventory)).Accepted `
+        'Inventory fast path rejected the retained flagged full profile.'
+    $flaggedCheckpoint = Invoke-Hidden $service 'BeginCheckpoint'
+    foreach ($entry in (Get-Hidden $flaggedCheckpoint 'Entries')) {
+        Invoke-Hidden $service 'CommitCheckpointEntry' @($flaggedCheckpoint, $entry) | Out-Null
     }
-    $adminDisk = Invoke-Hidden $repository 'Load' @($identity, $storageKey)
-    Assert-True ($adminDisk.Envelope.Revision -eq 1 -and
-        $deserializeProfile.Invoke($profiles, [object[]]@($adminDisk.Envelope.GetPayloadCopy(), $null, $localSource)).m_usedCheats) `
-        'Admin checkpoint cleared the cheat flag or failed to expose a cold revision-1 disk baseline.'
+    $flaggedDisk = Invoke-Hidden $repository 'Load' @($identity, $storageKey)
+    Assert-True ($flaggedDisk.Envelope.Revision -eq 1 -and
+        $deserializeProfile.Invoke($profiles, [object[]]@($flaggedDisk.Envelope.GetPayloadCopy(), $null, $localSource)).m_usedCheats) `
+        'Checkpoint cleared the achievement flag or failed to expose a cold revision-1 disk baseline.'
     Invoke-Hidden $service 'CloseLocalHostSession' @($afterReloadReopen.Snapshot.SessionId) | Out-Null
     $script:fixturePolicyAdmin = $false
-    $adminReopen = Invoke-Hidden $service 'OpenOrCreateLocalHostSession' @($identity)
-    Assert-True ($adminReopen.Snapshot.Revision -eq 7 -and
-        $adminReopen.SemanticObservations[0] -like '*would_reject:used_cheats*') `
-        'Stored Observe could not reopen a previously accepted admin profile.'
-    $storedAudit = Get-Hidden (Get-Hidden $adminReopen 'AuditFindings') 'AuditObservations'
-    Assert-True ($storedAudit.Count -eq 1 -and (Get-Hidden $storedAudit[0] 'ReasonCode') -eq 'stored_policy_violation') `
+    $flaggedReopen = Invoke-Hidden $service 'OpenOrCreateLocalHostSession' @($identity)
+    Assert-True ($flaggedReopen.Snapshot.Revision -eq 7 -and
+        $flaggedReopen.SemanticObservations[0] -like '[[]used_cheats[]]*') `
+        'Stored Observe could not reopen a profile with achievement metadata.'
+    $storedAudit = Get-Hidden (Get-Hidden $flaggedReopen 'AuditFindings') 'AuditObservations'
+    Assert-True ($storedAudit.Count -eq 1 -and (Get-Hidden $storedAudit[0] 'ReasonCode') -eq 'used_cheats') `
         'Stored reopen lost its generated Observe classification.'
-    $revokedRequest = New-Request $identity $adminReopen.Snapshot.SessionId 8 7 $adminPayload
-    Assert-True (-not (Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($adminReopen.Snapshot.SessionId, $revokedRequest)).Accepted) `
-        'Revoked administrator retained the incoming cheat-flag exemption.'
-    $lookup = [object[]]@($adminReopen.Snapshot.SessionId, $null)
-    Assert-True (Invoke-Hidden $service 'TryGetLocalHostSession' $lookup) 'Final admin test session missing.'
+    $repeatedFlagRequest = New-Request $identity $flaggedReopen.Snapshot.SessionId 8 7 $flaggedPayload
+    Assert-True (Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($flaggedReopen.Snapshot.SessionId, $repeatedFlagRequest)).Accepted `
+        'Achievement metadata became dependent on administrator state after reopen.'
+    $lookup = [object[]]@($flaggedReopen.Snapshot.SessionId, $null)
+    Assert-True (Invoke-Hidden $service 'TryGetLocalHostSession' $lookup) 'Final flagged-profile test session missing.'
     $finalSession = $lookup[1]
     $service.Dispose()
     Assert-True (Get-Hidden $finalSession "IsClosed") "Dispose did not close the host."

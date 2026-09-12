@@ -335,7 +335,7 @@ namespace ServerManager
             int payloadLength)
         {
             if (kind == CharacterEnvelopeKind.InventorySaveRequest &&
-                (payloadLength < sizeof(int) * 2 ||
+                (payloadLength < sizeof(int) + sizeof(ushort) ||
                  payloadLength >
                      ValheimPlayerProfileCodec.MaximumInventorySnapshotBytes))
             {

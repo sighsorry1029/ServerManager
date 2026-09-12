@@ -22,6 +22,7 @@ namespace ServerManager
         private const int MaximumPeerInfoBytes = 512 * 1024;
         private const int MaximumStringBytes = 4 * 1024;
         private const int MaximumSteamTicketBytes = 64 * 1024;
+        private const int SimulationDistanceBytes = sizeof(int) * 2 + sizeof(byte);
         private static readonly ConditionalWeakTable<ZRpc, object> Installed = new();
 
         /// <summary>
@@ -193,12 +194,36 @@ namespace ServerManager
                     out rejection);
             }
 
+            if (!reader.TrySkipString(MaximumStringBytes))
+            {
+                return Malformed(
+                    "PeerInfo contained an invalid PlayFab ID.",
+                    out rejection);
+            }
+
+            // Valheim 1.0 serializes near/far simulation distance and its
+            // classic-mode flag between the common identity fields and the
+            // direction-specific authentication/world fields.
+            if (!reader.TrySkip(SimulationDistanceBytes))
+            {
+                return Malformed(
+                    "PeerInfo ended before the simulation distance.",
+                    out rejection);
+            }
+
             if (receivingOnServer)
             {
                 if (!reader.TrySkipString(MaximumStringBytes))
                 {
                     return Malformed(
                         "PeerInfo contained an invalid password field.",
+                        out rejection);
+                }
+
+                if (!reader.TrySkipString(MaximumStringBytes))
+                {
+                    return Malformed(
+                        "PeerInfo contained an invalid invite secret.",
                         out rejection);
                 }
 

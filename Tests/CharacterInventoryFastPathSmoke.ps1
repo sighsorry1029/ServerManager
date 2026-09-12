@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'Valheim107Fixtures.ps1')
 
 function Assert-True {
     param(
@@ -139,35 +140,20 @@ function New-InventorySnapshotBytes {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([int]106)
-        if ([string]::IsNullOrEmpty($PrefabName)) {
-            $writer.Write([int]0)
-        }
-        else {
-            $writer.Write([int]1)
-            $writer.Write($PrefabName)
-            $writer.Write([int]$Stack)
-            $writer.Write([single]12.5)
-            $writer.Write([int]$PositionX)
-            $writer.Write([int]$PositionY)
-            $writer.Write($false)
-            $writer.Write([int]1)
-            $writer.Write([int]0)
-            $writer.Write([long]76561198000000001)
-            $writer.Write("fast-path-crafter")
-            if ($null -ne $CustomDictionary) {
-                $writer.Write($CustomDictionary)
+        $writer.Write([int]109)
+        $writer.Write([uint16](-not [string]::IsNullOrEmpty($PrefabName)))
+        if (-not [string]::IsNullOrEmpty($PrefabName)) {
+            if ($null -eq $CustomDictionary) {
+                $customStream = [IO.MemoryStream]::new()
+                $customWriter = [IO.BinaryWriter]::new($customStream)
+                try {
+                    $customWriter.Write([int](-not [string]::IsNullOrEmpty($CustomValue)))
+                    if ($CustomValue) { $customWriter.Write('fast.path.marker'); $customWriter.Write($CustomValue) }
+                    $customWriter.Flush(); $CustomDictionary = $customStream.ToArray()
+                } finally { $customWriter.Dispose(); $customStream.Dispose() }
             }
-            elseif ([string]::IsNullOrEmpty($CustomValue)) {
-                $writer.Write([int]0)
-            }
-            else {
-                $writer.Write([int]1)
-                $writer.Write("fast.path.marker")
-                $writer.Write($CustomValue)
-            }
-            $writer.Write([int]$WorldLevel)
-            $writer.Write($true)
+            [Valheim107Fixture]::Item($writer, $PrefabName, $Stack, 12.5, $PositionX, $PositionY, $false,
+                1, 0, 76561198000000001, 'fast-path-crafter', $CustomDictionary, $WorldLevel, $true, $false)
         }
 
         $writer.Flush()
@@ -185,7 +171,7 @@ function New-InnerPlayerDataFixture {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([int]29)
+        $writer.Write([int]33)
         $writer.Write([single]25)
         $writer.Write([single]24)
         $writer.Write([single]50)
@@ -230,6 +216,7 @@ function New-InnerPlayerDataFixture {
         $writer.Write([single]49)
         $writer.Write([single]5)
         $writer.Write([single]4)
+        $writer.Write([int]0) # build menu byte array
         $writer.Flush()
 
         return [pscustomobject]@{
@@ -290,35 +277,18 @@ function New-PlayerProfilePayload {
         [bool]$HasPlayerData = $true
     )
 
-    $package = [Activator]::CreateInstance($script:zPackageType)
-    Invoke-ZPackageWrite $package $script:zPackageWriteInt ([int]43)
-    Invoke-ZPackageWrite $package $script:zPackageWriteInt ([int]105)
-    for ($index = 0; $index -lt 105; ++$index) {
-        Invoke-ZPackageWrite $package $script:zPackageWriteSingle ([single]0)
-    }
+    $stream = [IO.MemoryStream]::new()
+    $writer = [IO.BinaryWriter]::new($stream)
+    try {
+        $writer.Write([int]46); [Valheim107Fixture]::Statistics($writer)
+        $writer.Write($false); $writer.Write([int]0)
+        $writer.Write($CharacterName); $writer.Write($PlayerId)
+        $writer.Write('fast-path-seed'); $writer.Write($false); $writer.Write([long]0)
+        $writer.Write($HasPlayerData)
+        if ($HasPlayerData) { $writer.Write([int]$PlayerData.Length); $writer.Write($PlayerData) }
+        $writer.Flush(); return ,$stream.ToArray()
+    } finally { $writer.Dispose(); $stream.Dispose() }
 
-    Invoke-ZPackageWrite $package $script:zPackageWriteBool $false
-    Invoke-ZPackageWrite $package $script:zPackageWriteInt ([int]0)
-    Invoke-ZPackageWrite $package $script:zPackageWriteString $CharacterName
-    Invoke-ZPackageWrite $package $script:zPackageWriteLong $PlayerId
-    Invoke-ZPackageWrite $package $script:zPackageWriteString "fast-path-seed"
-    Invoke-ZPackageWrite $package $script:zPackageWriteBool $false
-    Invoke-ZPackageWrite $package $script:zPackageWriteLong ([long]0)
-    for ($index = 0; $index -lt 6; ++$index) {
-        Invoke-ZPackageWrite $package $script:zPackageWriteInt ([int]0)
-    }
-
-    Invoke-ZPackageWrite $package $script:zPackageWriteBool $HasPlayerData
-    if ($HasPlayerData) {
-        Invoke-ZPackageWrite `
-            $package `
-            $script:zPackageWriteByteArray `
-            ([byte[]]$PlayerData)
-    }
-
-    return [byte[]]$script:zPackageGetArray.Invoke(
-        $package,
-        [object[]]@())
 }
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -457,13 +427,13 @@ try {
         Where-Object FullName -eq "Version" |
         Select-Object -First 1
     $playerVersionField = $versionType.Fields |
-        Where-Object Name -eq "m_playerVersion" |
+        Where-Object Name -eq "c_PlayerVersion" |
         Select-Object -First 1
     Assert-True (
         $null -ne $playerVersionField -and
         $playerVersionField.HasConstant) `
         "The installed PlayerProfile version marker changed."
-    $playerVersionField.Constant = [int]43
+    Assert-True ($playerVersionField.Constant -eq 46) 'Expected original Valheim 1.0.7 profile marker.'
     $gameDefinition.Write($gameStream)
     $gameAssembly = [Reflection.Assembly]::Load($gameStream.ToArray())
 }
@@ -751,7 +721,7 @@ Assert-True (
     $validatedPlayerId -eq [long]76561198000000001 -and
     $semantic.HasPlayerData -and
     $items.Count -eq 1 -and
-    $items[0].PrefabName -ceq "FastInventoryItem" -and
+    $items[0].PrefabHash -eq [Valheim107Fixture]::Hash("FastInventoryItem") -and
     $items[0].Stack -eq 7 -and
     $items[0].PositionX -eq 3 -and
     $items[0].PositionY -eq 4 -and
@@ -802,13 +772,16 @@ foreach ($itemWorldLevel in @(0, 1, 2, 10, 255)) {
         "The inventory fast path clamped, dropped, or rewrote world level $itemWorldLevel."
 }
 
-foreach ($invalidWorldLevel in @(-1, 256, [int]::MinValue, [int]::MaxValue)) {
+# World level is one byte in inventory 109; out-of-range integers cannot be
+# represented. Reject unknown flag bits instead, through the same three paths.
+foreach ($invalidCheatFlags in @(2, 128, 255)) {
     [byte[]]$invalidLevelInventory = New-InventorySnapshotBytes `
-        -PrefabName "WorldLevelDataItem" -WorldLevel $invalidWorldLevel
+        -PrefabName "WorldLevelDataItem" -WorldLevel 255
+    $invalidLevelInventory[$invalidLevelInventory.Length - 1] = [byte]$invalidCheatFlags
     $invalidLevelError = Assert-ThrowsLike `
         { Invoke-OneArgument $validateInventory $profileCodec $invalidLevelInventory } `
         "*invalid inventory item data*" `
-        "Standalone inventory parsing accepted out-of-range world level $invalidWorldLevel."
+        "Standalone inventory parsing accepted unknown item flag bits $invalidCheatFlags."
     Assert-True ($invalidLevelError.GetType() -eq $protocolExceptionType) `
         "An invalid inventory world level did not fail as a protocol error."
 
@@ -819,7 +792,7 @@ foreach ($invalidWorldLevel in @(-1, 256, [int]::MinValue, [int]::MaxValue)) {
     $invalidLevelProfileError = Assert-ThrowsLike `
         { Invoke-TwoArguments $validateSnapshot $profileCodec $identity $invalidLevelProfile } `
         "*invalid inventory item data*" `
-        "Full-profile parsing accepted out-of-range world level $invalidWorldLevel."
+        "Full-profile parsing accepted unknown item flag bits $invalidCheatFlags."
     Assert-True ($invalidLevelProfileError.GetType() -eq $protocolExceptionType) `
         "An invalid full-profile world level did not fail as a protocol error."
 
@@ -831,7 +804,7 @@ foreach ($invalidWorldLevel in @(-1, 256, [int]::MinValue, [int]::MaxValue)) {
     $invalidLevelReplaceError = Assert-ThrowsLike `
         { $replaceInventory.Invoke($profileCodec, $invalidLevelReplaceArguments) } `
         "*invalid inventory item data*" `
-        "Inventory materialization accepted out-of-range world level $invalidWorldLevel."
+        "Inventory materialization accepted unknown item flag bits $invalidCheatFlags."
     Assert-True ($invalidLevelReplaceError.GetType() -eq $protocolExceptionType -and
         (Test-ByteArrayEqual $fullProfile $fullProfileBefore)) `
         "Rejected world-level data altered the authoritative full-profile input."
@@ -978,7 +951,7 @@ foreach ($boundaryKind in @($snapshotKind, $saveRequestKind)) {
         $sessionId,
         $identity,
         $createdUtc,
-        [int]43,
+        [int]46,
         $boundaryPayload)
     $boundaryEnvelope = $createEnvelope.Invoke($null, $boundaryArguments)
     # Direct reflection retains the returned byte[] as one object instead of
@@ -1034,7 +1007,7 @@ $createInventoryArguments[2] = [long]1
 $createInventoryArguments[3] = $sessionId
 $createInventoryArguments[4] = $identity
 $createInventoryArguments[5] = $createdUtc
-$createInventoryArguments[6] = [int]43
+$createInventoryArguments[6] = [int]46
 $createInventoryArguments[7] = $replacementInventory
 $inventoryEnvelope = $createEnvelope.Invoke(
     $null,
@@ -1074,7 +1047,7 @@ Assert-True ($badRevisionError.GetType() -eq $protocolExceptionType) `
     "A skipped inventory revision did not fail as a protocol error."
 
 $shortPayloadArguments = [object[]]$createInventoryArguments.Clone()
-$shortPayloadArguments[7] = [byte[]]::new(7)
+$shortPayloadArguments[7] = [byte[]]::new(5)
 $shortPayloadEnvelope = $createEnvelope.Invoke(
     $null,
     $shortPayloadArguments)
@@ -1085,6 +1058,14 @@ Assert-ThrowsLike `
         $shortPayloadEnvelope } `
     "*invalid length*" `
     "An undersized inventory request entered the wire protocol." | Out-Null
+
+$emptyInventoryArguments = [object[]]$createInventoryArguments.Clone()
+$emptyInventoryArguments[7] = [byte[]]([BitConverter]::GetBytes([int]109) + [BitConverter]::GetBytes([uint16]0))
+$emptyInventoryEnvelope = $createEnvelope.Invoke($null, $emptyInventoryArguments)
+[byte[]]$emptyInventoryWire = Invoke-OneArgument $encodeEnvelope $envelopeCodec $emptyInventoryEnvelope
+$emptyInventoryDecoded = Invoke-OneArgument $decodeEnvelope $envelopeCodec $emptyInventoryWire
+Assert-True (Test-ByteArrayEqual ($emptyInventoryDecoded.GetPayloadCopy()) $emptyInventoryArguments[7]) `
+    "A valid empty inventory could not clear the previous six-byte-header inventory snapshot."
 
 $oversizedPayloadArguments = [object[]]$createInventoryArguments.Clone()
 $oversizedPayloadArguments[7] = $oversizedInventory
@@ -1109,7 +1090,7 @@ $admissionArguments[2] = [long]$decodedInventory.BaseRevision
 $admissionArguments[3] = $decodedInventory.SessionId
 $admissionArguments[4] = $identity
 $admissionArguments[5] = $decodedInventory.CreatedUtc
-$admissionArguments[6] = [int]43
+$admissionArguments[6] = [int]46
 $admissionArguments[7] = $materialized
 $admissionEnvelope = $createEnvelope.Invoke(
     $null,
@@ -1121,7 +1102,7 @@ $checkpointArguments[2] = [long]$admissionEnvelope.BaseRevision
 $checkpointArguments[3] = $sessionId
 $checkpointArguments[4] = $identity
 $checkpointArguments[5] = $createdUtc
-$checkpointArguments[6] = [int]43
+$checkpointArguments[6] = [int]46
 $checkpointArguments[7] = $admissionEnvelope.GetPayloadCopy()
 $checkpointEnvelope = $createEnvelope.Invoke(
     $null,

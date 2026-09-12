@@ -264,7 +264,19 @@ try {
             $onPlayerReady `
             $activityFullName `
             "TryResolveAuthenticatedSteam64") `
-        "OnPlayerReady does not derive its log key from the authenticated Steam socket."
+        "OnPlayerReady does not derive its log key from final Steam authentication."
+    $resolveAuthenticatedSteam64 = Get-MethodDefinition `
+        $activityType `
+        "TryResolveAuthenticatedSteam64"
+    Assert-True (Test-CallsMethod `
+            $resolveAuthenticatedSteam64 `
+            "ServerManager.ServerManagerRuntime" `
+            "TryResolveActiveDetectionPeer") `
+        "Player logging does not revalidate the generation-bound final Steam session."
+    Assert-True (-not (Test-ReferencesMember `
+            $resolveAuthenticatedSteam64 `
+            "GetPeerID")) `
+        "Player logging still depends on a concrete live socket after final authentication."
     Assert-True (Test-CallsMethod `
             $onPlayerReady `
             "ServerManager.CharacterSession" `
@@ -280,6 +292,10 @@ try {
             $activityFullName `
             "TryEnsureLoginWritten") `
         "Ready logging no longer initializes the per-character log stream."
+    Assert-True (Test-ContainsString `
+            $onPlayerReady `
+            "Per-player activity log registration skipped because the final Steam identity could not be revalidated.") `
+        "A final-authentication mismatch can still fail without a server diagnostic."
     Assert-True (Test-ReferencesMember $onPlayerReady "get_PlayerId") `
         "Ready logging no longer uses the authoritative CharacterSession player ID."
     $tryEnsureLoginWritten = Get-MethodDefinition `
@@ -436,7 +452,6 @@ try {
         $activityType `
         "AppendInventoryDetail"
     foreach ($visibleMember in @(
-            "get_PrefabName",
             "get_Stack",
             "get_Quality",
             "get_CustomData")) {
@@ -475,6 +490,25 @@ try {
     }
     Assert-True (Test-CallsMethod $writeInventoryDetail $activityFullName "TryWriteBlock") `
         "The detailed inventory snapshot is not emitted as one atomic block."
+    Assert-True (Test-CallsMethod $appendInventoryDetail $activityFullName "InventoryItemName") `
+        "Detailed inventory output no longer resolves saved item hashes to prefab names."
+    $inventoryItemName = Get-MethodDefinition $activityType "InventoryItemName"
+    foreach ($identityMember in @("get_PrefabName", "get_PrefabHash")) {
+        Assert-True (Test-ReferencesMember $inventoryItemName $identityMember) `
+            "Inventory name resolution lost $identityMember."
+    }
+    $writeInventoryDelta = Get-MethodDefinition $activityType "WriteInventoryDelta"
+    Assert-True (Test-ContainsString $writeInventoryDelta " Inv: ") `
+        "Inventory delta output lost its compact Inv label."
+    Assert-True (-not (Test-ContainsString $writeInventoryDelta " Inventory changed: ")) `
+        "Inventory delta output retained the repeated long label."
+    Assert-True (Test-CallsMethod $writeInventoryDelta $activityFullName "InventoryDeltaItemName") `
+        "Inventory delta output no longer resolves saved item hashes to prefab names."
+    $resolveInventoryItemName = Get-MethodDefinition $activityType "ResolveInventoryItemName"
+    Assert-True (Test-CallsMethod $resolveInventoryItemName "ObjectDB" "TryGetItemPrefab") `
+        "Inventory item names are not resolved through Valheim's public ObjectDB hash lookup."
+    Assert-True (Test-ContainsString $resolveInventoryItemName "unknown:") `
+        "Unresolved inventory items lost their stable unknown-item fallback."
     Assert-True (Test-CallsMethod `
             $appendInventoryDetail `
             $activityFullName `

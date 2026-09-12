@@ -31,10 +31,11 @@ function Invoke-Observations {
                 # Convenience for the existing literal fixtures only. Production
                 # receives metadata directly from the semantic evaluator.
                 $category = 'ValidationObserved'; $code = 'stored_policy_violation'
-                if ($value -match '^\[admin_bypass:(used_cheats|forbidden_prefab)') {
+                if ($value -match '^\[admin_bypass:(forbidden_prefab)') {
                     $category = 'AdminBypass'; $code = $Matches[1]
-                } elseif ($value -match '^\[(skill_gain|skill_accumulator):') {
+                } elseif ($value -match '^\[(skill_gain|skill_accumulator):|^\[used_cheats\]') {
                     $category = 'RevisionObserved'; $code = $Matches[1]
+                    if ($value -match '^\[used_cheats\]') { $code = 'used_cheats' }
                 } elseif ($value -notmatch '^\[would_reject:') { continue }
                 $key = $value.Substring(0, $value.IndexOf(']') + 1)
                 $value = New-AuditObservation $category $code $key $value
@@ -248,17 +249,17 @@ try {
     Invoke-Observations @('[admin_bypass:forbidden_prefab:SwordCheat] host exception') -Source 'incoming_host'
     Assert-True ($queue.Count -eq 2) 'The host admin bypass was not independently audited.'
     Reset-TestQueue
-    Invoke-Observations @('[admin_bypass:used_cheats] administrator retained usage flag')
-    Invoke-Observations @('[admin_bypass:used_cheats] repeated save') -Revision 3
-    Invoke-Observations @('[admin_bypass:used_cheats] host usage flag') -Source 'incoming_host'
+    Invoke-Observations @('[used_cheats] character retains achievement marker')
+    Invoke-Observations @('[used_cheats] repeated save') -Revision 3
+    Invoke-Observations @('[used_cheats] host usage flag') -Source 'incoming_host'
     Assert-True ($queue.Count -eq 2 -and
-        @($queue.ToArray() | Where-Object Kind -eq 'security.admin_bypass').Count -eq 2 -and
+        @($queue.ToArray() | Where-Object Kind -eq 'character.revision_observed').Count -eq 2 -and
         @($queue.ToArray() | Where-Object { $_.Fields['reason_code'] -eq 'used_cheats' }).Count -eq 2) `
-        'Cheat-flag exemptions lost remote/host audit routing or stable cooldown.'
+        'Achievement metadata observations lost remote/host audit routing or stable cooldown.'
     Reset-TestQueue
-    Invoke-Observations @((New-AuditObservation 'AdminBypass' 'used_cheats' '[admin_bypass:used_cheats]' 'A new sentence without any classification prefix.'))
-    Invoke-Observations @((New-AuditObservation 'AdminBypass' 'used_cheats' '[admin_bypass:used_cheats]' '[skill_gain:99] misleading display prefix')) -Revision 7
-    Assert-True ($queue.Count -eq 1 -and $queue.ToArray()[0].Kind -eq 'security.admin_bypass' -and
+    Invoke-Observations @((New-AuditObservation 'RevisionObserved' 'used_cheats' '[used_cheats]' 'A new sentence without any classification prefix.'))
+    Invoke-Observations @((New-AuditObservation 'RevisionObserved' 'used_cheats' '[used_cheats]' '[skill_gain:99] misleading display prefix')) -Revision 7
+    Assert-True ($queue.Count -eq 1 -and $queue.ToArray()[0].Kind -eq 'character.revision_observed' -and
         $queue.ToArray()[0].Fields['reason_code'] -eq 'used_cheats' -and
         $queue.ToArray()[0].Fields['finding'] -eq 'A new sentence without any classification prefix.') `
         'Observation classification or stable dedupe still depends on display wording.'

@@ -135,6 +135,7 @@ public sealed class ZPackage
     public void Write(float value) { writer.Write(value); }
     public void Write(bool value) { writer.Write(value); }
     public void Write(string value) { writer.Write(value); }
+    public void Write(byte[] value) { writer.Write(value.Length); writer.Write(value); }
     public void Write(UnityEngine.Vector3 value) { Write(value.x); Write(value.y); Write(value.z); }
     public byte[] GetArray() { writer.Flush(); return stream.ToArray(); }
 }
@@ -156,7 +157,7 @@ namespace ServerManager
     }
     public sealed partial class ValheimPlayerProfileCodec
     {
-        public const int SupportedPlayerDataVersion = 29;
+        public const int SupportedPlayerDataVersion = 33;
         public byte[] CreateEmptyProfileBytes(string name) { throw new Exception("Unmaterialized first-spawn fallback is forbidden."); }
         static PlayerProfile CreateEmptyProfile(string name) { return new PlayerProfile(); }
         static class ProfilePrivateAccess { public static void SetPlayerData(PlayerProfile profile, byte[] data) { profile.Data = data; } }
@@ -210,7 +211,7 @@ public static class CharacterStarterItemsHarness
     {
         using (var reader = new BinaryReader(new MemoryStream(data)))
         {
-            Check(reader.ReadInt32() == 29, "Player schema");
+            Check(reader.ReadInt32() == 33, "Player schema");
             Check(reader.ReadSingle() == 25 && reader.ReadSingle() == 25 && reader.ReadSingle() == 75, "new player stats");
             reader.ReadSingle(); reader.ReadString(); reader.ReadSingle();
             Check(reader.ReadInt32() == 106, "inventory schema");
@@ -236,7 +237,7 @@ public static class CharacterStarterItemsHarness
             reader.ReadString(); reader.ReadString();
             for (int i = 0; i < 6; ++i) reader.ReadSingle();
             Check(reader.ReadInt32() == 0 && reader.ReadInt32() == 0 && reader.ReadInt32() == 2 && reader.ReadInt32() == 0 && reader.ReadInt32() == 0, "no food, skills or custom data granted");
-            Check(reader.ReadSingle() == 75 && reader.ReadSingle() == 0 && reader.ReadSingle() == 0 && reader.BaseStream.Position == reader.BaseStream.Length, "complete bounded Player payload");
+            Check(reader.ReadSingle() == 75 && reader.ReadSingle() == 0 && reader.ReadSingle() == 0 && reader.ReadInt32() == 0 && reader.BaseStream.Position == reader.BaseStream.Length, "complete bounded Player payload");
             return result;
         }
     }

@@ -13,10 +13,12 @@ namespace ServerManager
     /// </summary>
     public sealed partial class ValheimPlayerProfileCodec
     {
-        public const int SupportedPlayerProfileVersion = 43;
-        public const int SupportedPlayerDataVersion = 29;
+        public const int SupportedPlayerProfileVersion = 46;
+        public const int SupportedPlayerDataVersion = 33;
         public const int MaximumInventorySnapshotBytes = 1024 * 1024;
-        private const int SupportedPlayerStatCount = 105;
+        private const int SupportedPlayerStatCount = 205;
+        private const int SupportedStatGroupCount = 10;
+        private const int SupportedEnemyStatGroupCount = 5;
         private const int MaxMetadataStringUtf8Bytes = 64 * 1024;
 
         private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
@@ -105,7 +107,7 @@ namespace ServerManager
             }
 
             EnsureSupportedGameVersion();
-            if (payload.Length < sizeof(int) * 2 ||
+            if (payload.Length < sizeof(int) + sizeof(ushort) ||
                 payload.Length > MaximumInventorySnapshotBytes)
             {
                 throw new CharacterProtocolException(
@@ -248,7 +250,7 @@ namespace ServerManager
             return materialized;
         }
 
-        /// <summary>Splices only the version-2 skill section into a validated 43/29 profile.</summary>
+        /// <summary>Splices only the version-2 skill section into a validated 46/33 profile.</summary>
         internal byte[] ReplaceSkillAdmin(
             CharacterIdentity identity, byte[] fullProfile, string operation,
             string skillName, float value, out CharacterValidatedSnapshot validatedSnapshot)
@@ -298,20 +300,7 @@ namespace ServerManager
 
             ZPackage package = new ZPackage();
             package.Write(SupportedPlayerProfileVersion);
-            package.Write(SupportedPlayerStatCount);
-            for (int index = 0; index < SupportedPlayerStatCount; ++index)
-            {
-                float value;
-                if (!profile.m_playerStats.m_stats.TryGetValue(
-                        (PlayerStatType)index,
-                        out value))
-                {
-                    value = 0f;
-                }
-
-                EnsureFinite(value, "player statistic");
-                package.Write(value);
-            }
+            WriteProfileStatistics(package, profile);
 
             package.Write(profile.m_firstSpawn);
 
@@ -396,12 +385,6 @@ namespace ServerManager
             }
 
             package.Write(new DateTimeOffset(dateCreated).ToUnixTimeSeconds());
-            WriteStringFloatDictionary(package, profile.m_knownWorlds, "known worlds");
-            WriteStringFloatDictionary(package, profile.m_knownWorldKeys, "known world keys");
-            WriteStringFloatDictionary(package, profile.m_knownCommands, "known commands");
-            WriteStringFloatDictionary(package, profile.m_enemyStats, "enemy statistics");
-            WriteStringFloatDictionary(package, profile.m_itemPickupStats, "item pickup statistics");
-            WriteStringFloatDictionary(package, profile.m_itemCraftStats, "item craft statistics");
 
             byte[]? playerData = ProfilePrivateAccess.GetPlayerData(profile);
             package.Write(playerData != null);
@@ -475,19 +458,7 @@ namespace ServerManager
 
                 PlayerProfile profile = new PlayerProfile(localFilename, fileSource);
 
-                int statisticCount = ReadCount(package, "player statistic count");
-                if (statisticCount != SupportedPlayerStatCount)
-                {
-                    throw new CharacterProtocolException(
-                        "The raw PlayerProfile statistic count is unsupported.");
-                }
-
-                for (int index = 0; index < statisticCount; ++index)
-                {
-                    float statistic = package.ReadSingle();
-                    EnsureFinite(statistic, "player statistic");
-                    profile.m_playerStats[(PlayerStatType)index] = statistic;
-                }
+                ReadProfileStatistics(package, rawPlayerProfile, profile);
 
                 profile.m_firstSpawn = package.ReadBool();
                 System.Collections.IDictionary worldData =
@@ -576,39 +547,10 @@ namespace ServerManager
                 profile.m_usedCheats = package.ReadBool();
 
                 long creationSeconds = package.ReadLong();
+                // Preserve the stored instant. Date would discard the time and
+                // reinterpret UTC midnight in the local timezone when saved.
                 profile.m_dateCreated =
-                    DateTimeOffset.FromUnixTimeSeconds(creationSeconds).Date;
-
-                ReadStringFloatDictionary(
-                    package,
-                    rawPlayerProfile,
-                    profile.m_knownWorlds,
-                    "known worlds");
-                ReadStringFloatDictionary(
-                    package,
-                    rawPlayerProfile,
-                    profile.m_knownWorldKeys,
-                    "known world keys");
-                ReadStringFloatDictionary(
-                    package,
-                    rawPlayerProfile,
-                    profile.m_knownCommands,
-                    "known commands");
-                ReadStringFloatDictionary(
-                    package,
-                    rawPlayerProfile,
-                    profile.m_enemyStats,
-                    "enemy statistics");
-                ReadStringFloatDictionary(
-                    package,
-                    rawPlayerProfile,
-                    profile.m_itemPickupStats,
-                    "item pickup statistics");
-                ReadStringFloatDictionary(
-                    package,
-                    rawPlayerProfile,
-                    profile.m_itemCraftStats,
-                    "item craft statistics");
+                    DateTimeOffset.FromUnixTimeSeconds(creationSeconds).UtcDateTime;
 
                 if (package.ReadBool())
                 {
@@ -712,21 +654,7 @@ namespace ServerManager
                         "The raw PlayerProfile version is unsupported.");
                 }
 
-                int statisticCount = ReadCount(
-                    package,
-                    "player statistic count");
-                if (statisticCount != SupportedPlayerStatCount)
-                {
-                    throw new CharacterProtocolException(
-                        "The raw PlayerProfile statistic count is unsupported.");
-                }
-
-                for (int index = 0; index < statisticCount; ++index)
-                {
-                    EnsureFinite(
-                        package.ReadSingle(),
-                        "player statistic");
-                }
+                ReadProfileStatistics(package, rawPlayerProfile, null);
 
                 _ = package.ReadBool();
                 int worldCount = ReadCount(package, "world profile count");
@@ -863,6 +791,67 @@ namespace ServerManager
             }
         }
 
+        private void WriteProfileStatistics(ZPackage package, PlayerProfile profile)
+        {
+            if (profile.m_playerStats.Length != SupportedStatGroupCount)
+                throw new CharacterProtocolException("The PlayerProfile statistic groups are unsupported.");
+            package.Write(SupportedPlayerStatCount);
+            package.Write(SupportedStatGroupCount);
+            foreach (PlayerProfile.PlayerStats stats in profile.m_playerStats)
+            {
+                if (stats == null || stats.m_enemyStats.Length != SupportedEnemyStatGroupCount)
+                    throw new CharacterProtocolException("The PlayerProfile enemy statistic groups are unsupported.");
+                for (int index = 0; index < SupportedPlayerStatCount; ++index)
+                {
+                    stats.m_stats.TryGetValue((PlayerStatType)index, out float value);
+                    EnsureFinite(value, "player statistic");
+                    package.Write(value);
+                }
+                WriteStringFloatDictionary(package, stats.m_knownWorlds, "known worlds");
+                WriteStringFloatDictionary(package, stats.m_knownWorldKeys, "known world keys");
+                WriteStringFloatDictionary(package, stats.m_knownCommands, "known commands");
+                package.Write(SupportedEnemyStatGroupCount);
+                foreach (Dictionary<string, float> enemies in stats.m_enemyStats)
+                    WriteStringFloatDictionary(package, enemies, "enemy statistics");
+                WriteStringFloatDictionary(package, stats.m_itemPickupStats, "item pickup statistics");
+                WriteStringFloatDictionary(package, stats.m_itemCraftStats, "item craft statistics");
+                WriteStringFloatDictionary(package, stats.m_pickableStats, "pickable statistics");
+                WriteStringFloatDictionary(package, stats.m_foodEatenStats, "food statistics");
+                WriteStringFloatDictionary(package, stats.m_piecesPlacedStats, "building statistics");
+            }
+        }
+
+        // The identity-only reader consumes the same bounded prefix without
+        // constructing a profile or touching ObjectDB/Unity objects.
+        private void ReadProfileStatistics(ZPackage package, byte[] backing, PlayerProfile? profile)
+        {
+            if (ReadCount(package, "player statistic count") != SupportedPlayerStatCount ||
+                ReadCount(package, "statistic group count") != SupportedStatGroupCount)
+                throw new CharacterProtocolException("The raw PlayerProfile statistic counts are unsupported.");
+            for (int group = 0; group < SupportedStatGroupCount; ++group)
+            {
+                PlayerProfile.PlayerStats? stats = profile?.m_playerStats[group];
+                for (int index = 0; index < SupportedPlayerStatCount; ++index)
+                {
+                    float value = package.ReadSingle();
+                    EnsureFinite(value, "player statistic");
+                    if (stats != null) stats[(PlayerStatType)index] = value;
+                }
+                ReadStringFloatDictionary(package, backing, stats?.m_knownWorlds, "known worlds");
+                ReadStringFloatDictionary(package, backing, stats?.m_knownWorldKeys, "known world keys");
+                ReadStringFloatDictionary(package, backing, stats?.m_knownCommands, "known commands");
+                if (ReadCount(package, "enemy statistic group count") != SupportedEnemyStatGroupCount)
+                    throw new CharacterProtocolException("The raw PlayerProfile enemy statistic count is unsupported.");
+                for (int enemy = 0; enemy < SupportedEnemyStatGroupCount; ++enemy)
+                    ReadStringFloatDictionary(package, backing, stats?.m_enemyStats[enemy], "enemy statistics");
+                ReadStringFloatDictionary(package, backing, stats?.m_itemPickupStats, "item pickup statistics");
+                ReadStringFloatDictionary(package, backing, stats?.m_itemCraftStats, "item craft statistics");
+                ReadStringFloatDictionary(package, backing, stats?.m_pickableStats, "pickable statistics");
+                ReadStringFloatDictionary(package, backing, stats?.m_foodEatenStats, "food statistics");
+                ReadStringFloatDictionary(package, backing, stats?.m_piecesPlacedStats, "building statistics");
+            }
+        }
+
         private void WriteStringFloatDictionary(
             ZPackage package,
             Dictionary<string, float> values,
@@ -890,10 +879,11 @@ namespace ServerManager
         private void ReadStringFloatDictionary(
             ZPackage package,
             byte[] profileBacking,
-            Dictionary<string, float> destination,
+            Dictionary<string, float>? destination,
             string fieldName)
         {
-            destination.Clear();
+            destination?.Clear();
+            HashSet<string>? skippedKeys = destination == null ? new HashSet<string>(StringComparer.Ordinal) : null;
             int count = ReadCount(package, fieldName);
             for (int index = 0; index < count; ++index)
             {
@@ -904,13 +894,13 @@ namespace ServerManager
                         fieldName + " key");
                 float value = package.ReadSingle();
                 EnsureFinite(value, fieldName);
-                if (destination.ContainsKey(key))
+                if (destination != null ? destination.ContainsKey(key) : !skippedKeys!.Add(key))
                 {
                     throw new CharacterProtocolException(
                         "The PlayerProfile contains a duplicate " + fieldName + " key.");
                 }
 
-                destination.Add(key, value);
+                destination?.Add(key, value);
             }
         }
 
@@ -1157,7 +1147,7 @@ namespace ServerManager
             reader.SkipStringSet("shown tutorials");
             reader.SkipStringSet("unique keys");
             reader.SkipStringSet("trophies");
-            reader.SkipInt32Set("known biomes");
+            reader.SkipStringSet("known biomes");
             reader.SkipStringStringDictionary("known texts");
 
             reader.ReadString("beard item");
@@ -1228,6 +1218,7 @@ namespace ServerManager
                     "The inner Player stamina or eitr values are invalid.");
             }
 
+            reader.SkipByteArray("build menu state");
             reader.RequireEnd();
             return new CharacterSemanticSnapshot(
                 true,
@@ -1243,44 +1234,38 @@ namespace ServerManager
             ParseAndValidateInnerInventory(InnerPlayerDataReader reader)
         {
             int inventoryVersion = reader.ReadInt32("inventory version");
-            if (inventoryVersion != 106)
+            if (inventoryVersion != 109)
             {
                 throw new CharacterProtocolException(
                     "The inner Player inventory version is unsupported.");
             }
 
-            int itemCount = reader.ReadCount("inventory items", 256);
+            int itemCount = reader.ValidateCount(reader.ReadUInt16("inventory items"), "inventory items", 256);
             HashSet<long> occupiedPositions = new HashSet<long>();
             List<CharacterSemanticItemState> items =
                 new List<CharacterSemanticItemState>(itemCount);
             for (int index = 0; index < itemCount; ++index)
             {
-                string prefabName = reader.ReadString("item prefab");
-                int stack = reader.ReadInt32("item stack");
-                float durability =
-                    reader.ReadFinite("item durability");
-                int positionX = reader.ReadInt32("item position X");
-                int positionY = reader.ReadInt32("item position Y");
-                _ = reader.ReadBoolean("item equipped");
-                int quality = reader.ReadInt32("item quality");
-                int variant = reader.ReadInt32("item variant");
-                _ = reader.ReadInt64("item crafter ID");
-                reader.ReadString("item crafter name");
-                IReadOnlyList<KeyValuePair<string, string>> customData =
-                    reader.ReadSemanticStringDictionary(
-                        "item custom data",
-                        maximumCount: 256);
-                int worldLevel = reader.ReadInt32("item world level");
-                _ = reader.ReadBoolean("item picked-up flag");
+                _ = reader.ReadInt32("item durability hundredths");
+                int positionX = reader.ReadByte("item position X");
+                int positionY = reader.ReadByte("item position Y");
+                int worldLevel = reader.ReadByte("item world level");
+                int flags = reader.ReadByte("item flags");
+                int quality = (flags & 4) != 0 ? reader.ReadUInt16("item quality") : 1;
+                int stack = (flags & 8) != 0 ? reader.ReadUInt16("item stack") : 1;
+                if ((flags & 16) != 0) _ = reader.ReadInt32("item variant");
+                if ((flags & 32) != 0)
+                {
+                    _ = reader.ReadInt64("item crafter ID");
+                    reader.ReadString("item crafter name");
+                }
+                int prefabHash = (flags & 64) != 0 ? reader.ReadInt32("item prefab hash") : 0;
+                IReadOnlyList<KeyValuePair<string, string>> customData = (flags & 128) != 0
+                    ? reader.ReadSemanticStringDictionary("item custom data", 256, compactCount: true)
+                    : Array.Empty<KeyValuePair<string, string>>();
+                int cheatFlags = reader.ReadByte("item cheat flags");
 
-                if (string.IsNullOrEmpty(prefabName) ||
-                    stack < 1 ||
-                    positionX < -1 ||
-                    positionX > 255 ||
-                    positionY < -1 ||
-                    positionY > 255 ||
-                    worldLevel < 0 ||
-                    worldLevel > 255)
+                if (prefabHash == 0 || stack < 1 || (cheatFlags & ~1) != 0)
                 {
                     throw new CharacterProtocolException(
                         "The inner Player contains invalid inventory item data.");
@@ -1302,7 +1287,7 @@ namespace ServerManager
                 // values can reject client/mod-defined data or normalize it.
                 items.Add(
                     new CharacterSemanticItemState(
-                        prefabName,
+                        prefabHash,
                         stack,
                         quality,
                         worldLevel,
@@ -1360,7 +1345,11 @@ namespace ServerManager
                 string fieldName,
                 int? maximumCount = null)
             {
-                int count = ReadInt32(fieldName + " count");
+                return ValidateCount(ReadInt32(fieldName + " count"), fieldName, maximumCount);
+            }
+
+            internal int ValidateCount(int count, string fieldName, int? maximumCount = null)
+            {
                 int limit = Math.Min(
                     _maximumCollectionEntries,
                     maximumCount ?? _maximumCollectionEntries);
@@ -1387,6 +1376,27 @@ namespace ServerManager
                     _bytes[_position + 3] << 24;
                 _position += sizeof(int);
                 return value;
+            }
+
+            internal byte ReadByte(string fieldName)
+            {
+                Require(1, fieldName);
+                return _bytes[_position++];
+            }
+
+            internal int ReadUInt16(string fieldName)
+            {
+                Require(2, fieldName);
+                int value = _bytes[_position] | _bytes[_position + 1] << 8;
+                _position += 2;
+                return value;
+            }
+
+            internal void SkipByteArray(string fieldName)
+            {
+                int length = ReadInt32(fieldName + " length");
+                Require(length, fieldName);
+                _position += length;
             }
 
             internal long ReadInt64(string fieldName)
@@ -1567,9 +1577,18 @@ namespace ServerManager
             internal IReadOnlyList<KeyValuePair<string, string>>
                 ReadSemanticStringDictionary(
                 string fieldName,
-                int? maximumCount = null)
+                int? maximumCount = null,
+                bool compactCount = false)
             {
-                int count = ReadCount(fieldName, maximumCount);
+                int count;
+                if (compactCount)
+                {
+                    count = ReadByte(fieldName + " count");
+                    if ((count & 128) != 0)
+                        count = ((count & 127) << 8) | ReadByte(fieldName + " count");
+                    count = ValidateCount(count, fieldName, maximumCount);
+                }
+                else count = ReadCount(fieldName, maximumCount);
                 HashSet<string> keys =
                     new HashSet<string>(StringComparer.Ordinal);
                 List<KeyValuePair<string, string>> entries =
@@ -2046,11 +2065,11 @@ namespace ServerManager
             int runtimePlayerProfileVersion =
                 ReadRuntimeConstant(
                     ProfilePrivateAccess.ValheimVersionType,
-                    "m_playerVersion");
+                    "c_PlayerVersion");
             int runtimePlayerDataVersion =
                 ReadRuntimeConstant(
                     ProfilePrivateAccess.ValheimVersionType,
-                    "m_playerDataVersion");
+                    "c_PlayerDataVersion");
             int runtimePlayerStatCount = Convert.ToInt32(
                 Enum.Parse(typeof(PlayerStatType), "Count", false));
 

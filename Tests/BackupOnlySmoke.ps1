@@ -1,10 +1,12 @@
 param(
     [string]$Configuration = "Debug",
     [string]$GamePath = "C:\Program Files (x86)\Steam\steamapps\common\Valheim",
-    [switch]$FixtureOnly
+    [switch]$FixtureOnly,
+    [switch]$IsolateGameSaveFlags
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Valheim107Fixtures.ps1')
 $script:assertions = 0
 function Assert-True([bool]$Condition, [string]$Message) {
     ++$script:assertions
@@ -114,7 +116,7 @@ Load-TestDependency (Join-Path $managedRoot 'assembly_utils.dll') {
 $game = Load-TestDependency (Join-Path $managedRoot 'assembly_valheim.dll') {
     param($definition)
     $version = $definition.MainModule.Types | Where-Object FullName -eq 'Version'
-    ($version.Fields | Where-Object Name -eq 'm_playerVersion').Constant = [int]43
+    Assert-True (($version.Fields | Where-Object Name -eq 'c_PlayerVersion').Constant -eq 46) 'Expected original Valheim 1.0.7 profile marker.'
 }
 $fixtureAssemblyResolver = [ResolveEventHandler] {
     param($sender, $eventArgs)
@@ -132,6 +134,15 @@ $plugin = Load-TestDependency $pluginPath {
     $runtimeInitializer = $runtimeType.Methods | Where-Object Name -eq '.cctor' | Select-Object -First 1
     Clear-Body $runtimeInitializer
     $runtimeInitializer.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ret))
+    if ($IsolateGameSaveFlags) {
+        # The schema fixture tests SaveSystem flags, not Unity scene state.
+        # The real suppression guard is covered by LocalHostCharacterSmoke,
+        # CharacterLoadValidationSmoke and the original-runtime probe.
+        $guard = $runtimeType.Methods | Where-Object Name -eq 'get_CharacterLoadSaveSuppressed'
+        Clear-Body $guard
+        $guard.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_0))
+        $guard.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ret))
+    }
     # A backup capture must never synthesize a replacement profile or START ITEMS.
     $type = $definition.MainModule.Types | Where-Object FullName -eq 'ServerManager.ValheimPlayerProfileCodec'
     $method = $type.Methods | Where-Object Name -eq 'CreateInitialProfileBytes' | Select-Object -First 1
@@ -151,21 +162,25 @@ function New-InventoryPayload([object[]]$Items = @()) {
         return $Fallback
     }
     try {
-        $writer.Write([int]106); $writer.Write([int]$Items.Count)
+        $writer.Write([int]109); $writer.Write([uint16]$Items.Count)
         $slot = 0
         foreach ($item in $Items) {
-            $writer.Write([string](Item-Value $item 'Prefab' ''))
-            $writer.Write([int](Item-Value $item 'Stack' 1))
-            $writer.Write([single](Item-Value $item 'Durability' 0))
-            $writer.Write([int](Item-Value $item 'X' $slot)); $writer.Write([int](Item-Value $item 'Y' 0))
+            $customStream = [IO.MemoryStream]::new()
+            $customWriter = [IO.BinaryWriter]::new($customStream)
+            try {
+                $custom = Item-Value $item 'Custom' @{}
+                $customWriter.Write([int]$custom.Count)
+                foreach ($key in $custom.Keys) { $customWriter.Write([string]$key); $customWriter.Write([string]$custom[$key]) }
+                $customWriter.Flush()
+                [Valheim107Fixture]::Item($writer,
+                    [string](Item-Value $item 'Prefab' ''), [int](Item-Value $item 'Stack' 1),
+                    [single](Item-Value $item 'Durability' 0), [int](Item-Value $item 'X' $slot), [int](Item-Value $item 'Y' 0),
+                    [bool](Item-Value $item 'Equipped' $false), [int](Item-Value $item 'Quality' 1), [int](Item-Value $item 'Variant' 0),
+                    [long](Item-Value $item 'CrafterId' 0), [string](Item-Value $item 'CrafterName' ''), $customStream.ToArray(),
+                    [int](Item-Value $item 'WorldLevel' 0), [bool](Item-Value $item 'PickedUp' $false), [bool](Item-Value $item 'Cheated' $false))
+            }
+            finally { $customWriter.Dispose(); $customStream.Dispose() }
             ++$slot
-            $writer.Write([bool](Item-Value $item 'Equipped' $false))
-            $writer.Write([int](Item-Value $item 'Quality' 1)); $writer.Write([int](Item-Value $item 'Variant' 0))
-            $writer.Write([long](Item-Value $item 'CrafterId' 0)); $writer.Write([string](Item-Value $item 'CrafterName' ''))
-            $custom = Item-Value $item 'Custom' @{}
-            $writer.Write([int]$custom.Count)
-            foreach ($key in $custom.Keys) { $writer.Write([string]$key); $writer.Write([string]$custom[$key]) }
-            $writer.Write([int](Item-Value $item 'WorldLevel' 0)); $writer.Write([bool](Item-Value $item 'PickedUp' $false))
         }
         $writer.Flush()
         return ,$stream.ToArray()
@@ -174,16 +189,20 @@ function New-InventoryPayload([object[]]$Items = @()) {
 }
 function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
     [string]$ItemPrefab = '', [bool]$UsedCheats = $false, [bool]$HasPlayerData = $true,
-    [object[]]$SkillValues = @(), [object[]]$InventoryItems = $null) {
+    [object[]]$SkillValues = @(), [object[]]$InventoryItems = $null,
+    [string[]]$KnownBiomes = @(), [byte[]]$BuildMenuState = @()) {
     $inner = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($inner)
     try {
-        $writer.Write([int]29)
+        $writer.Write([int]33)
         foreach ($value in @([single]25, [single]25, [single]50, [single]0)) { $writer.Write($value) }
         $writer.Write(''); $writer.Write([single]0)
         if ($null -eq $InventoryItems) { $InventoryItems = if ($ItemPrefab) { @(@{ Prefab = $ItemPrefab }) } else { @() } }
         $writer.Write([byte[]](New-InventoryPayload $InventoryItems))
-        for ($index = 0; $index -lt 8; ++$index) { $writer.Write([int]0) }
+        for ($index = 0; $index -lt 6; ++$index) { $writer.Write([int]0) }
+        $writer.Write([int]$KnownBiomes.Count)
+        foreach ($biome in $KnownBiomes) { $writer.Write($biome) }
+        $writer.Write([int]0) # known texts
         $writer.Write(''); $writer.Write('')
         for ($index = 0; $index -lt 6; ++$index) { $writer.Write([single]0) }
         $writer.Write([int]0); $writer.Write([int]0)
@@ -193,6 +212,7 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
         }
         $writer.Write([int]0)
         $writer.Write([single]50); $writer.Write([single]0); $writer.Write([single]0)
+        $writer.Write([int]$BuildMenuState.Length); $writer.Write($BuildMenuState)
         $writer.Flush()
         [byte[]]$innerBytes = $inner.ToArray()
     }
@@ -200,12 +220,10 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
     $outer = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($outer)
     try {
-        $writer.Write([int]43); $writer.Write([int]105)
-        for ($index = 0; $index -lt 105; ++$index) { $writer.Write([single]0) }
+        $writer.Write([int]46); [Valheim107Fixture]::Statistics($writer)
         $writer.Write($false); $writer.Write([int]0)
         $writer.Write($Name); $writer.Write($PlayerId); $writer.Write($Seed)
         $writer.Write($UsedCheats); $writer.Write([long]0)
-        for ($index = 0; $index -lt 6; ++$index) { $writer.Write([int]0) }
         $writer.Write($HasPlayerData)
         if ($HasPlayerData) { $writer.Write([int]$innerBytes.Length); $writer.Write($innerBytes) }
         $writer.Flush()
@@ -217,7 +235,7 @@ function New-Request($Identity, [Guid]$SessionId, [long]$Revision, [long]$BaseRe
     [byte[]]$Payload, [string]$Kind = 'SaveRequest') {
     return $script:plugin.GetType('ServerManager.CharacterEnvelope').GetMethod('Create').Invoke($null,
         [object[]]@([Enum]::Parse($script:plugin.GetType('ServerManager.CharacterEnvelopeKind'), $Kind),
-            $Revision, $BaseRevision, $SessionId, $Identity, [DateTime]::UtcNow, [int]43, $Payload))
+            $Revision, $BaseRevision, $SessionId, $Identity, [DateTime]::UtcNow, [int]46, $Payload))
 }
 function Get-HostSession($Opened) {
     $lookup = [object[]]@($Opened.Snapshot.SessionId, $null)
@@ -332,7 +350,7 @@ try {
     Assert-True (-not (Get-Hidden (Get-HostSession $authoritative) 'BackupOnly') -and
         $authoritative.Snapshot.Revision -eq 3 -and
         (Test-Bytes $authoritative.Snapshot.GetPayloadCopy() $capture3)) 'Mode-off reconnect did not select latest acknowledged RAM.'
-    $inventory = [byte[]]@([BitConverter]::GetBytes([int]106) + [BitConverter]::GetBytes([int]0))
+    $inventory = [byte[]]@([BitConverter]::GetBytes([int]109) + [BitConverter]::GetBytes([uint16]0))
     $inventorySave = New-Request $identity $authoritative.Snapshot.SessionId 4 3 $inventory 'InventorySaveRequest'
     Assert-True (Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($authoritative.Snapshot.SessionId, $inventorySave)).Accepted 'Capture did not establish inventory fast-path baseline.'
     $latest = Invoke-Hidden $service 'GetLocalHostSnapshot' @($authoritative.Snapshot.SessionId)
@@ -366,15 +384,13 @@ try {
     Invoke-Hidden $service 'CloseLocalHostSession' @($adminItem.Snapshot.SessionId) | Out-Null
     $script:fixtureAdmin = $false
     $cheats = New-ProfilePayload 'PolicyHero' 202 'cheat-used' -UsedCheats $true
-    Assert-Throws { Invoke-Hidden $service 'OpenBackupLocalHostSession' @($policyIdentity, $cheats) } '*policy*'
-    $script:fixtureAdmin = $true
     $allowed = Invoke-Hidden $service 'OpenBackupLocalHostSession' @($policyIdentity, $cheats)
-    Assert-True (@($allowed.SemanticObservations -match 'admin_bypass:used_cheats').Count -eq 1) 'Verified administrator exemption was lost at capture.'
+    Assert-True (@($allowed.SemanticObservations -match '^\[used_cheats\]').Count -eq 1) `
+        'Valheim achievement metadata rejected backup capture or was not audited.'
     $captureAudit = Get-Hidden (Get-Hidden $allowed 'AuditFindings') 'AuditObservations'
     Assert-True ($captureAudit.Count -eq 1 -and (Get-Hidden $captureAudit[0] 'ReasonCode') -eq 'used_cheats') `
         'Backup capture lost generated audit metadata before publishing its open result.'
     Invoke-Hidden $service 'CloseLocalHostSession' @($allowed.Snapshot.SessionId) | Out-Null
-    $script:fixtureAdmin = $false
     Set-Settings $true 1
     $quotaIdentity = New-Instance 'CharacterIdentity' @($identity.AccountId, 'AnotherHero')
     Assert-Throws { Invoke-Hidden $service 'OpenBackupLocalHostSession' @($quotaIdentity,

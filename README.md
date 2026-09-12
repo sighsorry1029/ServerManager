@@ -2,14 +2,8 @@
 
 Mod control, server-side characters, player logs and Discord tools for Valheim.
 
-Install the **same version on the server and every player’s client**.
-Requires BepInEx 5 and Steamworks networking. Crossplay / PlayFab is not supported.
 Works with dedicated servers and multiplayer worlds opened from the game.
 The local host’s character is managed too.
-
-[Setup](#install-and-start) · [Characters](#characters-and-backups) ·
-[Commands](#administrator-commands) · [Discord](#discord) ·
-[Schedules](#scheduled-commands) · [Client settings](#client-menu-and-notifications)
 
 ![](https://i.ibb.co/v4mhmYYV/Screenshot-2026-09-09-110138.png)
 optional mods list is available on lobby.
@@ -198,6 +192,16 @@ With `loadServerCharacterOnJoin: true`:
 - Single-player changes do not replace the server’s character.
 - New server characters receive the configured starting items.
 - The same rules also protect the local host’s character.
+
+The game and installed mods restore the server character's content. Missing item
+prefabs are logged and skipped by the game; they do not prevent joining. Later
+saves can replace the server character with this reduced inventory, so restore
+a backup if removed items need to be recovered. Load-time changes to equipment,
+item flags, skills and custom data are also allowed.
+
+If loading throws an exception or another patch skips the original managed
+load, ServerManager blocks saving and returns the player to the menu with an
+explanation. Data-format, ownership and network checks still apply.
 
 Inventory changes are sent frequently; full character updates are also sent
 periodically and during save/logout handling. The server keeps accepted updates

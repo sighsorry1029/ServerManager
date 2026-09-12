@@ -566,28 +566,28 @@ $cheatArguments = [object[]]$incomingArguments.Clone()
 $cheatArguments[5] = $flaggedSnapshot
 $adminProbe.IsAdmin = $false
 $cheatResult = $evaluateIncoming.Invoke($adminValidator, $cheatArguments)
-Assert-True ($cheatResult.Rejected -and (Test-Finding $cheatResult.Violations 'used_cheats')) `
-    'A non-admin cheat-marked profile was admitted.'
+Assert-True (-not $cheatResult.Rejected -and
+    (Test-Finding $cheatResult.Observations '[used_cheats]')) `
+    'Valheim achievement metadata rejected a non-admin profile or was not audited.'
 $adminProbe.IsAdmin = $true
 $cheatResult = $evaluateIncoming.Invoke($adminValidator, $cheatArguments)
 Assert-True (-not $cheatResult.Rejected -and
-    (Test-Finding $cheatResult.Observations '[admin_bypass:used_cheats]')) `
-    'A verified admin cheat-marked profile was rejected or not audited.'
+    (Test-Finding $cheatResult.Observations '[used_cheats]')) `
+    'Valheim achievement metadata changed behavior for an administrator.'
 $auditProperty = $cheatResult.GetType().GetProperty('AuditObservations', $instanceAll)
 $auditEntries = $auditProperty.GetValue($cheatResult)
 $auditKind = $auditEntries[0].GetType().GetProperty('Kind', $instanceAll).GetValue($auditEntries[0])
 $auditCode = $auditEntries[0].GetType().GetProperty('ReasonCode', $instanceAll).GetValue($auditEntries[0])
 $auditDetail = $auditEntries[0].GetType().GetProperty('Detail', $instanceAll).GetValue($auditEntries[0])
 Assert-True ($auditEntries.Count -eq $cheatResult.Observations.Count -and
-    $auditKind.ToString() -eq 'AdminBypass' -and $auditCode -eq 'used_cheats' -and
+    $auditKind.ToString() -eq 'RevisionObserved' -and $auditCode -eq 'used_cheats' -and
     $auditDetail -ceq $cheatResult.Observations[0]) `
     'The semantic producer did not generate immutable used-cheats metadata beside its unchanged display text.'
-$rejectionCode = $cheatResult.GetType().GetProperty('RejectionReasonCode', $instanceAll)
 $adminProbe.IsAdmin = $false
 $nonAdminCheat = $evaluateIncoming.Invoke($adminValidator, $cheatArguments)
-Assert-True ($nonAdminCheat.Rejected -and
-    $rejectionCode.GetValue($nonAdminCheat) -eq 'character_validation_failed') `
-    'Used-cheats rejection changed the existing non-admin audit category.'
+Assert-True (-not $nonAdminCheat.Rejected -and
+    (Test-Finding $nonAdminCheat.Observations '[used_cheats]')) `
+    'Used-cheats achievement metadata became dependent on administrator state.'
 $adminProbe.IsAdmin = $true
 foreach ($model in @('CharacterSessionOpenResult', 'CharacterSaveResult')) {
     $type = $plugin.GetType('ServerManager.' + $model, $true)
@@ -599,22 +599,24 @@ $callsBeforeStored = $adminProbe.Calls
 $cheatStored = $evaluateAuthoritative.Invoke($storedValidator, [object[]]@($identity, $flaggedSnapshot))
 $cheatImport = $evaluateAuthoritative.Invoke($adminValidator, [object[]]@($identity, $flaggedSnapshot))
 Assert-True (-not $cheatStored.Rejected -and
-    (Test-Finding $cheatStored.Observations 'would_reject:used_cheats') -and
-    $cheatImport.Rejected -and $adminProbe.Calls -eq $callsBeforeStored) `
-    'Stored Observe/import Enforce lost their independent policy or consulted live admin state.'
+    (Test-Finding $cheatStored.Observations '[used_cheats]') -and
+    -not $cheatImport.Rejected -and
+    (Test-Finding $cheatImport.Observations '[used_cheats]') -and
+    $adminProbe.Calls -eq $callsBeforeStored) `
+    'Used-cheats metadata was not observed consistently across stored and import validation.'
 $cheatArguments[5] = $withUsedCheats.Invoke((New-Snapshot -HasPlayerData $false), [object[]]@($true))
 $cheatStructural = $evaluateIncoming.Invoke($adminValidator, $cheatArguments)
 Assert-True ($cheatStructural.Rejected -and
     (Test-Finding $cheatStructural.Violations 'missing_player_data')) `
-    'Admin cheat metadata bypassed structural validation.'
+    'Achievement metadata bypassed structural validation.'
 $cheatArguments[5] = $flaggedSnapshot
 $adminProbe.IsAdmin = $false
-Assert-True ($evaluateIncoming.Invoke($adminValidator, $cheatArguments).Rejected) `
-    'Revoked admin retained the cheat-flag exemption.'
+Assert-True (-not $evaluateIncoming.Invoke($adminValidator, $cheatArguments).Rejected) `
+    'Revoked administrator state made achievement metadata reject a revision.'
 $adminProbe.IsAdmin = $true
 $adminProbe.Throw = $true
-Assert-True ($evaluateIncoming.Invoke($adminValidator, $cheatArguments).Rejected) `
-    'An admin lookup failure granted a cheat-flag exemption.'
+Assert-True (-not $evaluateIncoming.Invoke($adminValidator, $cheatArguments).Rejected) `
+    'An administrator lookup failure made achievement metadata reject a revision.'
 
 # Execute the actual compiled resolver, retaining its host/remote branches,
 # canonical parser, session identity comparison and exception filter. Replace only

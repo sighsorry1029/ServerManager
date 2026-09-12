@@ -801,17 +801,23 @@ internal static class SteamLobbyPlayerLimitPatch
 [HarmonyPatch(
     typeof(Game),
     nameof(Game.SavePlayerProfile),
-    new[] { typeof(bool) })]
+    new[] { typeof(bool), typeof(bool) })]
 internal static class ManagedCharacterSavePatch
 {
-    private static bool Prefix()
+    private static bool Prefix(bool isFromRpc, out bool __state)
     {
-        return ServerManagerRuntime.AllowLocalHostSave();
+        bool allowed = ServerManagerRuntime.AllowLocalHostSave();
+        __state = allowed &&
+            !SaveSystem.HasSessionFlag(SaveSystemSessionFlags.DontSaveCharacter) &&
+            !(isFromRpc && ZNet.instance.HardSaveBlock());
+        return allowed;
     }
 
-    private static void Postfix(Game __instance)
+    private static void Postfix(Game __instance, bool __state, bool __runOriginal)
     {
-        ServerManagerRuntime.AfterGameSave(__instance);
+        // Harmony postfixes also run when another prefix skipped the original.
+        if (__state && __runOriginal)
+            ServerManagerRuntime.AfterGameSave(__instance);
     }
 }
 
@@ -949,7 +955,7 @@ internal static class ServerEventWorldSavePatch
 [HarmonyPatch(typeof(ZNet), "SaveWorldThread")]
 internal static class VerifiedWorldSaveWorkerPatch
 {
-    private const string PrimarySaveSuccessLogPrefix = "World saved ( ";
+    private const string PrimarySaveSuccessLogPrefix = "World save (5/5) done. Total time [";
 
     private static void Prefix()
     {
@@ -998,8 +1004,8 @@ internal static class VerifiedWorldSaveWorkerPatch
     /// <summary>
     /// Valheim catches SaveWorldThread exceptions internally, so a Harmony
     /// finalizer cannot distinguish a successful primary save from the catch
-    /// path. Mark success only after the game's primary DB/metadata success log
-    /// and before optional auto-backup work begins.
+    /// path. Mark success only after the chunk/DB2/FWL writes and EndSave(true)
+    /// reached the game's success branch. Backups now precede the primary save.
     /// </summary>
     private static IEnumerable<CodeInstruction> Transpiler(
         IEnumerable<CodeInstruction> instructions)
@@ -1193,7 +1199,29 @@ internal static class ServerRoutedDamageLimitPatch
 internal static class ManagedCharacterPlayerSavePatch
 {
     [HarmonyPriority(Priority.Last)]
-    private static void Prefix(Player __instance) => CharacterPoisonPersistence.Capture(__instance);
+    private static bool Prefix(Player __instance)
+    {
+        if (ServerManagerRuntime.CharacterLoadSaveSuppressed && ReferenceEquals(__instance, Player.m_localPlayer)) return false;
+        CharacterPoisonPersistence.Capture(__instance);
+        return true;
+    }
+}
+
+[HarmonyPatch(typeof(PlayerProfile), nameof(PlayerProfile.Save))]
+internal static class UnsafeCharacterProfileSavePatch
+{
+    private static bool Prefix(ref bool __result)
+    {
+        if (!ServerManagerRuntime.CharacterLoadSaveSuppressed) return true;
+        __result = false;
+        return false;
+    }
+}
+
+[HarmonyPatch(typeof(PlayerProfile), nameof(PlayerProfile.SavePlayerData), new[] { typeof(Player) })]
+internal static class UnsafeCharacterCapturePatch
+{
+    private static bool Prefix() => !ServerManagerRuntime.CharacterLoadSaveSuppressed;
 }
 
 [HarmonyPatch(
@@ -1202,27 +1230,68 @@ internal static class ManagedCharacterPlayerSavePatch
     new[] { typeof(ZPackage) })]
 internal static class ManagedCharacterPlayerLoadPatch
 {
-    [HarmonyPriority(Priority.First)]
-    private static void Prefix(Player __instance, out bool __state)
+    private sealed class LoadState
     {
-        __state = ServerManagerRuntime.BeforePlayerLoad(__instance);
-        CharacterPoisonPersistence.BeforeLoad(__instance);
+        internal bool Entered;
+        internal bool Guarded;
+        internal bool Failed;
+    }
+
+    [HarmonyPriority(Priority.First)]
+    private static bool Prefix(Player __instance, out LoadState __state)
+    {
+        __state = new LoadState { Entered = ServerManagerRuntime.BeforePlayerLoad(__instance) };
+        __state.Guarded = ServerManagerRuntime.ShouldValidatePlayerLoad(__instance);
+        try
+        {
+            if (__state.Guarded && ServerManagerRuntime.CharacterLoadSaveBlocked)
+            {
+                __state.Failed = true;
+                return false;
+            }
+            CharacterPoisonPersistence.BeforeLoad(__instance);
+            return true;
+        }
+        catch (Exception error) when (__state.Guarded && !IntegrityCanonical.IsFatal(error))
+        {
+            __state.Failed = true;
+            ServerManagerRuntime.RejectUnsafePlayerLoad(error);
+            return false;
+        }
     }
 
     [HarmonyPriority(Priority.Last)]
     private static Exception? Finalizer(
         Player __instance,
-        bool __state,
+        LoadState? __state,
         bool __runOriginal,
         Exception? __exception)
     {
         try
         {
+            if (__exception != null && IntegrityCanonical.IsFatal(__exception)) return __exception;
+            // A higher-priority prefix can throw before our prefix creates
+            // __state. Such a managed load still needs the no-save exit.
+            if (__state == null && ServerManagerRuntime.ShouldValidatePlayerLoad(__instance))
+                __state = new LoadState { Guarded = true };
+            if (__state is { Guarded: true })
+            {
+                if (__state.Failed) return null;
+                if (__exception != null) throw __exception;
+                if (!__runOriginal) throw new InvalidDataException("Another patch skipped the managed character load.");
+            }
+            // The game and installed mods own content restoration. Missing
+            // prefabs and normal load-time changes do not invalidate a load.
             CharacterPoisonPersistence.AfterLoad(__instance, __runOriginal && __exception == null);
+        }
+        catch (Exception error) when (__state is { Guarded: true } && !IntegrityCanonical.IsFatal(error))
+        {
+            ServerManagerRuntime.RejectUnsafePlayerLoad(error);
+            return null;
         }
         finally
         {
-            ServerManagerRuntime.AfterPlayerLoad(__state);
+            ServerManagerRuntime.AfterPlayerLoad(__state?.Entered ?? false);
         }
         return __exception;
     }

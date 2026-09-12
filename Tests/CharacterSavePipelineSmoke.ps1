@@ -121,40 +121,7 @@ function Get-CecilSuccessors {
     return @($Instruction.Next)
 }
 
-function Test-CecilReachable {
-    param(
-        $Start,
-        $Target
-    )
-
-    if ($null -eq $Start -or $null -eq $Target) {
-        return $false
-    }
-
-    $pending = [Collections.Generic.Queue[object]]::new()
-    $visited = @{}
-    $pending.Enqueue($Start)
-    while ($pending.Count -ne 0) {
-        $current = $pending.Dequeue()
-        if ($visited.ContainsKey($current.Offset)) {
-            continue
-        }
-
-        if ($current.Offset -eq $Target.Offset) {
-            return $true
-        }
-
-        $visited[$current.Offset] = $true
-        foreach ($successor in @(Get-CecilSuccessors $current)) {
-            if ($null -ne $successor -and
-                -not $visited.ContainsKey($successor.Offset)) {
-                $pending.Enqueue($successor)
-            }
-        }
-    }
-
-    return $false
-}
+. (Join-Path $PSScriptRoot 'CecilControlFlow.ps1')
 
 function Get-PluginMethodDefinition {
     param(
@@ -437,9 +404,9 @@ $saveProfileDefinition = Find-GameMethod `
     "Game" `
     "SavePlayerProfile" `
     "System.Void" `
-    @("System.Boolean")
+    @("System.Boolean", "System.Boolean")
 Assert-True ($null -ne $saveProfileDefinition) `
-    "Game.SavePlayerProfile(bool) changed."
+    "Game.SavePlayerProfile(bool,bool) changed."
 
 $savePlayerDataDefinition = Find-GameMethod `
     "PlayerProfile" `
@@ -509,9 +476,9 @@ $inventoryChangedDefinition = Find-GameMethod `
     "Inventory" `
     "Changed" `
     "System.Void" `
-    @()
+    @("System.Boolean", "System.Boolean")
 Assert-True ($null -ne $inventoryChangedDefinition) `
-    "Inventory.Changed() changed."
+    "Inventory.Changed(bool,bool) changed."
 
 $playerLoadDefinition = Find-GameMethod `
     "Player" `

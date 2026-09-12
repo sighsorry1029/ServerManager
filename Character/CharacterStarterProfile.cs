@@ -185,7 +185,7 @@ namespace ServerManager
             }
         }
 
-        // Exact current Player.Save schema (29); all progression starts empty.
+        // Exact current Player.Save schema (33); all progression starts empty.
         // Values come from the loaded player prefab rather than a fabricated
         // world player. The regular codec refuses any future schema change.
         private static byte[] SerializeStarterPlayerData(Player template, Inventory inventory)
@@ -212,6 +212,7 @@ namespace ServerManager
             package.Write(template.m_baseStamina);
             package.Write(0f); // maximum eitr
             package.Write(0f); // current eitr
+            package.Write(Array.Empty<byte>()); // no saved build-menu state
             return package.GetArray();
         }
 

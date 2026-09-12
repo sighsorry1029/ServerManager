@@ -30,6 +30,8 @@ internal static class ValheimPrivateAccess
         typeof(ZNet).GetField("m_connectionStatus", StaticFields);
     private static readonly FieldInfo? ZNetBannedListField =
         typeof(ZNet).GetField("m_bannedList", InstanceFields);
+    private static readonly FieldInfo? ZNetAdminListField =
+        typeof(ZNet).GetField("m_adminList", InstanceFields);
     // Optional: dedicated builds advertise through SteamGameServer instead.
     private static readonly FieldInfo? SteamServerLobbyField =
         typeof(ZSteamMatchmaking).GetField("m_myLobby", InstanceFields);
@@ -110,6 +112,7 @@ internal static class ValheimPrivateAccess
             typeof(ZNet),
             "m_connectionStatus");
         _ = RequireField(ZNetBannedListField, typeof(ZNet), "m_bannedList");
+        _ = RequireField(ZNetAdminListField, typeof(ZNet), "m_adminList");
         _ = RequireMethod(ZNetSendPeerInfoMethod, typeof(ZNet), "SendPeerInfo");
         _ = RequireMethod(ZNetInternalKickMethod, typeof(ZNet), "InternalKick");
         _ = RequireField(ZRpcSocketField, typeof(ZRpc), "m_socket");
@@ -194,6 +197,15 @@ internal static class ValheimPrivateAccess
             server,
             typeof(ZNet),
             "m_bannedList");
+    }
+
+    internal static SyncedList GetAdminList(ZNet server)
+    {
+        return ReadRequired<SyncedList>(
+            ZNetAdminListField,
+            server,
+            typeof(ZNet),
+            "m_adminList");
     }
 
     internal static ZNetPeer? FindPeer(ZNet server, ZRpc rpc)

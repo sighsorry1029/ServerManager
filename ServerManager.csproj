@@ -175,6 +175,10 @@
         <None Include="Tests\RuntimeSecuritySmoke.ps1"/>
         <None Include="Tests\PlayerLocalizationSmoke.ps1"/>
         <None Include="Tests\AdminStatCapSmoke.ps1"/>
+        <None Include="Tests\CecilControlFlow.ps1"/>
+        <None Include="Tests\CecilControlFlowSmoke.ps1"/>
+        <None Include="Tests\Valheim107Fixtures.ps1"/>
+        <None Include="Tests\Valheim107CompatibilitySmoke.ps1"/>
         <None Include="Tests\CharacterSavePipelineSmoke.ps1"/>
         <None Include="Tests\PoisonPersistenceSmoke.ps1"/>
         <None Include="Tests\PoisonPersistenceSmoke.cs"/>
@@ -225,6 +229,8 @@
         <None Include="Tests\ServerSettingsSmoke.cs"/>
         <None Include="Tests\CharacterStarterItemsSmoke.ps1"/>
         <None Include="Tests\CharacterStarterItemsHarness.cs"/>
+        <None Include="Tests\CharacterLoadValidationSmoke.ps1"/>
+        <None Include="Tests\PeerInfoPreflightSmoke.ps1"/>
         <None Include="Tests\CharacterAuditSmoke.ps1"/>
         <None Include="Tests\RaidEventsSmoke.ps1"/>
         <None Include="Tests\Discord*.ps1"/>

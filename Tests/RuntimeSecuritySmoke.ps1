@@ -56,48 +56,7 @@ function Get-CecilSuccessors {
     return @($Instruction.Next)
 }
 
-function Test-CecilReachable {
-    param(
-        $Start,
-        $Target,
-        [object[]]$Blocked = @()
-    )
-
-    if ($null -eq $Start -or $null -eq $Target) {
-        return $false
-    }
-
-    $blockedOffsets = @{}
-    foreach ($blockedInstruction in $Blocked) {
-        if ($null -ne $blockedInstruction) {
-            $blockedOffsets[$blockedInstruction.Offset] = $true
-        }
-    }
-
-    $pending = [System.Collections.Generic.Queue[object]]::new()
-    $visited = @{}
-    $pending.Enqueue($Start)
-    while ($pending.Count -gt 0) {
-        $current = $pending.Dequeue()
-        if ($blockedOffsets.ContainsKey($current.Offset) -or
-            $visited.ContainsKey($current.Offset)) {
-            continue
-        }
-
-        if ($current.Offset -eq $Target.Offset) {
-            return $true
-        }
-
-        $visited[$current.Offset] = $true
-        foreach ($successor in @(Get-CecilSuccessors $current)) {
-            if ($null -ne $successor) {
-                $pending.Enqueue($successor)
-            }
-        }
-    }
-
-    return $false
-}
+. (Join-Path $PSScriptRoot 'CecilControlFlow.ps1')
 
 function Get-FirstConditionalBranch {
     param(
@@ -344,6 +303,11 @@ $bannedListDefinition = $zNetDefinition.Fields |
         $_.Name -eq "m_bannedList" -and
         $_.FieldType.FullName -eq "SyncedList"
     }
+$adminListDefinition = $zNetDefinition.Fields |
+    Where-Object {
+        $_.Name -eq "m_adminList" -and
+        $_.FieldType.FullName -eq "SyncedList"
+    }
 $isAdminDefinition = $zNetDefinition.Methods |
     Where-Object {
         $_.Name -eq "IsAdmin" -and
@@ -355,6 +319,8 @@ Assert-True ($null -ne $internalKickDefinition) `
     "ZNet.InternalKick(ZNetPeer) changed."
 Assert-True ($null -ne $bannedListDefinition) `
     "ZNet.m_bannedList changed."
+Assert-True ($null -ne $adminListDefinition) `
+    "ZNet.m_adminList changed."
 Assert-True ($null -ne $isAdminDefinition) `
     "ZNet.IsAdmin(string):bool changed."
 
@@ -2111,6 +2077,7 @@ foreach ($requiredMember in @(
     "get_InboundViolation",
     "get_EnqueuedCallbackCount",
     "get_ProcessedCallbackCount",
+    "get_ReachedActive",
     "get_CallbackOverflowed",
     "get_StaleCallbackCaptured",
     "get_LateCallbackCaptured",
@@ -4943,15 +4910,14 @@ $adminAdmission = $adminManifestType.Methods |
     Where-Object Name -eq 'Validate' | Select-Object -First 1
 $adminAdmissionCalls = @($adminAdmission.Body.Instructions |
     Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] })
-$preliminaryAdmin = $adminAdmissionCalls |
-    Where-Object { $_.Operand.Name -eq 'IsCurrentServerAdmin' } | Select-Object -First 1
 $provisionalValidation = $adminAdmissionCalls |
     Where-Object { $_.Operand.Name -eq 'ValidateForAdmission' } | Select-Object -First 1
-Assert-True ($null -ne $preliminaryAdmin -and $null -ne $provisionalValidation -and
-    $preliminaryAdmin.Offset -lt $provisionalValidation.Offset -and
+Assert-True ($null -ne $provisionalValidation -and
+    @($adminAdmissionCalls | Where-Object { $_.Operand.Name -eq 'IsCurrentServerAdmin' }).Count -eq 0 -and
+    $provisionalValidation.Previous.Previous.OpCode.Code.ToString() -eq 'Ldc_I4_1' -and
     @($adminAdmissionCalls | Where-Object { $_.Operand.Name -in @(
         'ConfirmAdminManifest', 'OpenOrCreateServerSession', 'RecordSecurityEvent', 'RecordAdminExemptions') }).Count -eq 0) `
-    'Pre-auth mod validation granted/audited an admin exemption or lost its preliminary server-admin lookup.'
+    'Pre-auth mod validation looked up/granted/audited administrator status instead of deferring final review.'
 Assert-True (@($adminAdmission.Body.Instructions | Where-Object {
     (Get-CecilIntConstant $_) -eq 64 }).Count -ge 1) `
     'Pending admin manifests lost their fixed authentication-reservation bound.'

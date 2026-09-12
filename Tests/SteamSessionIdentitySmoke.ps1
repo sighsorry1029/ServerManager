@@ -197,6 +197,7 @@ Assert-True (-not (Invoke-Identity $active).Success) 'Reserved identity was trea
 Set-Phase 'Active'
 Set-Property $attempt 'EnqueuedCallbackCount' 1
 Set-Property $attempt 'ProcessedCallbackCount' 1
+Set-Property $attempt 'ReachedActive' $true
 foreach ($name in @('BeginAuthInvocationObserved', 'BeginAuthResultRecorded', 'BeginAuthImmediateAccepted')) { Set-Property $attempt $name $true }
 Set-Property $attempt 'LatestResponse' ([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
 Assert-True ((Invoke-Identity $active).Success) 'An authenticated session rejected harmless peer/RPC outer wrappers.'
@@ -206,9 +207,8 @@ Assert-True ((Invoke-Identity $active).Success -and [SessionIdentityEnvironment]
 
 foreach ($case in @(
     @{ Name = 'EnqueuedCallbackCount'; Invalid = 0; Valid = 1 },
-    @{ Name = 'EnqueuedCallbackCount'; Invalid = 2; Valid = 1 },
     @{ Name = 'ProcessedCallbackCount'; Invalid = 0; Valid = 1 },
-    @{ Name = 'ProcessedCallbackCount'; Invalid = 2; Valid = 1 },
+    @{ Name = 'ReachedActive'; Invalid = $false; Valid = $true },
     @{ Name = 'CallbackOverflowed'; Invalid = $true; Valid = $false },
     @{ Name = 'StaleCallbackCaptured'; Invalid = $true; Valid = $false },
     @{ Name = 'LateCallbackCaptured'; Invalid = $true; Valid = $false },

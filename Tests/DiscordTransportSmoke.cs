@@ -2013,21 +2013,21 @@ internal static class DiscordTransportSmoke
     {
         foreach (string prefix in new[] { "", "Anonymous" })
         {
-            DiscordSettings settings = Settings("security.admin_bypass");
+            DiscordSettings settings = Settings("character.revision_observed");
             settings.WebhookRoutes[0].AnonymousPrefix = prefix;
             using (FakeHandler handler = new FakeHandler())
             using (DiscordHttp http = new DiscordHttp("", delegate { }, handler))
             using (DiscordWebhooks webhooks = new DiscordWebhooks(settings, http, delegate { }))
             {
-                ServerManagerEvent value = OperatorEvent("security.admin_bypass");
+                ServerManagerEvent value = OperatorEvent("character.revision_observed");
                 value.Fields["reason_code"] = "used_cheats";
                 value.Fields.Remove("evidence");
-                Check(webhooks.Enqueue(value), "Used-cheats bypass remains routable.");
+                Check(webhooks.Enqueue(value), "Used-cheats achievement observation remains routable.");
                 Task running = webhooks.RunAsync(CancellationToken.None);
                 await webhooks.StopAsync(TimeSpan.FromSeconds(3)); await running;
                 string body = handler.Requests[0].Body!;
                 Check(body.Contains("Profile used-cheats flag") && !body.Contains("Forbidden item"),
-                    "Named and anonymous used-cheats bypasses are distinct from forbidden-item bypasses.");
+                    "Named and anonymous used-cheats observations are distinct from forbidden-item bypasses.");
             }
         }
         using (FakeHandler handler = new FakeHandler())

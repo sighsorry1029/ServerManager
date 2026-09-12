@@ -4,6 +4,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Load the hashing cmdlet before loading the game reference assemblies.
+Import-Module (Join-Path $PSHOME "Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1") -ErrorAction Stop
 
 function Assert-True {
     param(
@@ -217,10 +219,10 @@ function Invoke-ServiceAdmission {
     param(
         [object]$Service,
         [byte[]]$Payload,
-        [bool]$AdminCandidate
+        [bool]$AllowAuthenticatedAdminReview
     )
 
-    $arguments = [object[]]@($null, $Payload, $AdminCandidate, $null)
+    $arguments = [object[]]@($null, $Payload, $AllowAuthenticatedAdminReview, $null)
     $decision = $script:validateForAdmission.Invoke($Service, $arguments)
     return [pscustomobject]@{
         Decision = $decision
@@ -653,7 +655,7 @@ Assert-True (
     $strictValidationCall.Offset -lt $createValidationDecisionCall.Offset -and
     @($validateServiceCalls |
         Where-Object { $_.Operand.Name -eq "get_EnforceModPolicy" }).Count -eq 0) `
-    "Manifest admission must run strict validation before an explicit administrator check or final decision."
+    "Manifest admission must run strict validation before bounded authenticated-admin review or final decision."
 
 $policyWatcherNotifyFilters = [int]$policyWatcherNotifyFiltersField.Constant
 $directoryNameNotifyFilter = [int][IO.NotifyFilters]::DirectoryName
@@ -1213,17 +1215,18 @@ try {
                 [object[]]@($null, $casePayload))
             Assert-True ($strictDecision.Accepted -eq $strictAccepted) `
                 ("The service compatibility validator was not strict: " + $policyCase.Name)
-            foreach ($adminCandidate in @($false, $true)) {
+            foreach ($allowAuthenticatedAdminReview in @($false, $true)) {
                 $admission = Invoke-ServiceAdmission `
-                    $serviceFixture $casePayload $adminCandidate
+                    $serviceFixture $casePayload $allowAuthenticatedAdminReview
                 $expectedAccepted = $strictAccepted -or
-                    ($adminCandidate -and $policyCase.Rejecting.Count -eq 0)
+                    ($allowAuthenticatedAdminReview -and $policyCase.Rejecting.Count -eq 0)
                 $expectedPending = $expectedAccepted -and -not $strictAccepted
                 Assert-True (
                     $admission.Decision.Accepted -eq $expectedAccepted -and
                     ($null -ne $admission.PendingManifest) -eq $expectedPending) `
                     ("The service provisional admission decision/pending manifest changed: " +
-                        $policyCase.Name + "; administrator=" + $adminCandidate)
+                        $policyCase.Name + "; authenticated review=" +
+                        $allowAuthenticatedAdminReview)
                 if ($expectedPending) {
                     $confirmed = Invoke-ServiceConfirmation `
                         $serviceFixture $admission.PendingManifest $true
@@ -1246,14 +1249,14 @@ try {
             Assert-True (
                 -not $badAdmission.Decision.Accepted -and
                 $null -eq $badAdmission.PendingManifest) `
-                "Administrator candidate status exempted a malformed manifest in the service."
+                "Authenticated administrator review deferred a malformed manifest in the service."
         }
         $serviceLimitsField.SetValue($serviceFixture, $smallPayloadLimits)
         $oversizedAdmission = Invoke-ServiceAdmission $serviceFixture $validPayload $true
         Assert-True (
             -not $oversizedAdmission.Decision.Accepted -and
             $null -eq $oversizedAdmission.PendingManifest) `
-            "Administrator candidate status exempted the service manifest byte limit."
+            "Authenticated administrator review deferred the service manifest byte limit."
         $serviceLimitsField.SetValue($serviceFixture, $serviceLimits)
 
         $pendingPayload = [byte[]](Invoke-Encode (
