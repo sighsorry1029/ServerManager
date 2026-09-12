@@ -1205,8 +1205,7 @@ namespace ServerManager
         {
             lock (sync)
             {
-                if (sessions.ContainsKey(session.Rpc) &&
-                    ReferenceEquals(sessions[session.Rpc], session))
+                if (IsCurrentSessionLocked(session))
                 {
                     ExpireIfNeeded(session, clock.GetTimestamp());
                     if (session.State == ConnectionSessionState.Rejected &&
@@ -1233,8 +1232,7 @@ namespace ServerManager
             ProtocolRejection rejection = new ProtocolRejection(
                 ProtocolRejectCode.DuplicateMessage,
                 "The connection session changed during protocol processing.");
-            if (sessions.ContainsKey(session.Rpc) &&
-                ReferenceEquals(sessions[session.Rpc], session))
+            if (IsCurrentSessionLocked(session))
             {
                 if (session.State == ConnectionSessionState.Rejected &&
                     session.Rejection != null)
@@ -1255,15 +1253,20 @@ namespace ServerManager
             Session session,
             ConnectionSessionState state)
         {
-            Session current;
-            if (!sessions.TryGetValue(session.Rpc, out current) ||
-                !ReferenceEquals(current, session))
+            if (!IsCurrentSessionLocked(session))
             {
                 return false;
             }
 
             ExpireIfNeeded(session, clock.GetTimestamp());
             return session.State == state && session.OperationInProgress;
+        }
+
+        private bool IsCurrentSessionLocked(Session session)
+        {
+            Session current;
+            return sessions.TryGetValue(session.Rpc, out current) &&
+                ReferenceEquals(current, session);
         }
 
         private void ExpireIfNeeded(Session session, long now)
