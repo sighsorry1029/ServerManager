@@ -182,10 +182,11 @@ internal static class DiscordRuntime
         string? processed = _processedText;
         // Actual content comparison catches atomic editor replacements and edits
         // that preserve length/timestamp. No file I/O or YAML parsing on Unity ticks.
-        _reloadRead = Task.Run(() => ReadReload(root, candidate, processed));
+        DiscordSettings? previous = _settings;
+        _reloadRead = Task.Run(() => ReadReload(root, candidate, processed, previous));
     }
 
-    private static ReloadRead ReadReload(string root, string? candidate, string? processed)
+    private static ReloadRead ReadReload(string root, string? candidate, string? processed, DiscordSettings? previous)
     {
         string text;
         try { text = DiscordSettings.ReadReloadText(root); }
@@ -195,7 +196,7 @@ internal static class DiscordRuntime
         }
         if (text == processed || text != candidate)
             return new ReloadRead(text, false, null, null);
-        try { return new ReloadRead(text, true, DiscordSettings.ParseForReload(text), null); }
+        try { return new ReloadRead(text, true, previous == null ? DiscordSettings.ParseForReload(text) : DiscordSettings.ParseForPartialReload(text, previous), null); }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
         {
             return new ReloadRead(text, true, null, ReadError(exception));
@@ -207,6 +208,7 @@ internal static class DiscordRuntime
         Session? active = Volatile.Read(ref _session);
         DiscordSettings? previous = _settings;
         if (active == null || previous == null) return;
+        foreach (string warning in candidate.ReloadWarnings) Log(warning);
         try
         {
             bool botChanged = !previous.HasSameBotSettings(candidate);

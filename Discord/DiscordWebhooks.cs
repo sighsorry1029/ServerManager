@@ -188,7 +188,7 @@ namespace ServerManager.Discord
         {
             if (value == null || string.IsNullOrWhiteSpace(value.EventId) || value.EventId.Length > 160)
                 return false;
-            string? eventFilter = DiscordSettings.GetWebhookEventFilter(value.Kind);
+            string? eventFilter = GetWebhookEventFilter(value);
             if (eventFilter == null) return false;
 
             Configuration configuration;
@@ -261,6 +261,16 @@ namespace ServerManager.Discord
             }
             if (dropped) SafeLog("Discord webhook queue is full; an event was dropped.");
             return count > 0;
+        }
+
+        private static string? GetWebhookEventFilter(ServerManagerEvent value)
+        {
+            if (value.Kind == "command.executed" && Field(value, "source", 32) == "cron")
+            {
+                string action = OperatorToken(value.Fields, "command", 64);
+                return action == "schedule" || action == "maintenance" ? "cron.executed" : null;
+            }
+            return DiscordSettings.GetWebhookEventFilter(value.Kind);
         }
 
         private bool AdmitOperatorLocked(ServerManagerEvent value)
@@ -493,6 +503,12 @@ namespace ServerManager.Discord
                     if (!anonymous) description = Field(value, "reason", 300);
                     break;
                 case "command.executed":
+                    if (IsCronSummary(value))
+                    {
+                        title = CronTitle(value);
+                        description = CronDescription(value);
+                        break;
+                    }
                     string command = OperatorToken(value.Fields, "command", 64);
                     if (anonymous && !KnownCommand(command)) command = string.Empty;
                     title = "Command" + (command.Length == 0 ? string.Empty : ": " + command);
@@ -718,6 +734,66 @@ namespace ServerManager.Discord
                 case "rcon_dispatched": return "Forwarded to the server console";
                 case "ram_accepted": return "RAM snapshot accepted";
                 default: return "Command returned success";
+            }
+        }
+
+        private static bool IsCronSummary(ServerManagerEvent value)
+        {
+            if (Field(value, "source", 32) != "cron") return false;
+            string action = OperatorToken(value.Fields, "command", 64);
+            return action == "schedule" || action == "maintenance";
+        }
+
+        private static string CronTitle(ServerManagerEvent value)
+        {
+            string code = OperatorToken(value.Fields, "result_code", 64);
+            string marker = Field(value, "success") == "false" ? "\u274c" :
+                code == "cron_skipped" ? "\u23ed" : "\u2705";
+            string verb = OperatorToken(value.Fields, "cron_verb", 64);
+            string count = OperatorToken(value.Fields, "cron_command_count", 2);
+            string subject = verb.Length > 0 ? verb : count.Length > 0 ? count + " commands" : string.Empty;
+            return marker + " Cron" + (subject.Length > 0 ? " · " + subject : string.Empty);
+        }
+
+        private static string CronDescription(ServerManagerEvent value)
+        {
+            string summary = StripValheimRichText(Field(value, "cron_summary", 1000));
+            string verb = OperatorToken(value.Fields, "cron_verb", 64);
+            if (summary == verb) summary = string.Empty;
+            string schedule = Field(value, "cron_schedule", 256);
+            string result = Field(value, "success") == "false" ? CommandResult(value, false) : string.Empty;
+            return string.Join(" · ", new[] { summary, schedule, result }.Where(text => text.Length > 0));
+        }
+
+        private static string StripValheimRichText(string value)
+        {
+            StringBuilder result = new StringBuilder(value.Length);
+            for (int index = 0; index < value.Length; ++index)
+            {
+                if (value[index] == '<')
+                {
+                    int close = value.IndexOf('>', index + 1);
+                    if (close > index && close - index <= 48 && IsValheimRichTextTag(value.Substring(index + 1, close - index - 1)))
+                    {
+                        index = close;
+                        continue;
+                    }
+                }
+                result.Append(value[index]);
+            }
+            return OneLine(result.ToString(), 1000);
+        }
+
+        private static bool IsValheimRichTextTag(string value)
+        {
+            string tag = value.Trim();
+            if (tag.StartsWith("/", StringComparison.Ordinal)) tag = tag.Substring(1);
+            int assignment = tag.IndexOf('=');
+            if (assignment >= 0) tag = tag.Substring(0, assignment);
+            switch (tag.ToLowerInvariant())
+            {
+                case "color": case "size": case "b": case "i": case "u": case "s": return true;
+                default: return false;
             }
         }
 

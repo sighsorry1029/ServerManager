@@ -11,6 +11,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BepInEx.Bootstrap;
+using BepInEx.Configuration;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
@@ -100,6 +101,28 @@ internal static class ClientMenuBranding
     private static string _lastLocalizationCacheAccessWarning = string.Empty;
     private static MenuGuide? _menuGuide;
     private static bool _menuGuideFailed;
+    private static bool _customMenuActive;
+
+    private static bool IsCustomMenuActive()
+    {
+        if (!Chainloader.PluginInfos.TryGetValue("rdmods.custommainmenu", out var plugin) ||
+            plugin.Instance == null) return false;
+        return !plugin.Instance.Config.TryGetEntry<bool>(
+            new ConfigDefinition("General", "Enabled"), out var enabled) || enabled.Value;
+    }
+
+    private static void RefreshMenuCompatibility(FejdStartup startup)
+    {
+        bool active = IsCustomMenuActive();
+        if (active == _customMenuActive) return;
+        _customMenuActive = active;
+        ResetMenuGuide();
+        ApplyLogo(startup);
+    }
+
+    // Consume only the frame that closes our dialog so vanilla cannot handle the
+    // same Escape/cancel input behind it. Normal menu updates continue while open.
+    internal static bool BeforeUiUpdate() => _menuGuide?.HandleDialogInput() != true;
 
     // The worker receives only a URI/token. Its result is consumed by this menu's
     // UI update; no continuation may access Unity objects or install a sprite.
@@ -178,6 +201,93 @@ internal static class ClientMenuBranding
         private readonly List<KeyValuePair<GameObject, bool>> _hidden = new();
         private MenuTextPanel? _panel;
         private MenuTextPanel? _optionalPanel;
+        private GameObject? _launcher;
+        private GameObject? _dialog;
+        private GameObject? _previousSelection;
+        private bool _open;
+        private bool _showMods;
+        private Button? _modsButton;
+        private Button? _guideButton;
+        private Button? _closeButton;
+
+        private void SetOpen(bool open)
+        {
+            _open = open;
+            if (open)
+            {
+                _previousSelection = UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject;
+                _dialog!.SetActive(true);
+                _dialog.GetComponentInChildren<Button>().Select();
+            }
+            else
+            {
+                _dialog?.SetActive(false);
+                if (_previousSelection != null && _previousSelection.activeInHierarchy)
+                    UnityEngine.EventSystems.EventSystem.current?.SetSelectedGameObject(_previousSelection);
+                _previousSelection = null;
+            }
+        }
+
+        internal bool HandleDialogInput()
+        {
+            if (!_open || !CanShow(_startup)) return false;
+            if (ZInput.GetKeyDown(KeyCode.Escape, true) || ZInput.GetButtonDown("JoyButtonB"))
+            {
+                SetOpen(false);
+                return true;
+            }
+            return false;
+        }
+
+        private Button AddButton(Transform parent, string text, Vector2 position, UnityEngine.Events.UnityAction action)
+        {
+            GameObject go = new("ServerManager " + text, typeof(RectTransform), typeof(Image), typeof(Button));
+            go.transform.SetParent(parent, false);
+            RectTransform rect = (RectTransform)go.transform;
+            rect.anchorMin = rect.anchorMax = rect.pivot = new Vector2(0.5f, 1f);
+            rect.anchoredPosition = position;
+            rect.sizeDelta = new Vector2(150f, 36f);
+            Image image = go.GetComponent<Image>();
+            image.color = new Color(0.18f, 0.14f, 0.09f, 1f);
+            TMP_Text label = MenuTextPanel.CreateText(go.transform, _startup.m_connectionFailedError,
+                "Label", 20f, new Color(1f, 0.8f, 0.4f));
+            label.text = text;
+            label.alignment = TextAlignmentOptions.Center;
+            label.raycastTarget = false;
+            MenuTextPanel.Stretch(label.rectTransform, Vector2.zero, Vector2.zero);
+            Button button = go.GetComponent<Button>();
+            button.targetGraphic = image;
+            button.onClick.AddListener(action);
+            return button;
+        }
+
+        private void EnsureDialog()
+        {
+            if (_launcher != null) return;
+            _launcher = AddButton(_startup.m_mainMenu.transform, "Server Info", new Vector2(0f, -20f),
+                () => SetOpen(true)).gameObject;
+            RectTransform launchRect = (RectTransform)_launcher.transform;
+            launchRect.anchorMin = launchRect.anchorMax = launchRect.pivot = Vector2.one;
+            launchRect.anchoredPosition = new Vector2(-24f, -24f);
+            _dialog = new GameObject("ServerManager Info", typeof(RectTransform), typeof(Image),
+                typeof(Canvas), typeof(GraphicRaycaster));
+            _dialog.SetActive(false);
+            _dialog.transform.SetParent(_startup.m_mainMenu.transform, false);
+            MenuTextPanel.Stretch((RectTransform)_dialog.transform, Vector2.zero, Vector2.zero);
+            _dialog.GetComponent<Image>().color = new Color(0f, 0f, 0f, 0.94f);
+            Canvas canvas = _dialog.GetComponent<Canvas>();
+            canvas.overrideSorting = true;
+            canvas.sortingOrder = 100;
+            Button guide = AddButton(_dialog.transform, "Guide", new Vector2(-160f, -20f), () => _showMods = false);
+            _modsButton = AddButton(_dialog.transform, "Allowed Mods", new Vector2(0f, -20f), () => _showMods = true);
+            Button close = AddButton(_dialog.transform, "Close", new Vector2(160f, -20f), () => SetOpen(false));
+            _guideButton = guide;
+            _closeButton = close;
+            Button[] buttons = { guide, _modsButton, close };
+            for (int i = 0; i < buttons.Length; ++i)
+                buttons[i].navigation = new Navigation { mode = Navigation.Mode.Explicit,
+                    selectOnLeft = buttons[(i + 2) % 3], selectOnRight = buttons[(i + 1) % 3] };
+        }
         private OptionalModQuery? _optionalQuery;
         private OptionalModLobbyQuery? _optionalLobbyQuery;
         private bool _optionalLobbyMode;
@@ -204,12 +314,43 @@ internal static class ClientMenuBranding
         {
             if (!CanShow(_startup))
             {
+                if (_open) SetOpen(false);
+                _launcher?.SetActive(false);
                 SetVisible(false);
                 return;
             }
+            if (_customMenuActive)
+            {
+                EnsureDialog();
+                _launcher!.SetActive(true);
+                if (!_open)
+                {
+                    SetVisible(false);
+                    return;
+                }
+                _dialog!.transform.SetAsLastSibling();
+            }
             _panel ??= new MenuTextPanel(_startup, left: false);
+            if (_customMenuActive) _panel.UseDialog(_dialog!.transform);
             string language = Localization.instance?.GetSelectedLanguage() ?? "English";
             string endpoint = ServerManagerPlugin.BrandingServerAddress?.Value ?? string.Empty;
+            if (_modsButton != null)
+            {
+                bool hasEndpoint = !string.IsNullOrWhiteSpace(endpoint);
+                if (_modsButton.interactable != hasEndpoint)
+                {
+                    _modsButton.interactable = hasEndpoint;
+                    Navigation guideNavigation = _guideButton!.navigation;
+                    guideNavigation.selectOnRight = hasEndpoint ? _modsButton : _closeButton;
+                    _guideButton.navigation = guideNavigation;
+                    Navigation closeNavigation = _closeButton!.navigation;
+                    closeNavigation.selectOnLeft = hasEndpoint ? _modsButton : _guideButton;
+                    _closeButton.navigation = closeNavigation;
+                    if (!hasEndpoint && UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject == _modsButton.gameObject)
+                        _guideButton.Select();
+                }
+                if (!_modsButton.interactable) _showMods = false;
+            }
             if (refreshText || !string.Equals(_language, language, StringComparison.Ordinal) ||
                 !string.Equals(_hintEndpoint, endpoint, StringComparison.Ordinal))
             {
@@ -226,7 +367,13 @@ internal static class ClientMenuBranding
             SetVisible(true);
             _panel.UpdateLayout();
             UpdateOptionalList(endpoint, language, refreshText);
-            _panel.HandleGuideKeys();
+            if (_customMenuActive)
+            {
+                _panel.SetVisible(!_showMods || string.IsNullOrWhiteSpace(endpoint));
+                _optionalPanel?.SetVisible(_showMods && !string.IsNullOrWhiteSpace(endpoint));
+            }
+            if (_customMenuActive && _showMods) _optionalPanel?.HandleGuideKeys();
+            else _panel.HandleGuideKeys();
         }
 
         private void UpdateOptionalList(string endpoint, string language, bool refreshText)
@@ -276,6 +423,7 @@ internal static class ClientMenuBranding
                     revision = _optionalQuery.DisplayRevision; entries = _optionalQuery.Entries;
                 }
                 _optionalPanel ??= new MenuTextPanel(_startup, left: true);
+                if (_customMenuActive) _optionalPanel.UseDialog(_dialog!.transform);
                 if (refreshText || _optionalRevision != revision ||
                     !string.Equals(_optionalLanguage, language, StringComparison.Ordinal))
                 {
@@ -287,7 +435,7 @@ internal static class ClientMenuBranding
                     _optionalPanel.SetText(PlayerLocalizer.Text("sm_menu_optional_title"),
                         body);
                 }
-                _optionalPanel.SetVisible(true);
+                _optionalPanel.SetVisible(!_customMenuActive || _showMods);
                 _optionalPanel.UpdateLayout();
             }
             catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
@@ -316,7 +464,7 @@ internal static class ClientMenuBranding
                 _optionalLobbyQuery?.Pause();
             }
             _visible = visible;
-            _panel?.SetVisible(visible);
+            _panel?.SetVisible(visible && (!_customMenuActive || !_showMods));
             if (!visible) _optionalPanel?.SetVisible(false);
             if (visible)
                 foreach (KeyValuePair<GameObject, bool> target in _hidden)
@@ -344,6 +492,8 @@ internal static class ClientMenuBranding
 
         private void CaptureTargets()
         {
+            // CustomMainMenu owns changelog, clutter and their visibility lifecycle.
+            if (_customMenuActive) return;
             // Locate proven patch-log leaves, never an unverified shared UI root.
             foreach (ChangeLog log in _startup.GetComponentsInChildren<ChangeLog>(true))
             {
@@ -379,6 +529,10 @@ internal static class ClientMenuBranding
 
         internal void Dispose()
         {
+            if (_open) SetOpen(false);
+            if (_launcher != null) UnityEngine.Object.Destroy(_launcher);
+            if (_dialog != null) UnityEngine.Object.Destroy(_dialog);
+            _launcher = _dialog = null;
             _optionalQuery?.Dispose();
             _optionalQuery = null;
             _optionalLobbyQuery?.Dispose();
@@ -476,6 +630,15 @@ internal static class ClientMenuBranding
         private Vector2 _lastSize;
         private bool _visible;
         private bool _needsLayout = true;
+        private bool _inDialog;
+
+        internal void UseDialog(Transform parent)
+        {
+            if (_inDialog) return;
+            _inDialog = true;
+            _root!.transform.SetParent(parent, false);
+            _needsLayout = true;
+        }
 
         internal MenuTextPanel(FejdStartup startup, bool left)
         {
@@ -555,7 +718,7 @@ internal static class ClientMenuBranding
             _scroll.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.Permanent;
         }
 
-        private static TMP_Text CreateText(Transform parent, TMP_Text fontSource, string name, float size, Color color)
+        internal static TMP_Text CreateText(Transform parent, TMP_Text fontSource, string name, float size, Color color)
         {
             GameObject target = new(name, typeof(RectTransform));
             // TMP Awake must see the vanilla font, not try a missing default font.
@@ -580,7 +743,7 @@ internal static class ClientMenuBranding
             return text;
         }
 
-        private static void Stretch(RectTransform rect, Vector2 minimum, Vector2 maximum)
+        internal static void Stretch(RectTransform rect, Vector2 minimum, Vector2 maximum)
         {
             rect.anchorMin = Vector2.zero;
             rect.anchorMax = Vector2.one;
@@ -618,6 +781,7 @@ internal static class ClientMenuBranding
             float oldScroll = _scroll!.verticalNormalizedPosition;
             float availableHeight = _lastSize.y;
             Vector2 size = CalculateGuideSize(_lastSize.x, availableHeight, 0f);
+            if (_inDialog) size.x = Mathf.Min(800f, _lastSize.x * 0.9f);
             float leftPadding = Mathf.Min(20f, size.x * 0.1f);
             float rightPadding = Mathf.Min(28f, size.x * 0.14f);
             float width = Mathf.Max(1f, size.x - leftPadding - rightPadding);
@@ -629,6 +793,12 @@ internal static class ClientMenuBranding
             panel.anchoredPosition = new Vector2(
                 (_left ? 1f : -1f) * Mathf.Min(24f, _lastSize.x * 0.05f),
                 -Mathf.Min(24f, _lastSize.y * 0.05f));
+            if (_inDialog)
+            {
+                size = new Vector2(Mathf.Min(800f, _lastSize.x * 0.9f), Mathf.Max(1f, _lastSize.y - 100f));
+                panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 1f);
+                panel.anchoredPosition = new Vector2(0f, -76f);
+            }
             panel.sizeDelta = size;
             float verticalPadding = Mathf.Min(20f, size.y * 0.1f);
             Stretch(_scroll.viewport, new Vector2(leftPadding, verticalPadding), new Vector2(-rightPadding, -verticalPadding));
@@ -1173,6 +1343,7 @@ internal static class ClientMenuBranding
         }
 
         ObserveStartup(startup);
+        RefreshMenuCompatibility(startup);
         ResetMenuGuide();
         UpdateMenuGuide(startup);
         ApplyLogo(startup);
@@ -1220,6 +1391,7 @@ internal static class ClientMenuBranding
 
     internal static void OnUiUpdate(FejdStartup startup)
     {
+        if (CanUseClientUi(startup)) RefreshMenuCompatibility(startup);
         UpdateMenuGuide(startup);
         TickRemoteLogo(startup);
         if (!_armed ||
@@ -1817,6 +1989,11 @@ internal static class ClientMenuBranding
 
     private static void ApplyLogo(FejdStartup startup)
     {
+        if (_customMenuActive)
+        {
+            ReleaseCustomLogo(restoreVanilla: true);
+            return;
+        }
         Transform? logoTransform =
             startup.m_mainMenu?.transform.Find("Logo/LOGO");
         Image? image = logoTransform == null
@@ -2133,6 +2310,9 @@ internal static class ClientMenuBrandingSetupGuiPatch
 [HarmonyPatch(typeof(FejdStartup), "Update")]
 internal static class ClientMenuBrandingUiUpdatePatch
 {
+    [HarmonyPriority(Priority.First)]
+    private static bool Prefix() => ClientMenuBranding.BeforeUiUpdate();
+
     private static void Postfix(FejdStartup __instance)
     {
         ClientMenuBranding.OnUiUpdate(__instance);

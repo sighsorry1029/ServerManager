@@ -377,9 +377,23 @@ Use **webhooks** for game-to-Discord notifications.
 Use the **built-in bot** for Discord commands and Discord-to-game chat.
 You can use either one or both.
 
-New `discord.yml` templates have enabled examples with blank credentials.
-Fill them in, or disable/remove everything you do not use. Invalid edits keep
-the previous settings. The blank template is inactive until configured.
+New `discord.yml` templates have disabled bot/webhook examples with blank credentials.
+Fill in the credentials and set `enabled: true` for the components you want to use.
+Existing files are not rewritten. Omitting `enabled` still means true.
+
+On live reload, the bot and each named webhook are validated independently.
+An invalid webhook keeps only the last working route with the same exact `name`;
+other valid changes apply. A new invalid route stays disabled. Keep names unique
+and stable: duplicate names retain at most one previous route, while unnamed
+invalid entries cannot recover by their position. Explicit `enabled: false`
+disables a route even if its URL or other value is invalid; deleted routes are removed.
+Unknown mapping keys still invalidate that block. A malformed `webhooks` list
+retains the previous list while allowing a valid bot block to reload.
+
+Invalid YAML syntax, duplicate YAML keys, unknown root keys or file-level errors
+retain all active settings. Diagnostics identify webhook entries by their list
+index without printing names, tokens or URLs. Last working settings are kept in
+memory only; after restarting, invalid entries start disabled.
 
 ### Webhooks: game → Discord
 
@@ -410,7 +424,8 @@ webhooks:
 | `chat.shout` | In-game shout messages |
 | `raid.status` | Raid starts and ends, with name and coordinates |
 | `player.death`, `boss.killed` | Deaths, including PvP, and boss kills |
-| `moderation.action`, `command.executed` | Admin activity |
+| `moderation.action`, `command.executed` | Moderation and manual admin activity |
+| `cron.executed` | One compact final result for each scheduled job |
 | `security.alert`, `security.admin_bypass` | Detection/response reports and admin exemptions |
 | `character.validation` | Rejected saves and validation warnings |
 | `character.shadow_stalled`, `character.revision_observed` | Delayed character updates and revision warnings |
@@ -481,6 +496,12 @@ and cannot start an offline server.
 
 The server creates `cron.yml` when the world is ready. Scheduling works without
 Discord. The default `jobs: []` runs nothing.
+
+Add `cron.executed` to a webhook route to receive one compact card after each
+job. Intermediate command dispatches are omitted. Announcement, chat and broadcast
+cards show their text without Valheim rich-text tags; other commands show only
+their verbs. Remove `server.announcement` from that route if the same scheduled
+broadcast should not also appear as an announcement event.
 
 Example: announce each evening and save every 30 minutes.
 

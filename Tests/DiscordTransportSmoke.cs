@@ -61,6 +61,7 @@ internal static class DiscordTransportSmoke
         await SteamIdTrustedSourceAndBounds();
         await SteamIdSnapshotAndReload();
         await CompactEventCards();
+        await CompactCronCards();
         await EnvironmentalDeathCards();
         await LocalizedStoryRoutes();
         await LocalizedPublicFrames();
@@ -299,11 +300,12 @@ internal static class DiscordTransportSmoke
         string[] retiredSelectors = { "combat.pvp_kill", "character.save_rejected", "character.validation_observed",
             "security.detection", "security.response", "server.ready", "server.shutdown", "player.login", "player.leave",
             "raid.started", "raid.ended" };
-        Check(DiscordSettings.PublicEvents.Count == 16 && DiscordSettings.PublicEvents.SetEquals(SourceEventKinds.Select(ExpectedWebhookFilter)),
-            "Sixteen selectable filters cover all twenty-two existing source event kinds.");
+        Check(DiscordSettings.PublicEvents.Count == 17 && DiscordSettings.PublicEvents.SetEquals(
+                SourceEventKinds.Select(ExpectedWebhookFilter).Concat(new[] { "cron.executed" })),
+            "Seventeen selectable filters cover all source kinds and the final cron projection.");
         foreach (string kind in SourceEventKinds)
             Check(DiscordSettings.GetWebhookEventFilter(kind) == ExpectedWebhookFilter(kind), "Exact source-to-filter mapping: " + kind);
-        foreach (string kind in new[] { "character.validation", "security.alert", "server.status", "player.connection", "raid.status",
+        foreach (string kind in new[] { "character.validation", "security.alert", "server.status", "player.connection", "raid.status", "cron.executed",
             "player.death.extra", "security.*", "chat.normal", "unknown" })
             Check(DiscordSettings.GetWebhookEventFilter(kind) == null, "Group selectors and unknown kinds are not source events: " + kind);
 
@@ -741,6 +743,70 @@ internal static class DiscordTransportSmoke
                     Check(((string?)embed["title"] ?? "").Contains("Greydwarf") &&
                         !((string?)embed["title"] ?? "").Contains("\n"), "Shared creature-death sentence retains its target without a duplicate cause line.");
             }
+        }
+    }
+
+    private static async Task CompactCronCards()
+    {
+        DiscordSettings settings = Settings("command.executed");
+        settings.WebhookRoutes.Add(new DiscordWebhookRoute
+        {
+            Name = "Cron", Url = ReloadedWebhook, Username = "ServerManager",
+            Events = new HashSet<string> { "cron.executed" }
+        });
+        using (FakeHandler handler = new FakeHandler())
+        using (DiscordHttp http = new DiscordHttp("", delegate { }, handler))
+        using (DiscordWebhooks webhooks = new DiscordWebhooks(settings, http, delegate { }))
+        {
+            ServerManagerEvent manual = Event("command.executed");
+            manual.Fields["source"] = "discord";
+            manual.Fields["command"] = "players";
+            manual.Fields["success"] = "true";
+            manual.Fields["result_code"] = "players_listed";
+            Check(webhooks.Enqueue(manual), "Manual command remains on command.executed.");
+
+            ServerManagerEvent intermediate = Event("command.executed");
+            intermediate.Fields["source"] = "cron";
+            intermediate.Fields["command"] = "broadcast";
+            intermediate.Fields["success"] = "true";
+            intermediate.Fields["result_code"] = "cron_dispatched";
+            Check(!webhooks.Enqueue(intermediate), "Intermediate cron command does not create its own Discord card.");
+
+            ServerManagerEvent completed = Event("command.executed");
+            completed.Fields["source"] = "cron";
+            completed.Fields["command"] = "schedule";
+            completed.Fields["success"] = "true";
+            completed.Fields["result_code"] = "cron_completed";
+            completed.Fields["cron_verb"] = "broadcast";
+            completed.Fields["cron_command_count"] = "1";
+            completed.Fields["cron_schedule"] = "1-59/30 * * * *";
+            completed.Fields["cron_summary"] = "<color=yellow><size=32>AM,PM 05:30에 서버를 재부팅합니다</size></color>";
+            Check(webhooks.Enqueue(completed), "Final cron result uses the separate cron.executed selector.");
+
+            ServerManagerEvent failed = Event("command.executed");
+            failed.Fields["source"] = "cron";
+            failed.Fields["command"] = "maintenance";
+            failed.Fields["success"] = "false";
+            failed.Fields["result_code"] = "uw_partial_failure";
+            failed.Fields["cron_command_count"] = "2";
+            failed.Fields["cron_schedule"] = "30 5 * * *";
+            failed.Fields["cron_summary"] = "zones_reset → save";
+            Check(webhooks.Enqueue(failed), "Failed multi-command cron result uses the same compact final card.");
+
+            Task running = webhooks.RunAsync(CancellationToken.None);
+            await webhooks.StopAsync(TimeSpan.FromSeconds(3));
+            await running;
+            Check(handler.Requests.Count == 3 && handler.Requests[0].Url.StartsWith(Webhook, StringComparison.Ordinal) &&
+                handler.Requests.Skip(1).All(request => request.Url.StartsWith(ReloadedWebhook, StringComparison.Ordinal)),
+                "Manual and cron results reach only their independently selected destinations.");
+            CheckCompactEmbed((JObject)JObject.Parse(handler.Requests[0].Body!)["embeds"]![0]!,
+                "Command: players", "Result: players\\_listed", "Manual command card remains unchanged");
+            CheckCompactEmbed((JObject)JObject.Parse(handler.Requests[1].Body!)["embeds"]![0]!,
+                "✅ Cron · broadcast", "AM,PM 05:30에 서버를 재부팅합니다 · 1-59/30 \\* \\* \\* \\*",
+                "Successful cron card strips game markup and uses two compact lines");
+            CheckCompactEmbed((JObject)JObject.Parse(handler.Requests[2].Body!)["embeds"]![0]!,
+                "❌ Cron · 2 commands", "zones\\_reset → save · 30 5 \\* \\* \\* · Failed: uw\\_partial\\_failure",
+                "Failed cron card combines the job and result without a second schedule card");
         }
     }
 

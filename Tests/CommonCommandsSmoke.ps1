@@ -477,6 +477,24 @@ Assert-True ($auditData['message'].Length -lt 1000) 'Restore metadata must remai
 $auditData.Clear()
 $auditFields.Invoke($null, @('characterinfo', $metadata, $auditData)) | Out-Null
 Assert-True ($auditData.Count -eq 0) 'Other command kinds must not acquire restore result fields.'
+$cronMetadata = [Collections.Generic.Dictionary[string,string]]::new()
+foreach ($pair in @{
+    cron_schedule = '1-59/30 * * * *'; cron_command_count = '1'; cron_verb = 'broadcast'
+    cron_summary = '<color=yellow>Public restart notice</color>'; payload = 'CRON_PRIVATE_PAYLOAD'
+}.GetEnumerator()) { $cronMetadata.Add($pair.Key, $pair.Value) }
+$cronAudit = [Collections.Generic.Dictionary[string,string]]::new()
+$auditFields.Invoke($null, @('schedule', $cronMetadata, $cronAudit)) | Out-Null
+Assert-True ($cronAudit.Count -eq 4 -and $cronAudit['cron_schedule'] -ceq $cronMetadata['cron_schedule'] -and
+    $cronAudit['cron_command_count'] -ceq '1' -and $cronAudit['cron_verb'] -ceq 'broadcast' -and
+    $cronAudit['cron_summary'] -ceq $cronMetadata['cron_summary'] -and
+    -not (($cronAudit.Values -join '|').Contains('CRON_PRIVATE_PAYLOAD'))) `
+    'Final cron audit admits only the bounded Discord summary schema.'
+$cronMetadata['cron_command_count'] = '01'
+$cronMetadata['cron_verb'] = "bad verb`nsecret"
+$cronAudit.Clear()
+$auditFields.Invoke($null, @('maintenance', $cronMetadata, $cronAudit)) | Out-Null
+Assert-True (-not $cronAudit.ContainsKey('cron_command_count') -and $cronAudit['cron_verb'] -ceq 'badverbsecret') `
+    'Cron audit canonicalizes its verb and rejects a noncanonical command count.'
 $metadata['backup_id'] = '0123456789ABCDEF0123456789ABCDEF'
 $metadata['previous_revision'] = '-1'
 $metadata['restored_revision'] = '9223372036854775808'

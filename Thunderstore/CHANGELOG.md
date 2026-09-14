@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.7
+
+- Added optional CustomMainMenu compatibility so its changelog and logo remain visible, with ServerManager guidance and allowed mods available from a compact Server Info dialog.
+- Made new Discord examples disabled by default and isolated live-reload failures to the affected bot or named webhook block while valid blocks continue to update.
+- Added compact `cron.executed` webhook summaries that combine each scheduled job's commands, content, schedule and result into one notification.
+
 ## 1.0.6
 
 - Centralized YAML safety checks while retaining each configuration's existing limits and behavior.

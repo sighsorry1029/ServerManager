@@ -455,7 +455,7 @@ internal static class ServerScheduleRuntime
             {
                 ServerEventRuntime.RecordCommand("cron", run.Occurrence.Job.Id, run.Occurrence.Job.Id,
                     run.Occurrence.Job.Maintenance ? "maintenance" : "schedule", "",
-                    review ? "cron_needs_review" : code, success);
+                    review ? "cron_needs_review" : code, success, CronResultData(run));
                 if (review) Warn("Job '" + run.Occurrence.Job.Id + "' needs review (" + code + "). No automatic replay.");
                 else if (!success) Warn("Job '" + run.Occurrence.Job.Id + "' stopped (" + code + ").");
                 else if (run.Occurrence.Job.Log && (code != "cron_skipped" || _settings!.LogSkipped))
@@ -463,6 +463,32 @@ internal static class ServerScheduleRuntime
                         (code == "cron_skipped" ? "skipped (chance or global-key conditions)." : "completed."));
                 Finish(run);
             });
+        }
+
+        private static IReadOnlyDictionary<string, string> CronResultData(Run run)
+        {
+            ServerScheduleJob job = run.Occurrence.Job;
+            bool multiple = job.Commands.Count > 1;
+            string summary = string.Join(" → ", job.Commands.Select(command => CronCommandSummary(command, multiple)));
+            Dictionary<string, string> data = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["cron_schedule"] = job.Cron,
+                ["cron_command_count"] = job.Commands.Count.ToString(CultureInfo.InvariantCulture),
+                ["cron_summary"] = ServerCommands.BoundedText(summary, 1000)
+            };
+            if (!multiple) data["cron_verb"] = FirstVerb(job.Commands[0]);
+            return data;
+        }
+
+        private static string CronCommandSummary(string line, bool includeVerb)
+        {
+            if (!ServerCommands.TryTokenize(line, out string[] args, out _) || args.Length == 0)
+                return string.Empty;
+            string verb = FirstVerb(line);
+            int content = verb == "broadcast" ? 2 : verb == "announce" || verb == "chat" ? 1 : args.Length;
+            if (content >= args.Length) return verb;
+            string text = string.Join(" ", args.Skip(content));
+            return includeVerb ? verb + ": " + text : text;
         }
 
         private void Finish(Run run)

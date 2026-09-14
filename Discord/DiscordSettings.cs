@@ -21,7 +21,7 @@ internal sealed class DiscordSettings
     {
         "server.status", "server.saved", "server.announcement",
         "player.connection", "chat.shout", "raid.status", "player.death",
-        "boss.killed", "moderation.action", "command.executed",
+        "boss.killed", "moderation.action", "command.executed", "cron.executed",
         "security.alert", "security.admin_bypass",
         "character.validation", "character.shadow_stalled",
         "character.revision_observed", "connection.rejected"
@@ -38,7 +38,7 @@ internal sealed class DiscordSettings
         "character.save_rejected" or "character.validation_observed" => "character.validation",
         "security.detection" or "security.response" => "security.alert",
         // These names are selectors, never new event kinds that callers can emit.
-        "server.status" or "player.connection" or "raid.status" or
+        "server.status" or "player.connection" or "raid.status" or "cron.executed" or
             "character.validation" or "security.alert" => null,
         _ => PublicEvents.Contains(kind) ? kind : null
     };
@@ -50,6 +50,7 @@ internal sealed class DiscordSettings
     public HashSet<string> ChatChannelIds { get; set; } = new(StringComparer.Ordinal);
     public HashSet<string> AdminUserIds { get; set; } = new(StringComparer.Ordinal);
     public List<DiscordWebhookRoute> WebhookRoutes { get; set; } = new();
+    internal List<string> ReloadWarnings { get; } = new();
     internal int ChatRelayChannelCount => CommandChannelIds.Union(ChatChannelIds).Count();
 
     internal static DiscordSettings Load(string dataRoot, Action<string> log)
@@ -95,7 +96,15 @@ internal sealed class DiscordSettings
     internal static DiscordSettings ParseForReload(string yaml) =>
         ParseSettings(yaml, _ => { }, strict: true);
 
-    private static DiscordSettings ParseSettings(string yaml, Action<string> log, bool strict)
+    internal static DiscordSettings ParseForPartialReload(string yaml, DiscordSettings previous)
+    {
+        List<string> warnings = new();
+        DiscordSettings settings = ParseSettings(yaml, warnings.Add, strict: true, previous);
+        settings.ReloadWarnings.AddRange(warnings);
+        return settings;
+    }
+
+    private static DiscordSettings ParseSettings(string yaml, Action<string> log, bool strict, DiscordSettings? previous = null)
     {
         if (yaml == null) throw Invalid("YAML text is missing");
         if (yaml.Length > MaximumFileBytes) throw Invalid("file exceeds 128 KiB");
@@ -129,25 +138,35 @@ internal sealed class DiscordSettings
             "bot", "webhooks");
         DiscordSettings settings = new();
 
-        try { settings.ReadBot(root, strict); }
-        catch (InvalidDataException exception) when (!strict)
+        try { settings.ReadBot(root, strict, previous != null); }
+        catch (InvalidDataException exception) when (!strict || previous != null)
         {
             settings.BotEnabled = false;
             settings.ChatChannelIds.Clear();
-            log("Discord bot disabled. " + exception.Message);
+            if (previous != null)
+            {
+                settings.BotEnabled = previous.BotEnabled;
+                settings.BotToken = previous.BotToken;
+                settings.GuildIds = previous.GuildIds;
+                settings.CommandChannelIds = previous.CommandChannelIds;
+                settings.ChatChannelIds = previous.ChatChannelIds;
+                settings.AdminUserIds = previous.AdminUserIds;
+            }
+            log("Discord bot " + (previous == null ? "disabled. " : "keeps its last valid settings. ") + exception.Message);
         }
 
-        settings.ReadWebhooks(root, log, strict);
+        settings.ReadWebhooks(root, log, strict, previous);
         // Existing files are never rewritten: retain comments/order and never persist env secrets.
         return settings;
     }
 
-    private void ReadBot(Dictionary<string, YamlNode> root, bool strict)
+    private void ReadBot(Dictionary<string, YamlNode> root, bool strict, bool partial)
     {
         Dictionary<string, YamlNode> bot = Section(root, "bot", "enabled", "token", "guild_ids",
             "admin_channel_ids", "chat_channel_ids", "admin_user_ids");
         // An absent bot block still supports webhook-only configurations.
         BotEnabled = root.ContainsKey("bot") && Flag(bot, "enabled");
+        if (!BotEnabled && partial) return;
         BotToken = ResolveSecret("SERVERMANAGER_DISCORD_BOT_TOKEN", Text(bot, "token"));
         GuildIds = IdSet(List(bot, "guild_ids"), "bot.guild_ids");
         CommandChannelIds = IdSet(List(bot, "admin_channel_ids"), "bot.admin_channel_ids");
@@ -162,25 +181,33 @@ internal sealed class DiscordSettings
             throw Invalid("bot requires at least one valid guild ID and an ASCII bot token");
     }
 
-    private void ReadWebhooks(Dictionary<string, YamlNode> root, Action<string> log, bool strict)
+    private void ReadWebhooks(Dictionary<string, YamlNode> root, Action<string> log, bool strict, DiscordSettings? previous)
     {
         if (!root.TryGetValue("webhooks", out YamlNode node)) return;
         if (node is not YamlSequenceNode routes || routes.Children.Count > 10)
         {
-            if (strict) throw Invalid("webhooks must be a list of at most 10 routes");
-            log("Discord webhooks disabled: webhooks must be a list of at most 10 routes.");
+            if (strict && previous == null) throw Invalid("webhooks must be a list of at most 10 routes");
+            if (previous != null) WebhookRoutes.AddRange(previous.WebhookRoutes);
+            log("Discord webhooks " + (previous == null ? "disabled" : "keep their last valid settings") + ": webhooks must be a list of at most 10 routes.");
             return;
         }
         HashSet<string> names = new(StringComparer.Ordinal);
+        // Resolve identity before validating contents; never match an invalid entry
+        // to a previous route by its position. Ambiguous duplicate names are one group.
+        string?[] identities = routes.Children.Select(RouteIdentity).ToArray();
         for (int index = 0; index < routes.Children.Count; index++)
         {
             // Use a trusted numeric index in errors; a user-supplied name may itself contain a secret.
             string location = "webhooks[" + (index + 1).ToString(CultureInfo.InvariantCulture) + "]";
+            string? identity = identities[index];
             try
             {
                 Dictionary<string, YamlNode> route = Map(routes.Children[index], location,
                     "name", "enabled", "url", "events", "username", "avatar_url", "anonymous_prefix", "language", "include_steam_id");
                 bool enabled = Flag(route, "enabled");
+                if (!enabled && previous != null) continue;
+                if (previous != null && identity != null && identities.Count(value => value == identity) > 1)
+                    throw Invalid(location + " has a duplicate route name");
                 bool includeSteamId = route.ContainsKey("include_steam_id") && Flag(route, "include_steam_id");
                 string name = Text(route, "name", "Webhook " + (index + 1).ToString(CultureInfo.InvariantCulture));
                 string url = Text(route, "url");
@@ -210,15 +237,32 @@ internal sealed class DiscordSettings
                     AnonymousPrefix = anonymousPrefix, Language = language, IncludeSteamId = includeSteamId
                 });
             }
-            catch (InvalidDataException exception) when (!strict)
+            catch (InvalidDataException exception) when (!strict || previous != null)
             {
-                log(location + " disabled. " + exception.Message);
+                DiscordWebhookRoute? retained = identity == null ? null :
+                    previous?.WebhookRoutes.FirstOrDefault(route => route.Name == identity);
+                if (retained != null && !WebhookRoutes.Any(route => route.Name == identity))
+                    WebhookRoutes.Add(retained);
+                log(location + (retained == null ? " disabled. " : " keeps its last valid settings. ") + exception.Message);
             }
         }
     }
 
+    private static string? RouteIdentity(YamlNode node)
+    {
+        if (node is not YamlMappingNode mapping ||
+            !mapping.Children.TryGetValue(new YamlScalarNode("name"), out YamlNode value)) return null;
+        try
+        {
+            string name = Scalar(value, "name");
+            return name.Length > 0 && name.Length <= 80 && !name.Any(char.IsControl) ? name : null;
+        }
+        catch (InvalidDataException) { return null; }
+    }
+
     internal bool HasSameBotSettings(DiscordSettings other)
     {
+        if (other != null && !BotEnabled && !other.BotEnabled) return true;
         if (other == null || BotEnabled != other.BotEnabled || BotToken != other.BotToken ||
             !GuildIds.SetEquals(other.GuildIds) || !CommandChannelIds.SetEquals(other.CommandChannelIds) ||
             !ChatChannelIds.SetEquals(other.ChatChannelIds) ||
@@ -375,13 +419,13 @@ internal sealed class DiscordSettings
         new("Discord YAML configuration: " + reason + ".");
 
     private const string DefaultYaml = @"# Server-only UTF-8. Keep bot tokens and webhook URLs private.
-# Valid edits reload automatically; invalid edits keep the active settings.
+# Valid blocks reload automatically; invalid blocks keep their last valid settings.
 # Bot changes may reconnect Discord; the game server stays running.
 # Existing files are not rewritten. Webhooks work without a bot.
-# enabled defaults to true. Set unused components to false or remove them.
+# Examples are disabled. Omitted enabled defaults to true.
 # Fill enabled bot credentials/guild IDs and every enabled webhook URL before reloading.
 bot:
-  enabled: true
+  enabled: false
   token: '' # SERVERMANAGER_DISCORD_BOT_TOKEN overrides this value.
   guild_ids: [] # Discord server IDs; at least one is required when the bot is enabled.
   admin_user_ids: [] # Discord user IDs, not Steam IDs; full command/RCON access.
@@ -404,7 +448,8 @@ bot:
 #   player.death - All reported player deaths, including PvP; keeps cause-specific wording.
 #   boss.killed - Boss defeated.
 #   moderation.action - Administrative kick, ban or unban request.
-#   command.executed - Administrative command result, including failures.
+#   command.executed - Manual administrative command result, including failures.
+#   cron.executed - Compact final result for one scheduled job.
 #   security.alert - Cheat/stat-limit findings, detector diagnostics and response outcomes.
 #   security.admin_bypass - Administrator policy exemption.
 #   character.validation - Character save rejection or observe-only validation warning.
@@ -414,7 +459,7 @@ bot:
 #
 # Grouped filters keep separate outcome messages; they do not combine alerts.
 # Give enabled routes unique names, then add a URL and events.
-# Disable or remove unused examples before reloading.
+# Route names identify last valid settings. Deleted routes are removed.
 # Duplicate routes to one destination can duplicate notifications.
 # Example: events: [chat.shout, player.connection]
 # English and Korean are bundled; other languages need ServerManager.<Language>.yml under server BepInEx.
@@ -424,7 +469,7 @@ bot:
 # This is per webhook URL, independent of bot.admin_channel_ids. Use a private destination for IDs.
 webhooks:
   - name: Server status
-    enabled: true
+    enabled: false
     url: ''
     events:
       - server.status
@@ -443,12 +488,13 @@ webhooks:
   # Use a private destination: bot admin permissions do not protect webhook audiences.
   # These summaries are not proof of cheating or a full audit-log mirror.
   - name: Moderation
-    enabled: true
+    enabled: false
     url: ''
     events:
       - server.announcement
       - moderation.action
       - command.executed
+      - cron.executed
       - connection.rejected
       - character.revision_observed
       - character.validation
@@ -459,7 +505,7 @@ webhooks:
     include_steam_id: false
 
   - name: examplehook
-    enabled: true
+    enabled: false
     url: ''
     events: [server.status, server.saved, chat.shout]
     language: Korean
@@ -467,7 +513,7 @@ webhooks:
     anonymous_prefix: ''
 
   - name: examplehook2
-    enabled: true
+    enabled: false
     url: ''
     events:
       - server.status

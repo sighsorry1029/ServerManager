@@ -1128,6 +1128,19 @@ namespace ServerManager.Events
         private static void AddCommandResultFields(string action, IReadOnlyDictionary<string, string> data,
             Dictionary<string, string> fields)
         {
+            if ((action == "schedule" || action == "maintenance") && data != null)
+            {
+                if (data.TryGetValue("cron_schedule", out string cronSchedule))
+                    fields["cron_schedule"] = Safe(cronSchedule, 256);
+                if (data.TryGetValue("cron_verb", out string cronVerb) && !string.IsNullOrWhiteSpace(cronVerb))
+                    fields["cron_verb"] = SafeToken(cronVerb, 64);
+                if (data.TryGetValue("cron_summary", out string cronSummary))
+                    fields["cron_summary"] = Safe(cronSummary, 1000);
+                if (data.TryGetValue("cron_command_count", out string rawCount) &&
+                    int.TryParse(rawCount, NumberStyles.None, CultureInfo.InvariantCulture, out int count) &&
+                    count >= 1 && count <= 16 && rawCount == count.ToString(CultureInfo.InvariantCulture))
+                    fields["cron_command_count"] = rawCount;
+            }
             if (action == "giveitem" && data != null && data.TryGetValue("data_id", out string dataId) &&
                 global::ServerManager.Commands.ServerCommands.IsItemDataId(dataId))
             {

@@ -365,11 +365,12 @@ namespace ServerManager.Tests
             object configuredDefaults = strictParse.Invoke(null, new object[] { generated
                 .Replace("\r\n", "\n")
                 .Replace("  enabled: true\n  token:", "  enabled: false\n  token:")
+                .Replace("    enabled: false\n", "    enabled: true\n")
                 .Replace("url: ''", "url: https://discord.com/api/webhooks/123/generated-offline-token") });
             IList defaultRoutes = (IList)settings.GetProperty("WebhookRoutes").GetValue(configuredDefaults, null);
             string[][] expectedDefaultFilters = {
                 new[] { "server.status", "server.saved", "chat.shout", "player.connection", "raid.status", "player.death", "boss.killed" },
-                new[] { "server.announcement", "moderation.action", "command.executed", "connection.rejected", "character.revision_observed",
+                new[] { "server.announcement", "moderation.action", "command.executed", "cron.executed", "connection.rejected", "character.revision_observed",
                     "character.validation", "character.shadow_stalled", "security.admin_bypass", "security.alert" },
                 new[] { "server.status", "server.saved", "chat.shout" }, new[] { "server.status", "server.saved", "chat.shout" }
             };
@@ -1380,7 +1381,7 @@ namespace ServerManager.Tests
             MethodInfo parse = settingsType.GetMethod("ParseForReload", BindingFlags.Static | BindingFlags.NonPublic);
             MethodInfo filterFor = settingsType.GetMethod("GetWebhookEventFilter", BindingFlags.Static | BindingFlags.NonPublic);
             var selectable = (HashSet<string>)settingsType.GetField("PublicEvents", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
-            Check(selectable.Count == 16, "Actual Mono exposes the 16 grouped webhook selectors");
+            Check(selectable.Count == 17, "Actual Mono exposes the 17 grouped webhook selectors");
             const string securityUrl = "https://discord.com/api/webhooks/123/grouped-security-offline";
             const string validationUrl = "https://discord.com/api/webhooks/456/grouped-validation-offline";
             const string serverUrl = "https://discord.com/api/webhooks/789/grouped-server-offline";
@@ -1430,7 +1431,7 @@ namespace ServerManager.Tests
                         (string)eventType.GetProperty("Kind").GetValue(value, null) == sources[index],
                         "Grouped routing preserves the original source event " + sources[index]);
                 }
-                foreach (string synthetic in new[] { "server.status", "player.connection", "raid.status", "security.alert", "character.validation", "unknown.event" })
+                foreach (string synthetic in new[] { "server.status", "player.connection", "raid.status", "security.alert", "character.validation", "cron.executed", "unknown.event" })
                     Check(filterFor.Invoke(null, new object[] { synthetic }) == null &&
                         !(bool)sender.GetMethod("Enqueue").Invoke(webhooks, new[] { ReloadEvent(eventType, Guid.NewGuid().ToString("N"), synthetic, "not a source") }),
                         "Selectors are not synthetic source events and unknown sources cannot dispatch");

@@ -495,7 +495,7 @@ try {
     $routeEvents = $routeType.GetProperty('Events').GetValue($route)
     $eventFilter = $settingsType.GetMethod('GetWebhookEventFilter', $staticFlags)
     $selectableEvents = $settingsType.GetField('PublicEvents', $staticFlags).GetValue($null)
-    Assert-True ($null -ne $eventFilter -and $selectableEvents.Count -eq 16) 'Grouped webhook selector catalog is missing.'
+    Assert-True ($null -ne $eventFilter -and $selectableEvents.Count -eq 17) 'Grouped webhook selector catalog is missing.'
     foreach ($kind in @('security.detection', 'security.response', 'security.admin_bypass', 'character.save_rejected',
         'character.shadow_stalled', 'character.validation_observed', 'character.revision_observed', 'connection.rejected')) {
         $expectedFilter = switch ($kind) {
@@ -511,7 +511,7 @@ try {
         $routeEvents.Add($filter) | Out-Null
     }
     Assert-True ($routeEvents.Count -eq 6) 'The eight distinct operator audit kinds should select six webhook filters.'
-    foreach ($kind in @('server.status', 'player.connection', 'raid.status', 'security.alert', 'character.validation', 'event.unknown')) {
+    foreach ($kind in @('server.status', 'player.connection', 'raid.status', 'security.alert', 'character.validation', 'cron.executed', 'event.unknown')) {
         Assert-True ($null -eq $eventFilter.Invoke($null, [object[]]@($kind))) `
             'Synthetic selector names and unknown names must not become source audit events.'
     }

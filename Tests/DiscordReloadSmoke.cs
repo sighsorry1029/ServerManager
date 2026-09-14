@@ -32,7 +32,7 @@ internal static class DiscordReloadSmoke
             MainThread = Thread.CurrentThread.ManagedThreadId;
             Environment.SetEnvironmentVariable("SERVERMANAGER_DISCORD_BOT_TOKEN", null);
             NoClientStartup(); DisabledRecovery(); MalformedStartupRecovery();
-            StartupIsolationThenStrictReload(); DebounceAndSameMetadata(); DirectWebhookUrlReload(); AnonymousPrefixReload(); WebhookLanguageReload(); SteamIdOptionReload();
+            StartupIsolationThenStrictReload(); PartialBlockReload(); DebounceAndSameMetadata(); DirectWebhookUrlReload(); AnonymousPrefixReload(); WebhookLanguageReload(); SteamIdOptionReload();
             WholeDocumentLastGood(); OperatorRouteReload(); GroupedRouteReload(); AllBotSettingsReload(); GuildSettingsLifecycle(); ChatSettingsLifecycle(); AdminChatLifecycle(); CandidateFailure();
             StopAndWorldGuards(); DelayedGatewayActivation(); AdminOperations();
             Check(FakeLog.Messages.All(message => !message.Contains(Secret)),
@@ -144,11 +144,36 @@ internal static class DiscordReloadSmoke
             "Startup retains valid webhook beside invalid bot");
         object original = Session!;
         Apply(badBot.Replace("startup1", "rejected"));
-        Check(ReferenceEquals(Session, original) && RouteName == "startup1",
-            "Reload rejects entire partially invalid document");
+        Check(ReferenceEquals(Session, original) && RouteName == "rejected",
+            "Invalid bot retains its state while a valid webhook reloads");
         Apply(Config("corrected"));
         Check(RouteName == "corrected" && Commands != null,
             "Strict correction replaces disabled bot snapshot");
+    }
+
+    private static void PartialBlockReload()
+    {
+        string TwoRoutes() => Config("first") + Config("second").Split(new[] { "webhooks:\n" }, StringSplitOptions.None)[1];
+        NewWorld(TwoRoutes()); DiscordRuntime.Start();
+        string originalUrl = Hooks.Settings.WebhookRoutes[0].Url;
+        string badFirst = TwoRoutes().Replace("name: 'first'", "name: 'first'\n    language: []")
+            .Replace("name: 'second'", "name: 'second'\n    anonymous_prefix: Viking")
+            .Replace("admin_user_ids: ['789']", "admin_user_ids: ['987']");
+        Apply(badFirst);
+        Check(Hooks.Settings.WebhookRoutes.Count == 2 && Hooks.Settings.WebhookRoutes[0].Url == originalUrl &&
+            Hooks.Settings.WebhookRoutes[1].AnonymousPrefix == "Viking" && Commands!.Settings.AdminUserIds.Contains("987"),
+            "Failed first webhook, valid second webhook and bot changes apply independently through runtime reload");
+        Apply(badFirst.Replace("name: 'first'\n    language: []\n    enabled: true", "name: 'first'\n    language: []\n    enabled: false"));
+        Check(Hooks.Settings.WebhookRoutes.Count == 1 && RouteName == "second", "Explicit disable removes an invalid old route");
+        Apply(badFirst);
+        Check(Hooks.Settings.WebhookRoutes.Count == 1, "Re-enabling invalid route cannot revive a previously disabled snapshot");
+        Apply(TwoRoutes());
+        Check(Hooks.Settings.WebhookRoutes.Count == 2, "Corrected disabled route can recover");
+        Apply(Config("second"));
+        Check(Hooks.Settings.WebhookRoutes.Count == 1 && RouteName == "second", "File deletion removes old route by identity");
+        object current = Session!;
+        Apply("webhooks: [");
+        Check(ReferenceEquals(current, Session) && RouteName == "second", "Document syntax failure retains the complete active snapshot");
     }
 
     private static void DebounceAndSameMetadata()
@@ -216,10 +241,10 @@ internal static class DiscordReloadSmoke
             Apply("# legacy environment variables have no effect\n" + direct);
             Check(ReferenceEquals(Hooks, hooks) && hooks.ReloadCalls == reloads && hooks.Settings.WebhookRoutes.Single().Url == replacementUrl,
                 "Changing irrelevant webhook environment variables does not disable routes or replace equal settings");
-            foreach (string enabled in new[] { "true", "false" })
+            foreach (string enabled in new[] { "true" })
             foreach (string value in new[] { "''", "'" + environment + "'", "null", "[]", "{}", "true", "'BAD=" + Secret + "'" })
             {
-                string candidate = Config("blockedenv", admins: "[]")
+                string candidate = Config("directurl")
                     .Replace("    enabled: true", "    enabled: " + enabled)
                     .Replace("    events:", "    url_env: " + value + "\n    events:");
                 Apply(candidate);
@@ -276,10 +301,10 @@ internal static class DiscordReloadSmoke
 
         foreach (string scalar in new[] { "[]", "{}", "null", "'" + new string('x', 33) + "'",
             "\"" + Secret + "\\n\"", "\"\\tAnonymous\"", "\"Anonymous\\u200B\"", "\"Anonymous\\u2028\"" })
-        foreach (string enabled in new[] { "true", "false" })
+        foreach (string enabled in new[] { "true" })
         {
             string invalid = WithPrefix(scalar).Replace("    enabled: true", "    enabled: " + enabled)
-                .Replace("admin_user_ids: ['789']", "admin_user_ids: []");
+                ;
             Apply(invalid);
             Check(ReferenceEquals(Session, session) && ReferenceEquals(Hooks, hooks) &&
                 ReferenceEquals(Commands, commands) && hooks.ReloadCalls == 3 &&
@@ -322,10 +347,10 @@ internal static class DiscordReloadSmoke
             ReferenceEquals(Commands, commands) && ReferenceEquals(Gateway, gateway) && hooks.ReloadCalls == 1 &&
             hooks.Settings.WebhookRoutes.Single().Language == "Korean", "Language is a webhook-only live change without reconnecting the bot");
         foreach (string scalar in new[] { "''", "[]", "null", "'../English'", "'한국어'", "\"Korean\\n\"", "'" + new string('x', 65) + "'" })
-        foreach (string enabled in new[] { "true", "false" })
+        foreach (string enabled in new[] { "true" })
         {
             string invalid = WithLanguage(scalar).Replace("    enabled: true", "    enabled: " + enabled)
-                .Replace("admin_user_ids: ['789']", "admin_user_ids: []");
+                ;
             Apply(invalid);
             Check(ReferenceEquals(Session, session) && ReferenceEquals(Hooks, hooks) && hooks.ReloadCalls == 1 &&
                 hooks.Settings.WebhookRoutes.Single().Language == "Korean" &&
@@ -361,10 +386,10 @@ internal static class DiscordReloadSmoke
         Check(hooks.ReloadCalls == 1, "An equivalent enabled Steam-ID preference does not rebuild the sender");
         foreach (string scalar in new[] { "yes", "no", "on", "off", "1", "0", "True", "FALSE", "'true'", "\"false\"",
             "''", "' '", "[]", "{}", "null", "~", "'" + Secret + "'" })
-        foreach (bool enabled in new[] { true, false })
+        foreach (bool enabled in new[] { true })
         {
             string invalid = WithSteamId(scalar).Replace("    enabled: true", "    enabled: " + Flag(enabled))
-                .Replace("admin_user_ids: ['789']", "admin_user_ids: []");
+                ;
             Apply(invalid);
             Check(ReferenceEquals(Session, session) && ReferenceEquals(Hooks, hooks) && ReferenceEquals(Commands, commands) &&
                 ReferenceEquals(Gateway, gateway) && hooks.ReloadCalls == 1 && hooks.Settings.WebhookRoutes.Single().IncludeSteamId &&
@@ -408,22 +433,20 @@ internal static class DiscordReloadSmoke
         {
             "webhooks: [" + Secret + "\n",
             "privacy:\n  relay_shouts: false\n  relay_shouts: '" + Secret + "'\n",
-            Config("badgrant").Replace("user_ids: ['789']", "user_ids: ['invalid']"),
+            Config("lastgood").Replace("user_ids: ['789']", "user_ids: ['invalid']"),
             Config("bad_priv") + "privacy: {relay_shouts: true}\n",
             Config("bad_priv") + "privacy: {include_coordinates: false}\n",
             Config("bad_priv") + "privacy: {include_inventory: false}\n",
             Config("bad_priv") + "privacy: {include_plugin_list: true}\n",
             Config("bad_priv") + "privacy: {}\n",
-            Config("badtoken").Replace("token: '" + Secret + "_A'", "token: 'bad " + Secret + "'"),
-            Config("badroute").Replace("https://discord.com/api/webhooks/123/", "https://invalid.example/"),
-            Config("removedstart").Replace("['server.status']", "['server.status','server.started']"),
-            Config("removedjoin").Replace("['server.status']", "['player.first_join']"),
-            Config("disabledstart").Replace("    enabled: true", "    enabled: false").Replace("['server.status']", "['server.started']"),
-            Config("disabledjoin").Replace("    enabled: true", "    enabled: false").Replace("['server.status']", "['player.first_join']"),
+            Config("lastgood").Replace("token: '" + Secret + "_A'", "token: 'bad " + Secret + "'"),
+            Config("lastgood").Replace("https://discord.com/api/webhooks/123/", "https://invalid.example/"),
+            Config("lastgood").Replace("['server.status']", "['server.status','server.started']"),
+            Config("lastgood").Replace("['server.status']", "['player.first_join']"),
             Config("badlimit") + "rcon: {minimum_interval_seconds: 1}\n",
             Config("badlimit") + "rcon: {maximum_output_characters: 1800}\n",
             Config("badlimit") + "rcon: {}\n",
-            Config("badlimit").Replace("  enabled: true\n", "  enabled: true\n  command_timeout_seconds: 15\n"),
+            Config("lastgood").Replace("  enabled: true\n", "  enabled: true\n  command_timeout_seconds: 15\n"),
             Config("badmulti") + "---\n{}\n"
         };
         foreach (string yaml in invalid)
@@ -509,19 +532,18 @@ internal static class DiscordReloadSmoke
             "security.detection", "security.response" })
         foreach (bool enabled in new[] { true, false })
         {
+            Apply(ConfigFor("player.death"));
             string bad = ConfigFor(removed).Replace("admin_user_ids: ['789']", "admin_user_ids: ['987']");
             if (!enabled) bad = bad.Replace("    enabled: true", "    enabled: false");
             Apply(bad);
-            Check(ReferenceEquals(Session, session) && ReferenceEquals(Commands, commands) && ReferenceEquals(Gateway, gateway) &&
-                ReferenceEquals(Hooks, hooks) && hooks.ReloadCalls == reloads &&
-                commands.Settings.AdminUserIds.SetEquals(new[] { "789" }) &&
-                hooks.Settings.WebhookRoutes.Single().Events.SetEquals(new[] { "player.death" }) &&
+            Check(Commands!.Settings.AdminUserIds.SetEquals(new[] { "987" }) &&
+                (enabled ? Hooks.Settings.WebhookRoutes.Single().Events.SetEquals(new[] { "player.death" }) : Hooks.Settings.WebhookRoutes.Count == 0) &&
                 File.ReadAllText(ConfigPath, Utf8) == bad,
-                "Removed selector rejects the complete edit, retaining last-good authority/filters and user file bytes: " + removed);
+                "Invalid route retains only its block; valid authority edits and explicit disable apply: " + removed);
         }
         Apply(ConfigFor("character.validation"));
-        Check(hooks.ReloadCalls == reloads + 1 && hooks.Settings.WebhookRoutes.Single().Events.SetEquals(new[] { "character.validation" }),
-            "Corrected grouped selector recovers after rejected old names without restarting the session");
+        Check(Hooks.Settings.WebhookRoutes.Single().Events.SetEquals(new[] { "character.validation" }),
+            "Corrected grouped selector recovers after invalid old names");
     }
 
     private static void AllBotSettingsReload()
@@ -560,12 +582,14 @@ internal static class DiscordReloadSmoke
             "  guild_id: '123'\n", "  command_channel_ids: []\n", "chat: {channel_ids: []}\n", "chat: {}\n" })
         {
             oldCommands = Commands!;
+            string oldRoute = RouteName;
             string candidate = removed.StartsWith("  ", StringComparison.Ordinal)
                 ? Config("removedkey").Replace("  guild_ids: ['123']\n", removed + "  guild_ids: ['123']\n")
                 : Config("removedkey") + removed;
             Apply(candidate);
-            Check(ReferenceEquals(Commands, oldCommands) && !oldCommands.Disposed && RouteName == "reload02",
-                "Removed authorization, limit or single-guild/split-chat key rejects reload and retains last valid session");
+            Check(ReferenceEquals(Commands, oldCommands) && !oldCommands.Disposed &&
+                RouteName == (removed.StartsWith("  ", StringComparison.Ordinal) ? "removedkey" : oldRoute),
+                "Invalid bot retains authority but permits valid routes; unknown root rejects the document");
         }
         oldCommands = Commands!;
         Apply(Config("disabled", bot: false));
@@ -620,7 +644,7 @@ internal static class DiscordReloadSmoke
         foreach (string guilds in new[] { "[]", "null", "'321'", "['321','invalid']", "[{}]" })
         {
             Apply(Config("badguild", guilds: guilds));
-            Check(ReferenceEquals(Commands, previous) && !previous.Disposed && RouteName == "oneguild" &&
+            Check(ReferenceEquals(Commands, previous) && !previous.Disposed && RouteName == "badguild" &&
                 previous.Settings.GuildIds.SetEquals(new[] { "321" }),
                 "An invalid or empty enabled guild list preserves all last-good authority and routes");
         }
@@ -665,11 +689,11 @@ internal static class DiscordReloadSmoke
 
         previous = Commands;
         Apply(Config("chatbad", commandChannels: "[]", chatChannels: "['invalid-channel']"));
-        Check(ReferenceEquals(Commands, previous) && RouteName == "chatmoved",
+        Check(ReferenceEquals(Commands, previous) && RouteName == "chatbad",
             "Invalid chat-channel reload retains the entire last-good snapshot");
         Apply(Config("guildbad", commandChannels: "[]", chatChannels: "['654']").Replace("guild_ids: ['123']", "guild_ids: ['invalid-guild']"));
-        Check(ReferenceEquals(Commands, previous) && RouteName == "chatmoved",
-            "Invalid guild reload retains active chat and the entire last-good snapshot");
+        Check(ReferenceEquals(Commands, previous) && RouteName == "guildbad",
+            "Invalid guild reload retains active chat while valid webhook changes apply");
         Apply(Config("chatroute", commandChannels: "[]", chatChannels: "['654']", shout: true));
         Check(ReferenceEquals(Commands, previous) && Gateway!.ReceiveMessages && Hooks.Settings.WebhookRoutes[0].Events.Contains("chat.shout"),
             "Webhook event-filter reload does not reconnect or discard the chat dispatcher");

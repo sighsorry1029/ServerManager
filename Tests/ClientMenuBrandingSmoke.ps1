@@ -737,9 +737,39 @@ foreach ($guideDestroy in @($guideInstructions | Where-Object {
 })) {
     Assert-True ($null -ne $guideDestroy.Previous -and
         $guideDestroy.Previous.Operand -is [Mono.Cecil.FieldReference] -and
-        $guideDestroy.Previous.Operand.Name -eq '_root') `
-        'The guide can destroy a vanilla object rather than only its owned root.'
+        $guideDestroy.Previous.Operand.Name -in @('_root', '_launcher', '_dialog')) `
+        'The guide can destroy an object outside its owned panels and dialog controls.'
 }
+
+# Optional integration must not become a required runtime assembly or mutate the
+# other mod's configuration. Verify the contracts in the final bundled DLL.
+Assert-True (@($pluginDefinition.MainModule.AssemblyReferences | Where-Object Name -eq 'CustomMainMenu').Count -eq 0) `
+    'CustomMainMenu became a hard assembly dependency.'
+$customMenuDetection = $brandingType.Methods | Where-Object Name -eq 'IsCustomMenuActive' | Select-Object -First 1
+$detectionStrings = @($customMenuDetection.Body.Instructions | Where-Object {
+    $_.OpCode.Code -eq [Mono.Cecil.Cil.Code]::Ldstr
+} | ForEach-Object { $_.Operand })
+Assert-True ($detectionStrings -contains 'rdmods.custommainmenu' -and
+    $detectionStrings -contains 'General' -and $detectionStrings -contains 'Enabled') `
+    'Compatibility detection lost the installed plugin GUID or enable setting.'
+Assert-True (@($customMenuDetection.Body.Instructions | Where-Object {
+    $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -in @('Bind', 'Save', 'set_Value')
+}).Count -eq 0) 'Compatibility detection modifies the external configuration.'
+foreach ($guardedMethod in @(
+    ($menuGuideType.Methods | Where-Object Name -eq 'CaptureTargets' | Select-Object -First 1),
+    ($brandingType.Methods | Where-Object Name -eq 'ApplyLogo' | Select-Object -First 1))) {
+    $firstCall = $guardedMethod.Body.Instructions | Where-Object {
+        $_.Operand -is [Mono.Cecil.MethodReference]
+    } | Select-Object -First 1
+    Assert-True (@($guardedMethod.Body.Instructions | Where-Object {
+        $_.Operand -is [Mono.Cecil.FieldReference] -and $_.Operand.Name -eq '_customMenuActive' -and
+        $_.Offset -lt $firstCall.Offset
+    }).Count -gt 0) 'Shared changelog/logo access must be guarded before touching UI objects.'
+}
+$dialogInput = $menuGuideType.Methods | Where-Object Name -eq 'HandleDialogInput' | Select-Object -First 1
+Assert-True ($null -ne (Get-MethodCall $dialogInput $menuGuideType.FullName 'CanShow') -and
+    $null -ne (Get-MethodCall $dialogInput $menuGuideType.FullName 'SetOpen')) `
+    'Dialog input lacks menu visibility guarding or the normal close/selection restoration path.'
 Assert-True ($null -ne (Get-MethodCall $menuGuideMethods['Reflow'] $menuTextPanelType.FullName 'Reflow')) `
     'The guide lost its shared text layout delegation.'
 $textPanelReflow = $menuTextPanelType.Methods | Where-Object Name -eq 'Reflow' | Select-Object -First 1

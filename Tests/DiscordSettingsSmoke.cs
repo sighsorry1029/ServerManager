@@ -28,7 +28,7 @@ internal static class DiscordSettingsSmoke
     };
     private static readonly string[] SyntheticEventFilters =
     {
-        "server.status", "player.connection", "raid.status", "character.validation", "security.alert"
+        "server.status", "player.connection", "raid.status", "character.validation", "security.alert", "cron.executed"
     };
     private static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, true);
     private static string _root = "";
@@ -45,7 +45,7 @@ internal static class DiscordSettingsSmoke
             Environment.SetEnvironmentVariable(EnvB, null);
             for (int i = 1; i <= 10; i++) Environment.SetEnvironmentVariable("SERVERMANAGER_DISCORD_WEBHOOK_" + i, null);
             Defaults(); Valid(); AnonymousPrefixes(); WebhookLanguages(); SteamIdOptions(); GuildSettings(); RemovedBotSchema(); OperatorRoutes(); SourceEventFilters(); RemovedWebhookEvents(); ChatSettings(); BadBot(); RemovedAuthorizationKeys(); RemovedCommandLimits(); BadRoutes(); RemovedWebhookEnvironments(); RemovedPrivacyAndCollections(); Syntax(); EnvironmentOverrides();
-            StrictReload(); ReloadReads(); Comparators();
+            StrictReload(); PartialReload(); ReloadReads(); Comparators();
             Console.WriteLine("PASS: DiscordSettings startup/strict reload/comparators (" + _checks + " assertions, " + _cases + " isolated configs).");
             return 0;
         }
@@ -57,8 +57,8 @@ internal static class DiscordSettingsSmoke
         string root = NextRoot();
         var startupLogs = new List<string>();
         DiscordSettings settings = DiscordSettings.Load(root, startupLogs.Add);
-        Check(!settings.BotEnabled && settings.WebhookRoutes.Count == 0 && startupLogs.Count == 5,
-            "Enabled default bot and four routes fail closed with one diagnostic each while credentials are empty");
+        Check(!settings.BotEnabled && settings.WebhookRoutes.Count == 0 && startupLogs.Count == 0,
+            "Disabled examples load without missing-credential warnings");
         Safe(string.Join("\n", startupLogs));
         Check(new DiscordWebhookRoute().AnonymousPrefix == "", "Route model defaults to original player names");
         Check(new DiscordWebhookRoute().Language == "English", "Route model defaults to English event messages");
@@ -83,9 +83,9 @@ internal static class DiscordSettingsSmoke
             .Select(line => line.Trim().Split(':')[0]).ToArray();
         Check(botKeys.SequenceEqual(new[] { "enabled", "token", "guild_ids", "admin_user_ids", "admin_channel_ids", "chat_channel_ids" }),
             "Generated bot mapping places administrator users before the two channel lists");
-        Check(Regex.Matches(generated, @"(?m)^\s+enabled: true\s*$").Count == 5 &&
-            Regex.Matches(generated, @"(?m)^\s+enabled: false\s*$").Count == 0,
-            "Generated bot and all four webhook examples explicitly default enabled to true");
+        Check(Regex.Matches(generated, @"(?m)^\s+enabled: true\s*$").Count == 0 &&
+            Regex.Matches(generated, @"(?m)^\s+enabled: false\s*$").Count == 5,
+            "Generated bot and all four webhook examples are disabled");
         Check(!generated.Contains("guild_id:") && !generated.Contains("command_channel_ids:") && !generated.Contains("\nchat:"),
             "Generated YAML never advertises the removed single-guild or split-chat schema");
         Check(!generated.Contains("rcon:") && !generated.Contains("command_timeout_seconds") &&
@@ -107,7 +107,7 @@ internal static class DiscordSettingsSmoke
         Check(generated.Contains("English and Korean are bundled") &&
             generated.Contains("ServerManager.<Language>.yml under server BepInEx"),
             "Generated comments distinguish bundled translations from server-provided language files");
-        Check(generated.Contains("Disable or remove unused examples before reloading") &&
+        Check(generated.Contains("Deleted routes are removed") &&
             generated.Contains("Duplicate routes to one destination can duplicate notifications") &&
             generated.Contains("Fill enabled bot credentials/guild IDs and every enabled webhook URL before reloading"),
             "Generated comments explain duplicate delivery and credential-free inactivity without relaxing reload requirements");
@@ -134,7 +134,7 @@ internal static class DiscordSettingsSmoke
             "Default comments explain multi-guild shared configuration and the enabled bot's guild requirement");
         Check(generated.Contains("Commands and admin-only chat; displayed as Admin") &&
             generated.Contains("Public chat; displayed with Discord names"), "Default comments distinguish admin and public chat presentation");
-        Check(generated.Contains("Valid edits reload automatically; invalid edits keep the active settings") &&
+        Check(generated.Contains("Valid blocks reload automatically; invalid blocks keep their last valid settings") &&
             generated.Contains("may reconnect Discord; the game server stays running") &&
             generated.Contains("Existing files are not rewritten"), "Default comments describe live reload, last-good settings and existing-file preservation");
         Check(generated.Contains("name: Moderation") && OperatorKinds.All(generated.Contains) &&
@@ -152,7 +152,7 @@ internal static class DiscordSettingsSmoke
         byte[] original = File.ReadAllBytes(path);
         Check(!DiscordSettings.Load(root, _ => { }).BotEnabled, "Generated blank credentials remain inactive on repeated startup load");
         Check(original.SequenceEqual(File.ReadAllBytes(path)), "Generated example not rewritten on reload");
-        StrictRejected(generated, "Enabled generated example with blank credentials");
+        Check(!DiscordSettings.ParseForReload(generated).BotEnabled, "Disabled template is reloadable");
         Check(DiscordSettings.ReadReloadText(root) == generated && original.SequenceEqual(File.ReadAllBytes(path)),
             "Reload reads preserve the generated four-route example byte-for-byte even when its blank credentials reject activation");
         var omittedLogs = new List<string>();
@@ -197,8 +197,8 @@ internal static class DiscordSettingsSmoke
             "Generated comments describe every supported webhook event exactly once, with an English description");
         string[] eventLines = generated.Replace("\r\n", "\n").Split('\n')
             .Where(line => line.StartsWith("#   ", StringComparison.Ordinal)).ToArray();
-        Check(eventLines.Length == 16 && eventLines.Length == DiscordSettings.PublicEvents.Count,
-            "Generated comments list all sixteen actual selectable webhook filters");
+        Check(eventLines.Length == 17 && eventLines.Length == DiscordSettings.PublicEvents.Count,
+            "Generated comments list all seventeen actual selectable webhook filters");
         foreach (string line in eventLines)
         {
             Check(!HasCompleteEventCatalog(generated.Replace(line, "")), "Catalog checker detects a missing selectable event");
@@ -222,7 +222,7 @@ internal static class DiscordSettingsSmoke
         string[][] events =
         {
             new[] { "server.status", "server.saved", "chat.shout", "player.connection", "raid.status", "player.death", "boss.killed" },
-            new[] { "server.announcement", "moderation.action", "command.executed", "connection.rejected", "character.revision_observed", "character.validation", "character.shadow_stalled", "security.admin_bypass", "security.alert" },
+            new[] { "server.announcement", "moderation.action", "command.executed", "cron.executed", "connection.rejected", "character.revision_observed", "character.validation", "character.shadow_stalled", "security.admin_bypass", "security.alert" },
             new[] { "server.status", "server.saved", "chat.shout" },
             new[] { "server.status", "server.saved", "chat.shout" }
         };
@@ -232,8 +232,8 @@ internal static class DiscordSettingsSmoke
         {
             var route = (YamlMappingNode)routes.Children[index];
             string Value(string key) => ((YamlScalarNode)route.Children[new YamlScalarNode(key)]).Value!;
-            Check(Value("name") == names[index] && Value("enabled") == "true" && Value("url") == "",
-                "Each named example is explicitly enabled but contains no webhook credential");
+            Check(Value("name") == names[index] && Value("enabled") == "false" && Value("url") == "",
+                "Each named example is disabled and contains no webhook credential");
             string[] selected = ((YamlSequenceNode)route.Children[new YamlScalarNode("events")]).Children
                 .Cast<YamlScalarNode>().Select(node => node.Value!).ToArray();
             Check(selected.SequenceEqual(events[index]), "Default route selections use the grouped filters in the intended order");
@@ -266,15 +266,15 @@ internal static class DiscordSettingsSmoke
         }
         Check(!actualEvents[0].Overlaps(actualEvents[1]) &&
             new HashSet<string>(actualEvents[0].Concat(actualEvents[1]), StringComparer.Ordinal).SetEquals(DiscordSettings.PublicEvents),
-            "Server status and Moderation partition all sixteen supported filters without gaps or overlap");
+            "Server status and Moderation partition all seventeen supported filters without gaps or overlap");
         Check(OperatorKinds.All(actualEvents[1].Contains) && !OperatorKinds.Any(actualEvents[0].Contains),
             "All sensitive operator filters are grouped into Moderation");
-        Check(!actualEvents[1].Contains("player.connection") && actualEvents[1].Count == 9,
-            "Moderation retains its original nine filters without automatically adding connection identity notifications");
+        Check(!actualEvents[1].Contains("player.connection") && actualEvents[1].Count == 10,
+            "Moderation includes the separate cron result selector without adding connection identity notifications");
         Check(actualEvents[2].SetEquals(actualEvents[3]) && actualEvents[2].IsSubsetOf(actualEvents[0]),
             "Both additional examples intentionally repeat the same three public status/shout filters");
         Check(generated.Replace("\r\n", "\n").Contains(
-            "  - name: examplehook2\n    enabled: true\n    url: ''\n    events:\n" +
+            "  - name: examplehook2\n    enabled: false\n    url: ''\n    events:\n" +
             "      - server.status\n      - server.saved\n      - chat.shout\n"),
             "examplehook2 demonstrates the approved multiline event-list syntax");
 
@@ -282,7 +282,10 @@ internal static class DiscordSettingsSmoke
         var bot = (YamlMappingNode)root.Children[new YamlScalarNode("bot")];
         bot.Children[new YamlScalarNode("enabled")] = new YamlScalarNode("false");
         foreach (YamlMappingNode route in routes.Children)
+        {
+            route.Children[new YamlScalarNode("enabled")] = new YamlScalarNode("true");
             route.Children[new YamlScalarNode("url")] = new YamlScalarNode(SafeWebhook);
+        }
         using var writer = new StringWriter();
         document.Save(writer, assignAnchors: false);
         DiscordSettings configured = DiscordSettings.ParseForReload(writer.ToString());
@@ -291,6 +294,44 @@ internal static class DiscordSettingsSmoke
         Check(configured.WebhookRoutes.All(route => route.Username == "ServerManager" && route.AvatarUrl == "" && route.AnonymousPrefix == "" && !route.IncludeSteamId) &&
             configured.WebhookRoutes.Select(route => route.Language).SequenceEqual(new[] { "English", "English", "Korean", "English" }),
             "Explicit and omitted presentation/language fields resolve to the approved defaults independently per route");
+    }
+
+    private static void PartialReload()
+    {
+        var fixture = new Fixture();
+        var previous = DiscordSettings.ParseForReload(fixture.Render());
+        fixture.Routes[0]["url"] = "' '";
+        fixture.Routes[1]["anonymous_prefix"] = "'Viking'";
+        var next = DiscordSettings.ParseForPartialReload(fixture.Render(), previous);
+        Check(next.WebhookRoutes[0].Url == SafeWebhook && next.WebhookRoutes[1].AnonymousPrefix == "Viking",
+            "Bad first URL retains its route while the second route reloads");
+        Check(next.ReloadWarnings.Count == 1, "Partial failure produces one diagnostic");
+        Safe(string.Join("\n", next.ReloadWarnings));
+        fixture.Routes[0]["enabled"] = "false";
+        next = DiscordSettings.ParseForPartialReload(fixture.Render(), next);
+        Check(next.WebhookRoutes.Count == 1 && next.WebhookRoutes[0].Name == "second", "Explicit disable wins over invalid URL");
+        fixture.Routes[0]["enabled"] = "true";
+        next = DiscordSettings.ParseForPartialReload(fixture.Render(), next);
+        Check(next.WebhookRoutes.Count == 1, "Disabled history does not resurrect an older route");
+        fixture.Routes.Clear();
+        next = DiscordSettings.ParseForPartialReload(fixture.Render(), previous);
+        Check(next.WebhookRoutes.Count == 0, "Deleted routes stay deleted");
+        fixture = new Fixture();
+        fixture.Bot["token"] = "''";
+        fixture.Routes[1]["username"] = "'Updated'";
+        next = DiscordSettings.ParseForPartialReload(fixture.Render(), previous);
+        Check(next.HasSameBotSettings(previous) && next.WebhookRoutes[1].Username == "Updated", "Invalid bot does not block webhook reload");
+        fixture.Bot["enabled"] = "false";
+        next = DiscordSettings.ParseForPartialReload(fixture.Render(), previous);
+        Check(!next.BotEnabled, "Explicit bot disable overrides invalid credentials");
+        fixture = new Fixture();
+        fixture.Routes[1]["name"] = fixture.Routes[0]["name"];
+        next = DiscordSettings.ParseForPartialReload(fixture.Render(), previous);
+        Check(next.WebhookRoutes.Count == 1 && next.WebhookRoutes[0].Url == SafeWebhook, "Duplicate identity retains exactly one old route; removed name stays removed");
+        bool rejected = false;
+        try { DiscordSettings.ParseForPartialReload("webhooks: [", previous); }
+        catch (InvalidDataException) { rejected = true; }
+        Check(rejected && previous.WebhookRoutes.Count == 2, "Broken YAML rejects the entire candidate without modifying previous settings");
     }
 
     private static void Valid()
@@ -524,7 +565,7 @@ internal static class DiscordSettingsSmoke
 
     private static void OperatorRoutes()
     {
-        Check(DiscordSettings.PublicEvents.Count == 16 && OperatorKinds.All(DiscordSettings.PublicEvents.Contains),
+        Check(DiscordSettings.PublicEvents.Count == 17 && OperatorKinds.All(DiscordSettings.PublicEvents.Contains),
             "One supported webhook catalog includes all six exact operator selectors");
         foreach (string kind in OperatorKinds)
         {
@@ -580,7 +621,8 @@ internal static class DiscordSettingsSmoke
             Check(DiscordSettings.GetWebhookEventFilter(kind) == null, "Unknown/removed/noncanonical source cannot enter grouped routing: " + kind);
         var projected = new HashSet<string>(DiscordSettings.PublicEvents.Where(kind => !SyntheticEventFilters.Contains(kind))
             .Concat(grouped.Keys).Select(kind => DiscordSettings.GetWebhookEventFilter(kind)!), StringComparer.Ordinal);
-        Check(projected.SetEquals(DiscordSettings.PublicEvents), "All sixteen selectors correspond to supported real source events");
+        projected.Add("cron.executed"); // Selected from final source=cron command results by the dispatcher.
+        Check(projected.SetEquals(DiscordSettings.PublicEvents), "All seventeen selectors correspond to supported real source events or the final cron projection");
     }
 
     private static void RemovedWebhookEvents()

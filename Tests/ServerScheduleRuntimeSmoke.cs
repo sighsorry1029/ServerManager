@@ -282,12 +282,21 @@ internal static class ServerScheduleRuntimeSmoke
         Check(ServerCommands.Calls.All(call => call.Caller.Source == "cron" && call.Caller.Id == JobId()), "Common commands carry generated cron job identity.");
         Check(ServerEventRuntime.Audits.Count(a => a.Verb == "echo") == 1 &&
             ServerEventRuntime.Audits.All(a => a.Verb == "echo" || a.Verb == "schedule"), "Runtime audits raw command plus job outcome; common queue owns common command audits.");
+        ServerEventRuntime.Audit cron = ServerEventRuntime.Audits.Single(a => a.Verb == "schedule");
+        Check(cron.Data["cron_schedule"] == "* * * * * *" && cron.Data["cron_command_count"] == "5" &&
+            cron.Data["cron_summary"] == "echo → announce: hello → status → ban → unban" &&
+            !cron.Data.ContainsKey("cron_verb"),
+            "Final cron audit carries one bounded display summary while hiding non-announcement command arguments.");
         Check(Runs.Count == 0 && Claims == 0, "Successful command chain releases its occurrence claim.");
 
         Activate(Config("echo private-fixture-argument")); Due();
         Check(ServerEventRuntime.Audits.All(a => a.Source == "cron" && a.Id == JobId() && a.Name == JobId() &&
             a.Target.Length == 0 && !string.Join(" ", a.Source, a.Id, a.Name, a.Verb, a.Code, a.Target).Contains("private-fixture-argument")),
             "command.executed audit forwards bounded job identity/verb/result, not raw command arguments.");
+        cron = ServerEventRuntime.Audits.Single(a => a.Verb == "schedule");
+        Check(cron.Data["cron_verb"] == "echo" && cron.Data["cron_summary"] == "echo" &&
+            !string.Join(" ", cron.Data.Values).Contains("private-fixture-argument"),
+            "Single-command cron display metadata retains only a private command's verb.");
 
         Activate("jobs:\n" + string.Concat(Enumerable.Range(0, 5).Select(i => Job("j" + i, new[] { "echo " + i }))));
         Due(); Check(ServerConsoleExecutor.Lines.Count == 5 && Claims == 0, "Durable jobs drain across bounded frames (each Frame checks global budget).");
@@ -1023,7 +1032,7 @@ namespace ServerManager.Events
     internal static class ServerEventRuntime
     {
         internal sealed class SaveCall { internal CancellationToken Cancellation; internal Func<bool> Authorized = null!; }
-        internal sealed class Audit { internal string Source = "", Id = "", Name = "", Verb = "", Target = "", Code = ""; internal bool Success; }
+        internal sealed class Audit { internal string Source = "", Id = "", Name = "", Verb = "", Target = "", Code = ""; internal bool Success; internal Dictionary<string, string> Data = new(); }
         internal static long CommandWorldEpoch;
         internal static ServerManagerStatusSnapshot Status = new();
         internal static readonly List<SaveCall> Saves = new();
@@ -1033,7 +1042,9 @@ namespace ServerManager.Events
         internal static Task<ServerManagerCommandResult> EnqueueCommand(ServerEventCommandKind kind, string first, string second,
             CancellationToken cancellation, Func<bool> authorized)
         { Saves.Add(new SaveCall { Cancellation = cancellation, Authorized = authorized }); return NextSave ?? Task.FromResult(new ServerManagerCommandResult(true, "save_requested", "accepted")); }
-        internal static void RecordCommand(string source, string id, string name, string verb, string target, string code, bool success)
-        { Audits.Add(new Audit { Source = source, Id = id, Name = name, Verb = verb, Target = target, Code = code, Success = success }); }
+        internal static void RecordCommand(string source, string id, string name, string verb, string target, string code, bool success,
+            IReadOnlyDictionary<string, string>? data = null)
+        { Audits.Add(new Audit { Source = source, Id = id, Name = name, Verb = verb, Target = target, Code = code, Success = success,
+            Data = data == null ? new Dictionary<string, string>() : data.ToDictionary(pair => pair.Key, pair => pair.Value) }); }
     }
 }
