@@ -129,6 +129,8 @@ internal static class LocalHostCharacterRuntime
                     .WithPlayerMessage("sm_fresh_character_required");
             }
 
+            if (!session.BackupOnly)
+                codec.PreserveInitialAppearance(opened.Snapshot, original, managed);
             ValheimPrivateAccess.SetGamePlayerProfile(game, managed);
             if (opened.PendingInitialCommit &&
                 !service.FinalizePendingLocalHostSnapshot(openedSessionId))

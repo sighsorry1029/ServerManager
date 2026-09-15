@@ -38,7 +38,7 @@ namespace ServerManager
         ClientCharacterRejection = 12,
         BackupCaptureRequest = 13,
         BackupCaptureCommitted = 14,
-        LibraryManifestUpdate = 15,
+        // 15 is retired; do not reuse it for another message.
         Reject = 255
     }
 
@@ -454,14 +454,9 @@ namespace ServerManager
             AllowAdminCheatCommandsFlag |
             CarryWeightLimitFlag |
             MaximumDamageLimitFlag;
-        internal const int MaximumLibraryKeys = 128;
-        internal const int MaximumLibraryKeyUtf8Bytes = 256;
         internal const int EncodedBytes =
             sizeof(ushort) + sizeof(int) + sizeof(ushort) +
             sizeof(float) + sizeof(float) + sizeof(int);
-        internal const int MaxEncodedBytes = EncodedBytes +
-            MaximumLibraryKeys * (sizeof(int) + MaximumLibraryKeyUtf8Bytes);
-        private static readonly Encoding LibraryKeyUtf8 = new UTF8Encoding(false, true);
 
         public ProtocolChallengeOptions(
             bool enforceManifest,
@@ -478,8 +473,7 @@ namespace ServerManager
             bool enforceCarryWeightLimit,
             float maximumCarryWeight,
             bool enforceMaximumDamageLimit,
-            float maximumDamage,
-            IEnumerable<string> libraryKeys = null)
+            float maximumDamage)
         {
             if (maximumManifestBytes < 64 * 1024 ||
                 maximumManifestBytes >
@@ -525,22 +519,6 @@ namespace ServerManager
             MaximumCarryWeight = maximumCarryWeight;
             EnforceMaximumDamageLimit = enforceMaximumDamageLimit;
             MaximumDamage = maximumDamage;
-            List<string> keys = new List<string>();
-            HashSet<string> unique = new HashSet<string>(StringComparer.Ordinal);
-            if (libraryKeys != null)
-            {
-                foreach (string key in libraryKeys)
-                {
-                    if (keys.Count >= MaximumLibraryKeys ||
-                        !IntegrityAssemblyIdentity.IsCanonicalKey(key) ||
-                        LibraryKeyUtf8.GetByteCount(key) > MaximumLibraryKeyUtf8Bytes ||
-                        !unique.Add(key))
-                        throw new ArgumentException("Library identities must be bounded, canonical and unique.", nameof(libraryKeys));
-                    keys.Add(key);
-                }
-            }
-            keys.Sort(StringComparer.Ordinal);
-            LibraryKeys = keys.AsReadOnly();
         }
 
         public bool EnforceManifest { get; private set; }
@@ -573,15 +551,13 @@ namespace ServerManager
 
         public float MaximumDamage { get; private set; }
 
-        public IReadOnlyList<string> LibraryKeys { get; private set; }
-
         internal ProtocolChallengeOptions WithGameplayLimits(float carryWeight, float damage)
         {
             return new ProtocolChallengeOptions(EnforceManifest, ServerCharactersEnabled,
                 MaximumManifestBytes, DetectCheatEngine, DetectExternalTools,
                 DetectGenericProcessNames, DetectValheimTooler, MonitorCheatCommands,
                 BlockCheatCommands, AllowAdminCheatCommands, ProcessScanIntervalSeconds,
-                EnforceCarryWeightLimit, carryWeight, EnforceMaximumDamageLimit, damage, LibraryKeys);
+                EnforceCarryWeightLimit, carryWeight, EnforceMaximumDamageLimit, damage);
         }
 
         private static void ValidateGameplayLimit(
@@ -631,8 +607,6 @@ namespace ServerManager
             }
 
             ValidatePayloadForKind(packet.Kind, packet.Payload.Length, limits);
-            if (packet.Kind == ProtocolPacketKind.LibraryManifestUpdate && packet.Sequence == 0)
-                throw new ArgumentOutOfRangeException(nameof(packet), "Library manifest sequence must be positive.");
             int totalLength = checked(FixedHeaderBytes + packet.Payload.Length);
             if (totalLength > limits.MaxPacketBytes)
             {
@@ -744,11 +718,6 @@ namespace ServerManager
 
                     ProtocolPacketKind kind = (ProtocolPacketKind)rawKind;
                     uint sequence = reader.ReadUInt32();
-                    if (kind == ProtocolPacketKind.LibraryManifestUpdate && sequence == 0)
-                    {
-                        rejection = Malformed("The library manifest sequence was invalid.");
-                        return false;
-                    }
                     byte[] sessionId = ProtocolByteUtil.ReadExact(
                         reader,
                         ConnectionProtocolLimits.SessionIdBytes);
@@ -974,8 +943,7 @@ namespace ServerManager
                 packet.Kind != ProtocolPacketKind.Challenge ||
                 packet.Sequence != ProtocolSequence.Challenge ||
                 packet.Payload == null ||
-                packet.Payload.Length < ProtocolChallengeOptions.EncodedBytes ||
-                packet.Payload.Length > ProtocolChallengeOptions.MaxEncodedBytes)
+                packet.Payload.Length != ProtocolChallengeOptions.EncodedBytes)
             {
                 rejection = Malformed("The connection challenge options were invalid.");
                 return false;
@@ -998,36 +966,11 @@ namespace ServerManager
                         return false;
                     }
 
-                    int libraryCount = reader.ReadInt32();
-                    if (libraryCount < 0 || libraryCount > ProtocolChallengeOptions.MaximumLibraryKeys)
+                    // Preserve the fixed challenge layout, but no dependency
+                    // request or variable-length extension is supported.
+                    if (reader.ReadInt32() != 0 || stream.Position != stream.Length)
                     {
-                        rejection = Malformed("The connection challenge library count was invalid.");
-                        return false;
-                    }
-                    List<string> libraryKeys = new List<string>(libraryCount);
-                    string previousKey = null;
-                    for (int index = 0; index < libraryCount; index++)
-                    {
-                        int byteCount = reader.ReadInt32();
-                        if (byteCount < 1 || byteCount > ProtocolChallengeOptions.MaximumLibraryKeyUtf8Bytes ||
-                            byteCount > stream.Length - stream.Position)
-                        {
-                            rejection = Malformed("The connection challenge library identity size was invalid.");
-                            return false;
-                        }
-                        string key = RejectUtf8.GetString(ProtocolByteUtil.ReadExact(reader, byteCount));
-                        if (!IntegrityAssemblyIdentity.IsCanonicalKey(key) ||
-                            (previousKey != null && StringComparer.Ordinal.Compare(previousKey, key) >= 0))
-                        {
-                            rejection = Malformed("The connection challenge library identities were not canonical and unique.");
-                            return false;
-                        }
-                        libraryKeys.Add(key);
-                        previousKey = key;
-                    }
-                    if (stream.Position != stream.Length)
-                    {
-                        rejection = Malformed("The connection challenge options contained trailing data.");
+                        rejection = Malformed("The connection challenge has unsupported extensions. Update ServerManager on both server and client.");
                         return false;
                     }
 
@@ -1046,8 +989,7 @@ namespace ServerManager
                         (flags & ProtocolChallengeOptions.CarryWeightLimitFlag) != 0,
                         maximumCarryWeight,
                         (flags & ProtocolChallengeOptions.MaximumDamageLimitFlag) != 0,
-                        maximumDamage,
-                        libraryKeys);
+                        maximumDamage);
                     return true;
                 }
             }
@@ -1148,13 +1090,7 @@ namespace ServerManager
                 writer.Write((ushort)options.ProcessScanIntervalSeconds);
                 writer.Write(options.MaximumCarryWeight);
                 writer.Write(options.MaximumDamage);
-                writer.Write(options.LibraryKeys.Count);
-                foreach (string key in options.LibraryKeys)
-                {
-                    byte[] keyBytes = RejectUtf8.GetBytes(key);
-                    writer.Write(keyBytes.Length);
-                    writer.Write(keyBytes);
-                }
+                writer.Write(0); // Reserved; no library requests.
                 writer.Flush();
                 payload = stream.ToArray();
             }
@@ -1273,8 +1209,7 @@ namespace ServerManager
             switch (kind)
             {
                 case ProtocolPacketKind.Challenge:
-                    if (payloadLength < ProtocolChallengeOptions.EncodedBytes ||
-                        payloadLength > ProtocolChallengeOptions.MaxEncodedBytes)
+                    if (payloadLength != ProtocolChallengeOptions.EncodedBytes)
                     {
                         throw new InvalidDataException(
                             "Challenge payload had an invalid size.");
@@ -1283,7 +1218,6 @@ namespace ServerManager
                     break;
 
                 case ProtocolPacketKind.ManifestResponse:
-                case ProtocolPacketKind.LibraryManifestUpdate:
                     if (payloadLength > limits.MaxManifestBytes)
                     {
                         throw new ArgumentOutOfRangeException(nameof(payloadLength));

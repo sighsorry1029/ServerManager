@@ -41,6 +41,11 @@ By default, an existing local character with world progress cannot join unless
 the server already has its save. The player is asked to create a new character;
 their local save is not overwritten by this rejection.
 
+New server characters keep the skin color, hair, beard, hair color and body model
+selected during character creation. Starting items and progression follow the
+server rules. Once a server save exists, its appearance is restored instead;
+later in-game appearance changes are included in full character saves.
+
 ## Where files are stored
 
 Server data is separate from mod-manager profiles.
@@ -107,10 +112,13 @@ Mods that must run on the server still belong in its `BepInEx/plugins` folder.
 - Verified admins may use extra plugins or mismatched optional mods.
   **Required mods still apply to admins.**
 
-Dependency libraries such as `YamlDotNet.dll` can also be listed. A required
-library must be available as a matching standalone DLL; code bundled inside
-another mod does not count. Unlisted libraries are not blocked like unlisted
-plugins. Native DLLs are not supported as references.
+Only BepInEx plugins are checked. Standalone libraries such as
+`Newtonsoft.Json.dll` and `YamlDotNet.dll` are skipped even when copied into
+`required` or `optional`; skipped files are reported when the policy loads or
+reloads. Their presence, version and hash do not affect admission. A companion
+DLL that registers a BepInEx plugin (such as Newtonsoft.Json Detector) still
+follows the normal plugin rules. Libraries merged into a plugin remain part of
+that plugin's file hash. Native DLLs are not supported as references.
 
 These checks do not prove that a client’s memory or external tools are unmodified.
 

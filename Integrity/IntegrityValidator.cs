@@ -5,7 +5,7 @@ using System.Linq;
 namespace ServerManager
 {
     /// <summary>
-    /// Pure policy evaluator. Plugin GUIDs and reserved library keys are distinct.
+    /// Pure policy evaluator for BepInEx plugin GUIDs.
     /// Display names are retained for diagnostics but never grant access; an
     /// allowed file SHA-256 is always required for present required rules.
     /// Optional and unlisted plugins are strict by default, with an explicit
@@ -73,7 +73,7 @@ namespace ServerManager
                     diagnostics.Add(
                         IntegrityCanonical.Error(
                             IntegrityDiagnosticCodes.RequiredPluginMissing,
-                            "Required " + (IntegrityAssemblyIdentity.IsLibraryKey(rule.PluginGuid) ? "library '" : "plugin '") +
+                            "Required plugin '" +
                             rule.DisplayName +
                             "' (" +
                             rule.PluginGuid +
@@ -87,9 +87,6 @@ namespace ServerManager
                 IntegrityPolicyRule rule;
                 if (!policy.TryGetCanonicalRule(entry.PluginGuid, out rule))
                 {
-                    // Only explicitly configured libraries are in scope. Game,
-                    // framework and other dependency DLLs are not extra plugins.
-                    if (IntegrityAssemblyIdentity.IsLibraryKey(entry.PluginGuid)) continue;
                     (allowAdminExceptions ? exemptedDiagnostics : diagnostics).Add(
                         IntegrityCanonical.Error(
                             IntegrityDiagnosticCodes.UnlistedPluginPresent,
@@ -108,7 +105,7 @@ namespace ServerManager
                     (exemptOptionalHash ? exemptedDiagnostics : diagnostics).Add(
                         IntegrityCanonical.Error(
                             IntegrityDiagnosticCodes.HashNotAllowed,
-                            (IntegrityAssemblyIdentity.IsLibraryKey(rule.PluginGuid) ? "Library '" : "Plugin '") + rule.DisplayName +
+                            "Plugin '" + rule.DisplayName +
                             "' has SHA-256 " +
                             entry.FileSha256 +
                             ", which is not allowed by the server policy.",

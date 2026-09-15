@@ -72,8 +72,7 @@ namespace ServerManager
             try
             {
                 List<IntegrityPolicyRule> rules = snapshot.Rules
-                    .Where(rule => rule.Requirement == IntegrityRequirement.Optional &&
-                        !IntegrityAssemblyIdentity.IsLibraryKey(rule.PluginGuid))
+                    .Where(rule => rule.Requirement == IntegrityRequirement.Optional)
                     .ToList();
                 if (rules.Count > MaximumEntryCount) throw new CatalogTooLargeException();
                 // Bound every field before constructing sorting keys or payloads.
@@ -266,8 +265,7 @@ namespace ServerManager
             if (value.Length > MaximumGuidBytes) throw new CatalogTooLargeException();
             if (!IntegrityCanonical.TryNormalizeGuid(value, IntegrityLimits.Default,
                     IntegrityDiagnosticCodes.ManifestInvalidGuid, out string canonical, out _) ||
-                !string.Equals(value, canonical, StringComparison.Ordinal) ||
-                IntegrityAssemblyIdentity.IsLibraryKey(canonical))
+                !string.Equals(value, canonical, StringComparison.Ordinal))
                 throw new InvalidDataException();
         }
 

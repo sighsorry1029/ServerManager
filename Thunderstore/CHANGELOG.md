@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.8
+
+- Preserved the appearance selected during character creation on the first server join, while keeping server-defined starting items and progression.
+- Limited required/optional checks to BepInEx plugins. Standalone library DLLs are now skipped and reported when the policy loads or reloads, avoiding rejections caused by shared game libraries.
+- Clarified that ServerManager.dll is automatically required, must not be placed in optional, and does not need a copy in required.
+
 ## 1.0.7
 
 - Added optional CustomMainMenu compatibility so its changelog and logo remain visible, with ServerManager guidance and allowed mods available from a compact Server Info dialog.

@@ -8,45 +8,12 @@ using System.Text;
 namespace ServerManager
 {
     /// <summary>
-    /// Describes how a server policy treats a plugin or managed-library key.
+    /// Describes how a server policy treats a plugin.
     /// </summary>
     public enum IntegrityRequirement
     {
         Required,
         Optional
-    }
-
-    // A reserved namespace keeps library identities separate from plugin GUIDs.
-    // The simple name selects the rule; SHA-256 pins the full assembly contents,
-    // including version, culture and public key. Never use these keys as paths.
-    internal static class IntegrityAssemblyIdentity
-    {
-        internal const string Prefix = "assembly:";
-        internal const int MaximumLibraryCount = 128;
-
-        internal static bool IsLibraryKey(string? key) =>
-            key?.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase) == true;
-
-        internal static string GetKey(string simpleName)
-        {
-            if (string.IsNullOrEmpty(simpleName) || simpleName.Length > 247 ||
-                simpleName == "." || simpleName == ".." ||
-                simpleName.Any(c => !((c >= 'a' && c <= 'z') ||
-                    (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                    c == '.' || c == '_' || c == '-' || c == '+')))
-                throw new ArgumentException("The managed assembly simple name is invalid.", nameof(simpleName));
-            return Prefix + simpleName.ToLowerInvariant();
-        }
-
-        internal static bool IsCanonicalKey(string key)
-        {
-            try
-            {
-                return IsLibraryKey(key) && string.Equals(key,
-                    GetKey(key.Substring(Prefix.Length)), StringComparison.Ordinal);
-            }
-            catch (ArgumentException) { return false; }
-        }
     }
 
     /// <summary>
@@ -598,7 +565,6 @@ namespace ServerManager
             }
 
             string trimmed = value!.Trim();
-            bool libraryKey = IntegrityAssemblyIdentity.IsLibraryKey(trimmed);
             for (int index = 0; index < trimmed.Length; index++)
             {
                 char character = trimmed[index];
@@ -608,8 +574,7 @@ namespace ServerManager
                     character >= '0' && character <= '9' ||
                     character == '.' ||
                     character == '_' ||
-                    character == '-' ||
-                    (libraryKey && (character == ':' || character == '+'));
+                    character == '-';
                 if (!allowed)
                 {
                     diagnostic = Error(
@@ -630,13 +595,6 @@ namespace ServerManager
             }
 
             canonical = trimmed.ToLowerInvariant();
-            if (IntegrityAssemblyIdentity.IsLibraryKey(canonical) &&
-                !IntegrityAssemblyIdentity.IsCanonicalKey(canonical))
-            {
-                diagnostic = Error(diagnosticCode, "The managed library key is invalid.", string.Empty);
-                canonical = string.Empty;
-                return false;
-            }
             return true;
         }
 

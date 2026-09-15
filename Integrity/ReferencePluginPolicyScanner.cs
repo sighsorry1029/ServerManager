@@ -62,6 +62,7 @@ namespace ServerManager
             cancellationToken.ThrowIfCancellationRequested();
             List<IntegrityDiagnostic> diagnostics =
                 new List<IntegrityDiagnostic>();
+            List<string> skippedLibraries = new List<string>();
             List<ReferencePluginPolicyRecord> records =
                 new List<ReferencePluginPolicyRecord>();
 
@@ -120,6 +121,7 @@ namespace ServerManager
                     file,
                     records,
                     diagnostics,
+                    skippedLibraries,
                     cancellationToken);
                 if (diagnostics.Count != 0)
                 {
@@ -132,7 +134,8 @@ namespace ServerManager
             cancellationToken.ThrowIfCancellationRequested();
             return new ReferencePluginPolicyScanResult(
                 records,
-                diagnostics);
+                diagnostics,
+                skippedLibraries);
         }
 
         private void EnumerateRoleFiles(
@@ -286,6 +289,7 @@ namespace ServerManager
             ReferencePluginFile file,
             ICollection<ReferencePluginPolicyRecord> records,
             ICollection<IntegrityDiagnostic> diagnostics,
+            ICollection<string> skippedLibraries,
             CancellationToken cancellationToken)
         {
             try
@@ -390,13 +394,6 @@ namespace ServerManager
 
                                     IntegrityManifestEntry entry = DecodeBepInPluginAttribute(
                                         attribute, sha256, file.FullPath);
-                                    if (IntegrityAssemblyIdentity.IsLibraryKey(entry.PluginGuid))
-                                    {
-                                        throw new InvalidDataException(
-                                            "BepInPlugin GUIDs cannot use the reserved assembly: prefix: " +
-                                            file.FullPath);
-                                    }
-
                                     if (!fileGuids.Add(entry.PluginGuid))
                                     {
                                         throw new InvalidDataException(
@@ -412,7 +409,7 @@ namespace ServerManager
                                                 IntegrityDiagnosticCodes.PolicyTooManyRules,
                                                 "Reference DLLs declare more than " +
                                                 _limits.MaxPluginCount +
-                                                " plugin or managed-library entries."));
+                                                " plugin entries."));
                                         return;
                                     }
 
@@ -424,33 +421,9 @@ namespace ServerManager
 
                             if (fileRecords.Count == 0)
                             {
-                                // Dependency libraries have no BepInPlugin GUID.
-                                // Use their actual managed assembly name, never
-                                // the administrator's potentially renamed file.
-                                AssemblyNameDefinition? identity = module.Assembly?.Name;
-                                if (identity == null || string.IsNullOrWhiteSpace(identity.Name))
-                                {
-                                    throw new InvalidDataException(
-                                        "Reference DLL has no managed assembly identity: " + file.FullPath);
-                                }
-
-                                if (records.Count >= _limits.MaxPluginCount)
-                                {
-                                    diagnostics.Add(
-                                        IntegrityCanonical.Error(
-                                            IntegrityDiagnosticCodes.PolicyTooManyRules,
-                                            "Reference DLLs declare more than " +
-                                            _limits.MaxPluginCount +
-                                            " plugin or managed-library entries."));
-                                    return;
-                                }
-
-                                IntegrityManifestEntry library = new IntegrityManifestEntry(
-                                    IntegrityAssemblyIdentity.GetKey(identity.Name),
-                                    identity.FullName,
-                                    sha256,
-                                    _limits);
-                                fileRecords.Add(new ReferencePluginPolicyRecord(file.Requirement, library));
+                                if (module.Assembly == null)
+                                    throw new InvalidDataException("Reference DLL has no managed assembly identity: " + file.FullPath);
+                                skippedLibraries.Add(file.FullPath);
                             }
                         }
                     }
@@ -714,11 +687,15 @@ namespace ServerManager
     {
         internal ReferencePluginPolicyScanResult(
             IEnumerable<ReferencePluginPolicyRecord> records,
-            IEnumerable<IntegrityDiagnostic> diagnostics)
+            IEnumerable<IntegrityDiagnostic> diagnostics,
+            IEnumerable<string>? skippedLibraries = null)
         {
+            SkippedLibraries = Array.AsReadOnly((skippedLibraries ?? Array.Empty<string>()).ToArray());
             Records = records.ToArray();
             Diagnostics = IntegrityCollections.Freeze(diagnostics);
         }
+
+        internal IReadOnlyList<string> SkippedLibraries { get; }
 
         internal IReadOnlyList<ReferencePluginPolicyRecord> Records { get; }
 

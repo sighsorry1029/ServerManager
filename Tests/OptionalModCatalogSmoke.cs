@@ -54,8 +54,7 @@ internal static class OptionalModCatalogSmoke
         var optional = Rule("private.guid", "한글 Mod 🚀", "2.0.0", "1.0.0", "2.0.0");
         var second = Rule("second.guid", "Alpha", "5.0");
         var required = new IntegrityPolicyRule("required.guid", "RequiredSecret", IntegrityRequirement.Required, new[] { Hash });
-        var library = new IntegrityPolicyRule("assembly:secret", "LibrarySecret", IntegrityRequirement.Optional, new[] { Hash });
-        var rules = OptionalModCatalog.Encode(Snapshot(optional, second, required, library));
+        var rules = OptionalModCatalog.Encode(Snapshot(optional, second, required));
         var result = Status(rules, OptionalModCatalogStatus.Available, "Valid catalog unavailable");
         Assert(result.Entries.Count == 2 && result.Entries[0].Name == "Alpha" && result.Entries[1].Name == "한글 Mod 🚀", "Optional plugin filtering/order failed");
         Assert(result.Entries[0].PluginGuid == "second.guid" && result.Entries[1].PluginGuid == "private.guid", "Stable GUIDs did not round-trip");
@@ -63,7 +62,7 @@ internal static class OptionalModCatalogSmoke
             OptionalModCatalog.UnavailableHeaderValue == "2|missing|0|0|", "Preview schema was not upgraded to version two");
         Assert(result.Entries[1].Versions.SequenceEqual(new[] { "1.0.0", "2.0.0" }), "Versions not sorted distinct");
         Assert(optional.AllowedSha256.SequenceEqual(new[] { Hash }), "Metadata changed allowed hashes");
-        Assert(Stable(rules) == Stable(OptionalModCatalog.Encode(Snapshot(library, second, optional, required))), "Output depends on input order");
+        Assert(Stable(rules) == Stable(OptionalModCatalog.Encode(Snapshot(second, optional, required))), "Output depends on input order");
         Assert(rules.All(pair => pair.Key.StartsWith(OptionalModCatalog.KeyPrefix, StringComparison.Ordinal) && pair.Value.Length <= 96 && pair.Value.All(c => c <= 127)), "Rules not short ASCII values");
         Assert(rules.Sum(pair => pair.Key.Length + pair.Value.Length) <= 16384, "Catalog exceeds aggregate limit");
         string privateCheck = Encoding.UTF8.GetString(Payload(rules));
@@ -78,7 +77,7 @@ internal static class OptionalModCatalogSmoke
         bool immutable = false;
         try { ((IList<string>)result.Entries[1].Versions).Add("3"); } catch (NotSupportedException) { immutable = true; }
         Assert(immutable, "Decoded version list is mutable");
-        Status(OptionalModCatalog.Encode(Snapshot(required, library)), OptionalModCatalogStatus.Available, "Empty optional list is unavailable");
+        Status(OptionalModCatalog.Encode(Snapshot(required)), OptionalModCatalogStatus.Available, "Empty optional list is unavailable");
         Assert(OptionalModCatalog.Decode(OptionalModCatalog.Encode(Snapshot(required))).Entries.Count == 0, "Required-only catalog not empty");
         Status(new Dictionary<string, string> { ["other"] = new string('x', 20000) }, OptionalModCatalogStatus.Missing, "Unrelated rules affect catalog");
         Status(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)

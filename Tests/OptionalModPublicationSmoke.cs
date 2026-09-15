@@ -424,7 +424,7 @@ internal static class OptionalModPublicationSmoke
         object store = Construct(Type("IntegrityPolicyStore"), dataRoot);
         Type candidateType = Type("IntegrityPolicyStore").GetNestedType("ReloadCandidate", All)!;
         Array noDiagnostics = Array.CreateInstance(Type("IntegrityDiagnostic"), 0);
-        object good = Construct(candidateType, rules, noDiagnostics);
+        object good = Construct(candidateType, rules, noDiagnostics, Array.Empty<string>());
         Call(store, "PublishReload", good);
         object current = store.GetType().GetProperty("Current", All)!.GetValue(store)!;
         var fake = new Fake();
@@ -435,7 +435,7 @@ internal static class OptionalModPublicationSmoke
         object error = Construct(Type("IntegrityDiagnostic"), "fixture.invalid", "Injected invalid reload", "");
         Array diagnostics = Array.CreateInstance(Type("IntegrityDiagnostic"), 1);
         diagnostics.SetValue(error, 0);
-        object bad = Construct(candidateType, Array.CreateInstance(Type("IntegrityPolicyRule"), 0), diagnostics);
+        object bad = Construct(candidateType, Array.CreateInstance(Type("IntegrityPolicyRule"), 0), diagnostics, Array.Empty<string>());
         object result = Call(store, "PublishReload", bad)!;
         Assert(!(bool)result.GetType().GetProperty("Success")!.GetValue(result)! &&
             (bool)result.GetType().GetProperty("KeptPreviousSnapshot")!.GetValue(result)!,
@@ -448,7 +448,7 @@ internal static class OptionalModPublicationSmoke
         fake.Tick(network, retained, _refresh);
         Assert(fake.Rules[_header] == oldHeader, "Periodic refresh retains the last successful policy catalog.");
 
-        object next = Construct(candidateType, Rules("mod.next", "Next Optional", "2.0.0"), noDiagnostics);
+        object next = Construct(candidateType, Rules("mod.next", "Next Optional", "2.0.0"), noDiagnostics, Array.Empty<string>());
         Call(store, "PublishReload", next);
         object replacement = store.GetType().GetProperty("Current", All)!.GetValue(store)!;
         fake.Tick(network, replacement, _refresh + _check);

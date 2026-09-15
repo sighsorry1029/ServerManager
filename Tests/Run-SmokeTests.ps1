@@ -218,18 +218,13 @@ $smokeTests = @(
         NeedsGamePath = $true
     },
     [pscustomobject]@{
-        Name = "Scoped library protocol"
-        File = "DependencyProtocolSmoke.ps1"
+        Name = "Plugin-only manifest protocol"
+        File = "PluginManifestProtocolSmoke.ps1"
         NeedsGamePath = $true
     },
     [pscustomobject]@{
         Name = "Asynchronous client manifest preparation"
         File = "ManifestPreparationSmoke.ps1"
-        NeedsGamePath = $true
-    },
-    [pscustomobject]@{
-        Name = "Targeted managed dependency manifest"
-        File = "DependencyManifestSmoke.ps1"
         NeedsGamePath = $true
     },
     [pscustomobject]@{

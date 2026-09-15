@@ -166,7 +166,14 @@ function New-InventorySnapshotBytes {
 }
 
 function New-InnerPlayerDataFixture {
-    param([byte[]]$InventorySnapshot, [byte[]]$PlayerCustomDictionary = $null)
+    param(
+        [byte[]]$InventorySnapshot,
+        [byte[]]$PlayerCustomDictionary = $null,
+        [string]$Beard = 'beard-after-inventory',
+        [string]$Hair = 'hair-after-inventory',
+        [single[]]$Colors = @(0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+        [int]$Model = 1
+    )
 
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
@@ -189,19 +196,15 @@ function New-InnerPlayerDataFixture {
             $writer.Write([int]0)
         }
 
-        $writer.Write("beard-after-inventory")
-        $writer.Write("hair-after-inventory")
-        foreach ($color in @(
-            [single]0.1,
-            [single]0.2,
-            [single]0.3,
-            [single]0.4,
-            [single]0.5,
-            [single]0.6)) {
+        $appearanceOffset = [int]$stream.Position
+        $writer.Write($Beard)
+        $writer.Write($Hair)
+        foreach ($color in $Colors) {
             $writer.Write([single]$color)
         }
 
-        $writer.Write([int]1)
+        $writer.Write($Model)
+        $appearanceLength = [int]$stream.Position - $appearanceOffset
         $writer.Write([int]0)
         $writer.Write([int]2)
         $writer.Write([int]0)
@@ -223,6 +226,8 @@ function New-InnerPlayerDataFixture {
             Bytes = $stream.ToArray()
             InventoryOffset = $inventoryOffset
             InventoryLength = $inventoryLength
+            AppearanceOffset = $appearanceOffset
+            AppearanceLength = $appearanceLength
         }
     }
     finally {
@@ -908,6 +913,75 @@ $emptyBaseError = Assert-ThrowsLike `
     "An inventory-only save was accepted without a full-profile base."
 Assert-True ($emptyBaseError.GetType() -eq $protocolExceptionType) `
     "A missing full-profile base did not fail as a protocol error."
+
+# Initial customization must transfer cosmetics only, leaving the authoritative
+# seed's inventory/progression and the selected local profile untouched.
+$preserveAppearance = $profileCodecType.GetMethod('PreserveInitialAppearance',
+    [Reflection.BindingFlags]'Instance,NonPublic')
+$deserializeProfile = $profileCodecType.GetMethod('DeserializeProfileFromBytes')
+$serializeProfile = $profileCodecType.GetMethod('SerializeProfileToBytes')
+$localSource = [Enum]::Parse($deserializeProfile.GetParameters()[2].ParameterType, 'Local')
+$createOrigin = $envelopeType.GetMethod('CreateWithOrigin',
+    [Reflection.BindingFlags]'Static,NonPublic')
+$appearanceInner = New-InnerPlayerDataFixture $replacementInventory `
+    -Beard 'Beard2' -Hair 'HairVeryDifferentLength' -Colors @(0.9, 0.8, 0.7, 0.6, 0.5, 0.4) -Model 0
+[byte[]]$appearanceProfile = New-PlayerProfilePayload -CharacterName 'FastPathHero' `
+    -PlayerId 1234 -PlayerData $appearanceInner.Bytes
+$selected = $deserializeProfile.Invoke($profileCodec, [object[]]@($appearanceProfile, $null, $localSource))
+$managed = $deserializeProfile.Invoke($profileCodec, [object[]]@($fullProfile, $null, $localSource))
+$playerDataField = $deserializeProfile.ReturnType.GetField('m_playerData',
+    [Reflection.BindingFlags]'Instance,NonPublic,Public')
+[byte[]]$selectedBefore = $serializeProfile.Invoke($profileCodec, [object[]]@($selected))
+$freshSnapshot = $createOrigin.Invoke($null, [object[]]@(
+    [Enum]::Parse($envelopeKindType, 'Snapshot'), [long]1, [long]0, [Guid]::NewGuid(),
+    $identity, [DateTime]::UtcNow, [int]46, $fullProfile, $true))
+Assert-True ($preserveAppearance.Invoke($profileCodec, [object[]]@($freshSnapshot, $selected, $managed))) `
+    'A fresh server seed did not preserve the selected appearance.'
+[byte[]]$mergedAppearance = $playerDataField.GetValue($managed)
+Assert-True ($mergedAppearance.Length -eq $inner.Bytes.Length - $inner.AppearanceLength + $appearanceInner.AppearanceLength) `
+    'Appearance merge produced an incorrect player-data length.'
+Assert-True (Test-ByteRangeEqual $mergedAppearance 0 $inner.Bytes 0 $inner.AppearanceOffset) `
+    'Initial appearance imported local inventory or progression.'
+Assert-True (Test-ByteRangeEqual $mergedAppearance $inner.AppearanceOffset `
+    $appearanceInner.Bytes $appearanceInner.AppearanceOffset $appearanceInner.AppearanceLength) `
+    'Initial beard, hair, skin/hair colors or model were not preserved.'
+Assert-True (Test-ByteRangeEqual $mergedAppearance ($inner.AppearanceOffset + $appearanceInner.AppearanceLength) `
+    $inner.Bytes ($inner.AppearanceOffset + $inner.AppearanceLength) `
+    ($inner.Bytes.Length - $inner.AppearanceOffset - $inner.AppearanceLength)) `
+    'Initial appearance changed skills, food, custom data or other server suffix data.'
+[byte[]]$selectedAfter = $serializeProfile.Invoke($profileCodec, [object[]]@($selected))
+Assert-True (Test-ByteArrayEqual $selectedBefore $selectedAfter) 'Appearance merge mutated the selected profile.'
+[byte[]]$savedAppearance = $serializeProfile.Invoke($profileCodec, [object[]]@($managed))
+$roundTrip = $deserializeProfile.Invoke($profileCodec, [object[]]@($savedAppearance, $null, $localSource))
+Assert-True (Test-ByteArrayEqual $mergedAppearance ($playerDataField.GetValue($roundTrip))) `
+    'The next full-profile serialization lost the initial appearance.'
+
+foreach ($origin in @(@([long]1, [long]0, $false), @([long]2, [long]1, $true))) {
+    $existingSnapshot = $createOrigin.Invoke($null, [object[]]@(
+        [Enum]::Parse($envelopeKindType, 'Snapshot'), $origin[0], $origin[1], [Guid]::NewGuid(),
+        $identity, [DateTime]::UtcNow, [int]46, $fullProfile, $origin[2]))
+    $existing = $deserializeProfile.Invoke($profileCodec, [object[]]@($fullProfile, $null, $localSource))
+    Assert-True (-not $preserveAppearance.Invoke($profileCodec, [object[]]@($existingSnapshot, $selected, $existing))) `
+        'An established server character accepted local appearance.'
+    Assert-True (Test-ByteArrayEqual $inner.Bytes ($playerDataField.GetValue($existing))) `
+        'An established server character was modified.'
+}
+$worldDataField = $deserializeProfile.ReturnType.GetField('m_worldData', [Reflection.BindingFlags]'Instance,NonPublic,Public')
+$worldData = $worldDataField.GetValue($selected)
+$worldValueType = $worldDataField.FieldType.GetGenericArguments()[1]
+$worldData.Add([long]123, [Activator]::CreateInstance($worldValueType))
+Assert-True (-not $preserveAppearance.Invoke($profileCodec, [object[]]@($freshSnapshot, $selected, $managed))) `
+    'A used local character was allowed to supply initial appearance.'
+$worldData.Clear()
+
+$badAppearance = New-InnerPlayerDataFixture $replacementInventory -Colors @([single]::NaN, 0, 0, 0, 0, 0)
+$playerDataField.SetValue($selected, $badAppearance.Bytes)
+$null = Assert-ThrowsLike {
+    $preserveAppearance.Invoke($profileCodec, [object[]]@($freshSnapshot, $selected, $managed))
+} '*skin*' 'Non-finite initial appearance was accepted.'
+Assert-True (Test-ByteArrayEqual $mergedAppearance ($playerDataField.GetValue($managed))) `
+    'Rejected appearance partially modified the server profile.'
+Write-Host 'Initial appearance: cosmetics-only merge, full save round trip, existing/used character guards and invalid-input isolation passed.'
 
 $inventoryKind = [Enum]::Parse(
     $envelopeKindType,

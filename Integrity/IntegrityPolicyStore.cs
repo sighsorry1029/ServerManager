@@ -74,12 +74,14 @@ namespace ServerManager
         // may publish it after checking that its folder-change request is current.
         internal sealed class ReloadCandidate
         {
+            internal readonly IReadOnlyList<string> SkippedLibraries;
             internal readonly IReadOnlyList<IntegrityPolicyRule> Rules;
             internal readonly IReadOnlyList<IntegrityDiagnostic> Diagnostics;
 
             internal ReloadCandidate(IEnumerable<IntegrityPolicyRule> rules,
-                IEnumerable<IntegrityDiagnostic> diagnostics)
+                IEnumerable<IntegrityDiagnostic> diagnostics, IEnumerable<string> skippedLibraries)
             {
+                SkippedLibraries = Array.AsReadOnly(skippedLibraries.ToArray());
                 Rules = Array.AsReadOnly(rules.ToArray());
                 Diagnostics = Array.AsReadOnly(diagnostics.ToArray());
             }
@@ -94,11 +96,7 @@ namespace ServerManager
                 ? BuildEffectiveRules(sourceScan.Records, diagnostics)
                 : new List<IntegrityPolicyRule>();
             cancellationToken.ThrowIfCancellationRequested();
-            if (rules.Count(rule => IntegrityAssemblyIdentity.IsLibraryKey(rule.PluginGuid)) >
-                IntegrityAssemblyIdentity.MaximumLibraryCount)
-                diagnostics.Add(IntegrityCanonical.Error(IntegrityDiagnosticCodes.PolicyTooManyRules,
-                    "The reference folders contain more than 128 distinct managed-library names."));
-            return new ReloadCandidate(rules, diagnostics);
+            return new ReloadCandidate(rules, diagnostics, sourceScan.SkippedLibraries);
         }
 
         internal IntegrityPolicyReloadResult PublishReload(ReloadCandidate prepared)
@@ -164,8 +162,9 @@ namespace ServerManager
                         diagnostics.Add(
                             IntegrityCanonical.Error(
                                 IntegrityDiagnosticCodes.PolicySourceRoleConflict,
-                                "ServerManager reference DLLs may only be placed " +
-                                "under ServerManager/required.",
+                                "ServerManager.dll should not be placed in the optional folder. " +
+                                "It is automatically required. A copy in the required folder " +
+                                "is allowed but unnecessary.",
                                 group.Key));
                     }
 

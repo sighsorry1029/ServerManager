@@ -315,14 +315,6 @@ namespace ServerManager
                     continue;
                 }
 
-                if (IntegrityAssemblyIdentity.IsLibraryKey(pluginGuid))
-                {
-                    diagnostics.Add(IntegrityCanonical.Error(
-                        IntegrityDiagnosticCodes.ManifestInvalidGuid,
-                        "A plugin GUID cannot use the reserved assembly: namespace.", pluginGuid));
-                    continue;
-                }
-
                 string name;
                 if (!IntegrityCanonical.TryNormalizeDisplayString(
                         pluginInfo.Name,

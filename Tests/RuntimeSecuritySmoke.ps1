@@ -487,7 +487,7 @@ $policyChallengeConstructors = @($runtimeDefinition.Methods.Body.Instructions |
     Where-Object { $_.OpCode.Name -eq 'newobj' -and
         $_.Operand.DeclaringType.FullName -eq 'ServerManager.ProtocolChallengeOptions' })
 Assert-True ($policyChallengeConstructors.Count -eq 1 -and
-    $policyChallengeConstructors[0].Operand.Parameters.Count -eq 16) `
+    $policyChallengeConstructors[0].Operand.Parameters.Count -eq 15) `
     "The server must construct one explicit challenge policy."
 $challengeArgumentInstructions = [Collections.Generic.List[object]]::new()
 $previousArgument = $policyChallengeConstructors[0].Previous
@@ -3386,7 +3386,7 @@ $limitsArguments[2] = 256 * 1024
 $limitsArguments[3] = 512
 $limits = $limitsType.GetConstructors()[0].Invoke($limitsArguments)
 
-$challengeArguments = [object[]]::new(16)
+$challengeArguments = [object[]]::new(15)
 $challengeArguments[0] = $true
 $challengeArguments[1] = $true
 $challengeArguments[2] = 256 * 1024
@@ -5098,125 +5098,6 @@ $processObservationOffset = $fixedRuntimeSource.IndexOf('ProcessDetectionEvidenc
 Assert-True ($staleObservationOffset -ge 0 -and $processObservationOffset -gt $staleObservationOffset -and
     $fixedRuntimeSource.Substring($staleObservationOffset, $processObservationOffset - $staleObservationOffset).Contains(
         'LogDetection(identity, report, DetectionAction.Log, "stale_policy_observation")')) 'Old observations can inherit new terminal responses.'
-
-# Managed dependencies extend the existing admission manifest and have a narrow,
-# authenticated late-load update path; they must not create a second admission gate.
-$libraryMergeStart = $fixedRuntimeSource.IndexOf('private static void ProcessClientManifestPreparation(')
-$libraryMergeEnd = $fixedRuntimeSource.IndexOf('private static void SendClientManifestResponse(', $libraryMergeStart)
-Assert-True ($libraryMergeStart -ge 0 -and $libraryMergeEnd -gt $libraryMergeStart) 'Missing initial plugin/library manifest preparation.'
-$libraryMergeSource = $fixedRuntimeSource.Substring($libraryMergeStart, $libraryMergeEnd - $libraryMergeStart)
-foreach ($libraryMergeToken in @(
-    'if (!preparation.TryGetResult(out IntegrityManifestBuildResult build)) return;',
-    'if (!libraries.TryGetResult(out IntegrityManifestBuildResult libraryBuild)) return;',
-    'if (!libraries.MatchesCurrentAssemblies())',
-    'manifest.Entries.Concat(libraryBuild.Manifest.Entries)',
-    'manifest, session.ManifestResponseLimits',
-    'session.LibraryBaseline = session.LibraryPreparation;',
-    'SendClientManifestResponse(session, encoded.Payload)')) {
-    Assert-True ($libraryMergeSource.Contains($libraryMergeToken)) "Initial library merge lost $libraryMergeToken."
-}
-Assert-True ($libraryMergeSource.IndexOf('manifest.Entries.Concat') -lt $libraryMergeSource.IndexOf('IntegrityManifestCodec.TryEncode') -and
-    $libraryMergeSource.IndexOf('IntegrityManifestCodec.TryEncode') -lt $libraryMergeSource.IndexOf('SendClientManifestResponse')) `
-    'Library entries were not included in the same bounded manifest before admission response.'
-
-$libraryUpdateStart = $fixedRuntimeSource.IndexOf('internal void HandleLibraryUpdate(')
-$libraryUpdateEnd = $fixedRuntimeSource.IndexOf('public ManifestValidationDecision Validate(', $libraryUpdateStart)
-Assert-True ($libraryUpdateStart -ge 0 -and $libraryUpdateEnd -gt $libraryUpdateStart) 'Missing authenticated library-update handler.'
-$libraryUpdateSource = $fixedRuntimeSource.Substring($libraryUpdateStart, $libraryUpdateEnd - $libraryUpdateStart)
-foreach ($libraryGuard in @(
-    'session.State != ConnectionSessionState.Ready', '!session.PeerInfoAuthenticated',
-    'ProtocolByteUtil.FixedTimeEquals(session.SessionId, packet.SessionId)',
-    'ProtocolByteUtil.FixedTimeEquals(session.Nonce, packet.Nonce)',
-    '_libraryChecks.TryGetValue(rpc, out LibraryCheck check)',
-    'check.LastSequence == uint.MaxValue', 'packet.Sequence != check.LastSequence + 1',
-    'Stopwatch.GetTimestamp() - check.LastUpdateTimestamp < Stopwatch.Frequency / 2',
-    'TryResolveActiveDetectionPeer(server, rpc',
-    'identity, check.Policy, packet.Payload, IsCurrentServerAdmin(server, identity)',
-    'if (!decision.Accepted) SendServerRejection(rpc, decision.Rejection)',
-    'else RecordAdminExemptions(identity, exemptions)')) {
-    Assert-True ($libraryUpdateSource.Contains($libraryGuard)) "Library update lost guard $libraryGuard."
-}
-Assert-True ($libraryUpdateSource.IndexOf('check.LastSequence = packet.Sequence') -gt $libraryUpdateSource.IndexOf('TryResolveActiveDetectionPeer') -and
-    $libraryUpdateSource.IndexOf('check.LastSequence = packet.Sequence') -lt $libraryUpdateSource.IndexOf('ValidateLibraryUpdate(')) `
-    'Library sequence state must advance only after session and peer authentication, before policy validation.'
-
-$libraryValidatorDefinition = $runtimeDefinition.NestedTypes | Where-Object Name -eq 'RuntimeManifestValidator' | Select-Object -First 1
-$libraryUpdateDefinition = $libraryValidatorDefinition.Methods | Where-Object Name -eq 'HandleLibraryUpdate' | Select-Object -First 1
-Assert-True ($null -ne $libraryUpdateDefinition -and $libraryUpdateDefinition.HasBody) 'No compiled library update handler.'
-$libraryUpdateCalls = @($libraryUpdateDefinition.Body.Instructions | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] })
-$libraryValidationCall = $libraryUpdateCalls | Where-Object { $_.Operand.Name -eq 'ValidateLibraryUpdate' } | Select-Object -First 1
-$libraryAuthorizationCall = $libraryUpdateCalls | Where-Object { $_.Operand.Name -eq 'IsCurrentServerAdmin' } | Select-Object -First 1
-Assert-True ($null -ne $libraryValidationCall -and $null -ne $libraryAuthorizationCall -and
-    $libraryAuthorizationCall.Offset -lt $libraryValidationCall.Offset) `
-    'Late library admin exceptions no longer use the server-current authorization result.'
-$libraryExemptionAuditCall = $libraryUpdateCalls | Where-Object { $_.Operand.Name -eq 'RecordAdminExemptions' } | Select-Object -First 1
-Assert-True ($null -ne $libraryExemptionAuditCall -and
-    $libraryValidationCall.Offset -lt $libraryExemptionAuditCall.Offset -and
-    -not (Test-CecilReachable $libraryUpdateDefinition.Body.Instructions[0] $libraryExemptionAuditCall @($libraryValidationCall))) `
-    'Late administrator library exemptions can be audited before validation, or no longer reach the shared audit path.'
-$libraryDecisionBranch = Get-FirstConditionalBranch $libraryValidationCall $libraryExemptionAuditCall
-Assert-True ($null -ne $libraryDecisionBranch -and
-    ((Test-CecilReachable $libraryDecisionBranch.Operand $libraryExemptionAuditCall) -xor
-     (Test-CecilReachable $libraryDecisionBranch.Next $libraryExemptionAuditCall))) `
-    'Both accepted and rejected late-library updates can reach administrator exemption auditing.'
-$libraryRequiredGuardCalls = @($libraryUpdateCalls | Where-Object { $_.Operand.Name -in @(
-    'TryGetSnapshot', 'get_State', 'get_PeerInfoAuthenticated', 'FixedTimeEquals', 'TryResolveActiveDetectionPeer') })
-Assert-True ($libraryRequiredGuardCalls.Count -eq 6) 'Compiled session/authentication/library update guard set changed.'
-foreach ($libraryGuardCall in $libraryRequiredGuardCalls) {
-    Assert-True (-not (Test-CecilReachable $libraryUpdateDefinition.Body.Instructions[0] $libraryValidationCall @($libraryGuardCall))) `
-        "Library policy validation can bypass compiled guard $($libraryGuardCall.Operand.Name)."
-    $libraryGuardBranch = Get-FirstConditionalBranch $libraryGuardCall $libraryValidationCall
-    Assert-True ($null -ne $libraryGuardBranch) "Library guard $($libraryGuardCall.Operand.Name) has no rejecting branch."
-    $libraryGuardBranchesReachingValidation = @((Get-CecilSuccessors $libraryGuardBranch) | Where-Object {
-        Test-CecilReachable $_ $libraryValidationCall
-    })
-    Assert-True ($libraryGuardBranchesReachingValidation.Count -eq 1) `
-        "Both outcomes of library guard $($libraryGuardCall.Operand.Name) can validate or the valid path is unreachable."
-}
-
-$libraryClientStart = $fixedRuntimeSource.IndexOf('private static void ProcessClientLibraryUpdates(')
-$libraryClientEnd = $fixedRuntimeSource.IndexOf('private static void HandleClientManifestAccepted(', $libraryClientStart)
-Assert-True ($libraryClientStart -ge 0 -and $libraryClientEnd -gt $libraryClientStart) 'Missing bounded client library-update path.'
-$libraryClientSource = $fixedRuntimeSource.Substring($libraryClientStart, $libraryClientEnd - $libraryClientStart)
-foreach ($libraryClientGuard in @(
-    '!ReferenceEquals(_client, session)', 'session.Failed', '!session.ReadyAcknowledgementSent',
-    'session.LibraryKeys.Length == 0', 'session.LibraryBaseline == null',
-    'if (now < session.NextLibraryCheckTimestamp) return;',
-    'session.NextLibraryCheckTimestamp = now + Stopwatch.Frequency;',
-    'session.LibraryBaseline.MatchesCurrentAssemblies()',
-    'if (!pending.TryGetResult(out IntegrityManifestBuildResult result)) return;',
-    'if (!pending.MatchesCurrentAssemblies())', 'session.NextLibraryUpdateSequence == 0',
-    'ProtocolPacketKind.LibraryManifestUpdate, session.NextLibraryUpdateSequence',
-    'session.SessionId!, session.Nonce!, encoded.Payload', 'session.NextLibraryUpdateSequence++')) {
-    Assert-True ($libraryClientSource.Contains($libraryClientGuard)) "Client late-library check lost $libraryClientGuard."
-}
-Assert-True ($libraryClientSource.IndexOf('NextLibraryCheckTimestamp = now + Stopwatch.Frequency') -lt
-    $libraryClientSource.IndexOf('LibraryBaseline.MatchesCurrentAssemblies()')) 'Loaded assembly polling is no longer paced before discovery.'
-foreach ($forbiddenInlineLibraryWork in @('File.ReadAllBytes', 'Directory.GetFiles', 'SHA256.Create', 'ModuleDefinition.ReadModule')) {
-    Assert-True (-not $libraryClientSource.Contains($forbiddenInlineLibraryWork)) "Client update performs main-thread $forbiddenInlineLibraryWork."
-}
-
-$libraryPinStart = $fixedRuntimeSource.IndexOf('if (decision.Accepted && _libraryChecks.TryGetValue(')
-$libraryPinEnd = $fixedRuntimeSource.IndexOf('if (decision.Accepted && pendingManifest != null)', $libraryPinStart)
-Assert-True ($libraryPinStart -ge 0 -and $libraryPinEnd -gt $libraryPinStart) 'Library policy pin is not tied to successful admission.'
-$libraryPinSource = $fixedRuntimeSource.Substring($libraryPinStart, $libraryPinEnd - $libraryPinStart)
-Assert-True ($libraryPinSource.Contains('CaptureLibraryPolicy()') -and
-    $libraryPinSource.Contains('libraries.Policy.Rules.Select(rule => rule.PluginGuid)') -and
-    $libraryPinSource.Contains('accepted.Rules.Where(rule => requested.Contains(rule.PluginGuid))')) `
-    'An admission-time policy reload can add unrequested library identities to the late-update contract.'
-Assert-True ([Text.RegularExpressions.Regex]::IsMatch($fixedRuntimeSource,
-    'internal void RemovePeer\(ZRpc rpc\)\s*\{[^}]*_libraryChecks\.Remove\(rpc\);') -and
-    [Text.RegularExpressions.Regex]::IsMatch($fixedRuntimeSource,
-    'internal void Clear\(\)\s*\{[^}]*_libraryChecks\.Clear\(\);')) `
-    'Per-connection library validation state survives peer/global cleanup.'
-$libraryCleanupStart = $fixedRuntimeSource.IndexOf('private static void CancelClientManifestPreparation(')
-$libraryCleanupEnd = $fixedRuntimeSource.IndexOf('private static ServerIntegrityService EnsureIntegrityService()', $libraryCleanupStart)
-Assert-True ($libraryCleanupStart -ge 0 -and $libraryCleanupEnd -gt $libraryCleanupStart) 'Missing client manifest cleanup.'
-$libraryCleanupSource = $fixedRuntimeSource.Substring($libraryCleanupStart, $libraryCleanupEnd - $libraryCleanupStart)
-foreach ($libraryCleanup in @('session.LibraryPreparation?.Dispose();', 'session.LibraryPreparation = null;',
-    'session.LibraryBaseline?.Dispose();', 'session.LibraryBaseline = null;', 'session.LibraryKeys = Array.Empty<string>();')) {
-    Assert-True ($libraryCleanupSource.Contains($libraryCleanup)) "Library worker lifecycle cleanup lost $libraryCleanup."
-}
 
 Write-Output ("Fixed 120-second/30-second timeout wiring and separate 10 MiB server/32 MiB client character bounds, unified responses, server-only snapshot stat evidence, post-ACK guarded stat sanctions/audit, anti-cheat wire-v21, authenticated hot policy updates, generation-bound reports, generic security rejection, gameplay limits, first-join/two-phase final-save gate, report-codec, exact-name/module, assembly, " +
     "admin-entitlement, event-integration, flood-cap, and command-queue smoke tests passed.")

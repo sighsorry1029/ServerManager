@@ -174,30 +174,6 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
     // Failed/retrying reload candidates are never exposed as an empty catalog.
     internal IntegrityPolicySnapshot? CurrentPolicy => _policyStore.Current;
 
-    internal IntegrityPolicySnapshot? CaptureLibraryPolicy()
-    {
-        IntegrityPolicySnapshot? current = _policyStore.Current;
-        return current == null ? null : new IntegrityPolicySnapshot(current.Generation,
-            current.Rules.Where(rule => IntegrityAssemblyIdentity.IsLibraryKey(rule.PluginGuid)));
-    }
-
-    internal ManifestValidationDecision ValidateLibraryUpdate(ServerPeerIdentity identity,
-        IntegrityPolicySnapshot policy, byte[] payload, bool authenticatedAdmin,
-        out IReadOnlyList<IntegrityDiagnostic> exemptions)
-    {
-        exemptions = Array.Empty<IntegrityDiagnostic>();
-        var limits = new IntegrityLimits(maxPayloadBytes: _limits.MaxPayloadBytes,
-            maxPluginCount: IntegrityAssemblyIdentity.MaximumLibraryCount);
-        IntegrityManifestDecodeResult decoded = IntegrityManifestCodec.TryDecode(payload, limits);
-        if (decoded.Success && decoded.Manifest!.Entries.Any(entry =>
-                !IntegrityAssemblyIdentity.IsLibraryKey(entry.PluginGuid) ||
-                !policy.TryGetRule(entry.PluginGuid, out _)))
-            return ManifestValidationDecision.Reject("The library update contains an unrequested identity.");
-        IntegrityValidationResult validation = IntegrityValidator.Validate(policy, decoded, authenticatedAdmin);
-        if (validation.Allowed) exemptions = validation.ExemptedDiagnostics;
-        return CreateValidationDecision(identity, policy, decoded.Manifest, validation);
-    }
-
     // A caller with a bounded final-authentication gate may defer only
     // optional/unlisted mismatches. This is permission to begin vanilla
     // authentication, NOT an admin lookup or grant.
@@ -677,7 +653,13 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
                         bool initialLoad = _policyStore.Current == null;
                         IntegrityPolicyReloadResult result = _policyStore.PublishReload(candidate);
                         LogReload(result, initialLoad);
-                        if (result.Success) _reloadRetryCount = 0;
+                        if (result.Success)
+                        {
+                            _reloadRetryCount = 0;
+                            foreach (string library in candidate.SkippedLibraries)
+                                _log.LogInfo("Skipped library in mod policy: " + library +
+                                    ". required/optional checks BepInEx plugins only; library contents are not compared.");
+                        }
                         else ScheduleFailedReloadRetryLocked(now);
                     }
                 }

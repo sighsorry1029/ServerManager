@@ -506,63 +506,17 @@ internal static partial class ServerManagerRuntime
 
     private sealed class RuntimeManifestValidator : IManifestValidator
     {
-        private sealed class LibraryCheck
-        {
-            internal LibraryCheck(IntegrityPolicySnapshot policy) { Policy = policy; }
-            internal IntegrityPolicySnapshot Policy;
-            internal uint LastSequence;
-            internal long LastUpdateTimestamp;
-        }
-
-        private readonly Dictionary<ZRpc, LibraryCheck> _libraryChecks = new();
         private readonly Dictionary<ZRpc, (string HostId, IntegrityManifest Manifest)>
             _pendingAdminManifests = new();
 
         internal void RemovePeer(ZRpc rpc)
         {
             _pendingAdminManifests.Remove(rpc);
-            _libraryChecks.Remove(rpc);
         }
 
         internal void Clear()
         {
             _pendingAdminManifests.Clear();
-            _libraryChecks.Clear();
-        }
-
-        internal void ConfigureLibraries(ZRpc rpc, IntegrityPolicySnapshot? policy)
-        {
-            if (policy != null && policy.Rules.Count != 0)
-                _libraryChecks[rpc] = new LibraryCheck(policy);
-        }
-
-        internal void HandleLibraryUpdate(ZNet server, ZRpc rpc, ProtocolPacket packet)
-        {
-            if (!_coordinator.TryGetSnapshot(rpc, out ConnectionSessionSnapshot session) ||
-                session.State != ConnectionSessionState.Ready || !session.PeerInfoAuthenticated ||
-                !ProtocolByteUtil.FixedTimeEquals(session.SessionId, packet.SessionId) ||
-                !ProtocolByteUtil.FixedTimeEquals(session.Nonce, packet.Nonce) ||
-                !_libraryChecks.TryGetValue(rpc, out LibraryCheck check) ||
-                check.LastSequence == uint.MaxValue || packet.Sequence != check.LastSequence + 1 ||
-                (check.LastUpdateTimestamp != 0 && Stopwatch.GetTimestamp() - check.LastUpdateTimestamp < Stopwatch.Frequency / 2))
-            {
-                SendServerRejection(rpc, new ProtocolRejection(ProtocolRejectCode.InvalidTransition,
-                    "The managed-library update was invalid or too frequent."));
-                return;
-            }
-            if (!TryResolveActiveDetectionPeer(server, rpc, out ServerPeerIdentity identity,
-                    out ProtocolRejection rejection))
-            {
-                SendServerRejection(rpc, rejection);
-                return;
-            }
-            check.LastSequence = packet.Sequence;
-            check.LastUpdateTimestamp = Stopwatch.GetTimestamp();
-            ManifestValidationDecision decision = EnsureIntegrityService().ValidateLibraryUpdate(
-                identity, check.Policy, packet.Payload, IsCurrentServerAdmin(server, identity),
-                out IReadOnlyList<IntegrityDiagnostic> exemptions);
-            if (!decision.Accepted) SendServerRejection(rpc, decision.Rejection);
-            else RecordAdminExemptions(identity, exemptions);
         }
 
         public ManifestValidationDecision Validate(
@@ -577,19 +531,6 @@ internal static partial class ServerManagerRuntime
                         peerIdentity, manifestPayload,
                         allowAuthenticatedAdminReview: true,
                         out IntegrityManifest? pendingManifest);
-                if (decision.Accepted && _libraryChecks.TryGetValue(peerIdentity.Rpc, out LibraryCheck libraries))
-                {
-                    // Folder reloads apply to subsequent admissions. Pin the
-                    // library rules used at this successful admission for its
-                    // late-load updates, without adding new unsolicited keys.
-                    IntegrityPolicySnapshot? accepted = EnsureIntegrityService().CaptureLibraryPolicy();
-                    if (accepted != null)
-                    {
-                        var requested = new HashSet<string>(libraries.Policy.Rules.Select(rule => rule.PluginGuid));
-                        libraries.Policy = new IntegrityPolicySnapshot(accepted.Generation,
-                            accepted.Rules.Where(rule => requested.Contains(rule.PluginGuid)));
-                    }
-                }
                 if (decision.Accepted && pendingManifest != null)
                 {
                     if (_pendingAdminManifests.Count >= MaximumSteamAuthenticationReservations)
@@ -687,11 +628,6 @@ internal static partial class ServerManagerRuntime
         internal PluginManifestScanner.Preparation? ManifestPreparation { get; set; }
         internal IntegrityLimits? ManifestResponseLimits { get; set; }
         internal bool ManifestResponseSent { get; set; }
-        internal string[] LibraryKeys { get; set; } = Array.Empty<string>();
-        internal DependencyManifestScanner.Preparation? LibraryBaseline { get; set; }
-        internal DependencyManifestScanner.Preparation? LibraryPreparation { get; set; }
-        internal long NextLibraryCheckTimestamp { get; set; }
-        internal uint NextLibraryUpdateSequence { get; set; } = 1;
 
         internal bool ManifestAccepted { get; set; }
 
@@ -1092,7 +1028,6 @@ internal static partial class ServerManagerRuntime
         if (_client != null)
         {
             ProcessClientManifestPreparation(_client);
-            ProcessClientLibraryUpdates(_client);
         }
 
         foreach (ConnectionSessionSnapshot expired in _coordinator.ExpireTimedOutSessions())
@@ -2532,7 +2467,6 @@ internal static partial class ServerManagerRuntime
         const int cheatCommandThreshold = 3;
         const int cheatCommandWindowSeconds = 60;
 
-        IntegrityPolicySnapshot? libraryPolicy = EnsureIntegrityService().CaptureLibraryPolicy();
         ProtocolChallengeOptions challengeOptions = new(
             enforceManifest: ServerManagerPlugin.DefaultEnforceModPolicy,
             serverCharactersEnabled: true,
@@ -2551,8 +2485,7 @@ internal static partial class ServerManagerRuntime
                 CurrentServerSettings.MaximumCarryWeight,
             enforceMaximumDamageLimit: true,
             maximumDamage:
-                CurrentServerSettings.MaximumDamage,
-            libraryKeys: libraryPolicy?.Rules.Select(rule => rule.PluginGuid));
+                CurrentServerSettings.MaximumDamage);
         ProtocolOperationResult challenged =
             _coordinator.DispatchChallenge(
                 znet,
@@ -2564,9 +2497,6 @@ internal static partial class ServerManagerRuntime
             SendServerRejection(rpc, challenged.Rejection);
             return;
         }
-
-        _manifestValidator.ConfigureLibraries(rpc, libraryPolicy);
-
         ServerDetectionStates[rpc] = new ServerDetectionState(
             challengeOptions,
             cheatDetectionResponse,
@@ -6252,10 +6182,6 @@ internal static partial class ServerManagerRuntime
 
         switch (packet.Kind)
         {
-            case ProtocolPacketKind.LibraryManifestUpdate:
-                _manifestValidator.HandleLibraryUpdate(server, rpc, packet);
-                break;
-
             case ProtocolPacketKind.PolicyAck:
                 HandleServerPolicyAck(server, rpc, packet);
                 break;
@@ -7114,9 +7040,6 @@ internal static partial class ServerManagerRuntime
             {
                 session.ManifestResponseLimits = new IntegrityLimits(
                     maxPayloadBytes: challengeOptions.MaximumManifestBytes);
-                session.LibraryKeys = challengeOptions.LibraryKeys.ToArray();
-                if (session.LibraryKeys.Length != 0)
-                    session.LibraryPreparation = DependencyManifestScanner.Begin(session.LibraryKeys, _integrityLimits);
                 session.ManifestPreparation ??= PluginManifestScanner.BeginCurrent(_integrityLimits);
                 ProcessClientManifestPreparation(session);
             }
@@ -7161,23 +7084,6 @@ internal static partial class ServerManagerRuntime
             if (!build.Success || manifest == null)
                 throw new InvalidDataException("The local plugin manifest could not be built (" +
                     string.Join(", ", build.Diagnostics.Select(item => item.Code).Distinct().Take(4)) + ").");
-            if (session.LibraryPreparation != null)
-            {
-                DependencyManifestScanner.Preparation libraries = session.LibraryPreparation;
-                if (!libraries.TryGetResult(out IntegrityManifestBuildResult libraryBuild)) return;
-                if (!libraryBuild.Success || libraryBuild.Manifest == null)
-                    throw new InvalidDataException("Managed-library preparation failed: " +
-                        string.Join("; ", libraryBuild.Diagnostics.Take(4)));
-                if (!libraries.MatchesCurrentAssemblies())
-                {
-                    // A legitimate lazy load can race the worker. Re-capture
-                    // actual loaded locations rather than accept stale disk candidates.
-                    libraries.Dispose();
-                    session.LibraryPreparation = DependencyManifestScanner.Begin(session.LibraryKeys, _integrityLimits);
-                    return;
-                }
-                manifest = new IntegrityManifest(manifest.Entries.Concat(libraryBuild.Manifest.Entries));
-            }
             if (!preparation.MatchesCurrentPlugins())
                 throw new InvalidDataException("The loaded plugin list changed during manifest preparation; reconnect is required.");
 
@@ -7192,13 +7098,10 @@ internal static partial class ServerManagerRuntime
             long elapsed = preparation.ElapsedMilliseconds;
             session.ManifestPreparation = null;
             preparation.Dispose();
-            session.LibraryBaseline = session.LibraryPreparation;
-            session.LibraryPreparation = null;
-            session.NextLibraryCheckTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
             SendClientManifestResponse(session, encoded.Payload);
             ServerManagerPlugin.Log.LogInfo(
                 "Client manifest prepared asynchronously: " + manifest.Entries.Count +
-                " plugin/library records, " + elapsed.ToString(CultureInfo.InvariantCulture) + " ms (including worker queue).");
+                " plugin records, " + elapsed.ToString(CultureInfo.InvariantCulture) + " ms (including worker queue).");
         }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
         {
@@ -7214,57 +7117,6 @@ internal static partial class ServerManagerRuntime
             session.SessionId!, session.Nonce!, manifestPayload, _connectionLimits);
         SendProtocolOrThrow(session.Rpc, response);
         session.ManifestResponseSent = true;
-    }
-
-    private static void ProcessClientLibraryUpdates(ClientConnection session)
-    {
-        if (!ReferenceEquals(_client, session) || session.Failed || !session.ReadyAcknowledgementSent ||
-            session.LibraryKeys.Length == 0 || session.LibraryBaseline == null) return;
-        try
-        {
-            if (session.Rpc.GetSocket()?.IsConnected() != true)
-            {
-                CancelClientManifestPreparation(session);
-                return;
-            }
-            long now = Stopwatch.GetTimestamp();
-            if (session.LibraryPreparation == null)
-            {
-                if (now < session.NextLibraryCheckTimestamp) return;
-                session.NextLibraryCheckTimestamp = now + Stopwatch.Frequency;
-                // Only selected identities are compared, once per second. No
-                // disk reads, directory walks or hashing in the frame hot path.
-                if (session.LibraryBaseline.MatchesCurrentAssemblies()) return;
-                session.LibraryPreparation = DependencyManifestScanner.Begin(session.LibraryKeys, _integrityLimits);
-            }
-            DependencyManifestScanner.Preparation pending = session.LibraryPreparation;
-            if (!pending.TryGetResult(out IntegrityManifestBuildResult result)) return;
-            if (!result.Success || result.Manifest == null)
-                throw new InvalidDataException("Managed-library revalidation failed: " +
-                    string.Join("; ", result.Diagnostics.Take(4)));
-            if (!pending.MatchesCurrentAssemblies())
-            {
-                pending.Dispose();
-                session.LibraryPreparation = null;
-                return;
-            }
-            IntegrityManifestEncodeResult encoded = IntegrityManifestCodec.TryEncode(
-                result.Manifest, session.ManifestResponseLimits ?? _integrityLimits);
-            if (!encoded.Success || encoded.Payload == null || session.NextLibraryUpdateSequence == 0)
-                throw new InvalidDataException("The managed-library update could not be encoded.");
-            SendProtocolOrThrow(session.Rpc, ProtocolPacketCodec.Encode(new ProtocolPacket(
-                ProtocolPacketKind.LibraryManifestUpdate, session.NextLibraryUpdateSequence,
-                session.SessionId!, session.Nonce!, encoded.Payload), _connectionLimits));
-            session.NextLibraryUpdateSequence++;
-            session.LibraryBaseline.Dispose();
-            session.LibraryBaseline = pending;
-            session.LibraryPreparation = null;
-            session.NextLibraryCheckTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
-        }
-        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
-        {
-            FailClient(session.Rpc, "A managed dependency could not be verified. Reconnect after checking your mod pack.", exception);
-        }
     }
 
     private static void HandleClientManifestAccepted(
@@ -7475,6 +7327,12 @@ internal static partial class ServerManagerRuntime
                     return;
                 }
 
+                if (!session.BackupOnly && _profileCodec!.PreserveInitialAppearance(envelope, selected, managed))
+                {
+                    // Capture after Player.Load/spawn through the existing full-save
+                    // pipeline. ACK/base bytes remain the actual server snapshot.
+                    session.FullProfileSafetySaveDueTimestamp = Stopwatch.GetTimestamp();
+                }
                 session.OriginalProfile = selected;
                 session.ManagedProfile = managed;
                 session.CharacterState = new CharacterClientState(
@@ -10097,11 +9955,6 @@ internal static partial class ServerManagerRuntime
         session.ManifestPreparation = null;
         session.ManifestResponseLimits = null;
         preparation?.Dispose();
-        session.LibraryPreparation?.Dispose();
-        session.LibraryPreparation = null;
-        session.LibraryBaseline?.Dispose();
-        session.LibraryBaseline = null;
-        session.LibraryKeys = Array.Empty<string>();
     }
 
     private static ServerIntegrityService EnsureIntegrityService()

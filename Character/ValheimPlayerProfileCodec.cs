@@ -284,6 +284,41 @@ namespace ServerManager
             return result;
         }
 
+        // A fresh server seed owns inventory/progression; only the selected new
+        // character's vanilla appearance is carried into its first Player.Load.
+        // The ordinary first full save then establishes that appearance on the server.
+        internal bool PreserveInitialAppearance(
+            CharacterEnvelope snapshot, PlayerProfile selected, PlayerProfile managed)
+        {
+            if (snapshot.Kind != CharacterEnvelopeKind.Snapshot ||
+                !snapshot.RequiresFreshLocalCharacter || snapshot.Revision != 1 ||
+                snapshot.BaseRevision != 0 || ProfilePrivateAccess.GetWorldData(selected).Count != 0)
+                return false;
+            if (!string.Equals(selected.GetName(), managed.GetName(), StringComparison.Ordinal) ||
+                !string.Equals(managed.GetName(), snapshot.CharacterName, StringComparison.Ordinal))
+                throw new CharacterProtocolException("Initial appearance character names differ.");
+            byte[]? source = ProfilePrivateAccess.GetPlayerData(selected);
+            byte[]? target = ProfilePrivateAccess.GetPlayerData(managed);
+            if (source == null || target == null) return false;
+            EnsureByteArrayLength(source, "selected player data");
+            EnsureByteArrayLength(target, "initial server player data");
+            ParseAndValidateInnerPlayerData(source, out _, out _, out _, out _,
+                out int sourceOffset, out int sourceLength);
+            ParseAndValidateInnerPlayerData(target, out _, out _, out _, out _,
+                out int targetOffset, out int targetLength);
+            int length = checked(target.Length - targetLength + sourceLength);
+            if (length > _options.MaxPayloadBytes)
+                throw new CharacterProtocolException("Initial appearance exceeds the profile limit.");
+            byte[] merged = new byte[length];
+            Buffer.BlockCopy(target, 0, merged, 0, targetOffset);
+            Buffer.BlockCopy(source, sourceOffset, merged, targetOffset, sourceLength);
+            Buffer.BlockCopy(target, targetOffset + targetLength, merged, targetOffset + sourceLength,
+                target.Length - targetOffset - targetLength);
+            _ = ParseAndValidateInnerPlayerData(merged);
+            ProfilePrivateAccess.SetPlayerData(managed, merged);
+            return true;
+        }
+
         /// <summary>
         /// Serializes the current in-memory PlayerProfile to the raw ZPackage payload that
         /// vanilla normally wraps with a length and generated hash inside a .fch file.
@@ -1110,6 +1145,19 @@ namespace ServerManager
             out int skillsOffset,
             out int skillsLength)
         {
+            return ParseAndValidateInnerPlayerData(playerData, out inventoryOffset,
+                out inventoryLength, out skillsOffset, out skillsLength, out _, out _);
+        }
+
+        private CharacterSemanticSnapshot ParseAndValidateInnerPlayerData(
+            byte[] playerData,
+            out int inventoryOffset,
+            out int inventoryLength,
+            out int skillsOffset,
+            out int skillsLength,
+            out int appearanceOffset,
+            out int appearanceLength)
+        {
             InnerPlayerDataReader reader = new InnerPlayerDataReader(
                 playerData,
                 _options.MaxProfileCollectionEntries);
@@ -1150,6 +1198,7 @@ namespace ServerManager
             reader.SkipStringSet("known biomes");
             reader.SkipStringStringDictionary("known texts");
 
+            appearanceOffset = reader.Position;
             reader.ReadString("beard item");
             reader.ReadString("hair item");
             ValidateColor(reader, "skin color");
@@ -1161,6 +1210,7 @@ namespace ServerManager
                 throw new CharacterProtocolException(
                     "The inner Player model index is invalid.");
             }
+            appearanceLength = reader.Position - appearanceOffset;
 
             int foodCount = reader.ReadCount("active foods", 16);
             for (int index = 0; index < foodCount; ++index)

@@ -996,54 +996,6 @@ Assert-True ($multiByteMessage.EndsWith(
     "Restart Valheim after changing mods, then try again.")) `
     "The bounded multi-byte rejection truncated its recovery instruction."
 
-# Library entries share the bounded binary manifest, but only listed library
-# identities are policy targets. Unknown libraries do not relax plugin strictness.
-$requiredLibraryKey = "assembly:yamldotnet"
-$optionalLibraryKey = "assembly:optional.library"
-$unknownLibraryKey = "assembly:unlisted.library"
-$libraryName = "YamlDotNet, Version=15.0.0.0, Culture=neutral, PublicKeyToken=null"
-$requiredLibraryEntry = New-ManifestEntry $requiredLibraryKey $libraryName $allowedHash
-$requiredLibraryWrongHash = New-ManifestEntry $requiredLibraryKey $libraryName $otherHash
-$optionalLibraryEntry = New-ManifestEntry $optionalLibraryKey "Optional.Library" $allowedHash
-$optionalLibraryWrongHash = New-ManifestEntry $optionalLibraryKey "Optional.Library" $otherHash
-$unknownLibraryEntry = New-ManifestEntry $unknownLibraryKey "Unlisted.Library" $otherHash
-$libraryPolicy = New-Policy @(
-    $requiredRule,
-    (New-PolicyRule $requiredLibraryKey $libraryName "Required" @($allowedHash)),
-    (New-PolicyRule $optionalLibraryKey "Optional.Library" "Optional" @($allowedHash)))
-$libraryPolicyCases = @(
-    @{ Name = "matching libraries"; Entries = @($requiredEntry, $requiredLibraryEntry, $optionalLibraryEntry); Rejecting = @(); Exemptible = @() },
-    @{ Name = "optional library absent"; Entries = @($requiredEntry, $requiredLibraryEntry); Rejecting = @(); Exemptible = @() },
-    @{ Name = "required library absent"; Entries = @($requiredEntry, $optionalLibraryEntry); Rejecting = @("validation.required_plugin_missing|$requiredLibraryKey"); Exemptible = @() },
-    @{ Name = "required library wrong hash"; Entries = @($requiredEntry, $requiredLibraryWrongHash); Rejecting = @("validation.hash_not_allowed|$requiredLibraryKey"); Exemptible = @() },
-    @{ Name = "optional library wrong hash"; Entries = @($requiredEntry, $requiredLibraryEntry, $optionalLibraryWrongHash); Rejecting = @(); Exemptible = @("validation.hash_not_allowed|$optionalLibraryKey") },
-    @{ Name = "unlisted library ignored"; Entries = @($requiredEntry, $requiredLibraryEntry, $unknownLibraryEntry); Rejecting = @(); Exemptible = @() },
-    @{ Name = "plugin remains strict beside unlisted library"; Entries = @($requiredEntry, $requiredLibraryEntry, $unknownLibraryEntry, $unlistedEntry); Rejecting = @(); Exemptible = @("validation.unlisted_plugin_present|$unlistedGuid") },
-    @{ Name = "library never satisfies required plugin"; Entries = @($requiredLibraryEntry, $unknownLibraryEntry); Rejecting = @("validation.required_plugin_missing|$requiredGuid"); Exemptible = @() }
-)
-foreach ($libraryCase in $libraryPolicyCases) {
-    $libraryManifest = New-Manifest $libraryCase.Entries
-    $libraryEncoded = Invoke-Encode $libraryManifest
-    Assert-True $libraryEncoded.Success "The library manifest fixture did not encode."
-    $libraryDecoded = Invoke-Decode ([byte[]]$libraryEncoded.Payload)
-    Assert-True $libraryDecoded.Success "The library manifest fixture did not decode."
-    $originalLibraryValues = @($libraryManifest.Entries | ForEach-Object { $_.PluginGuid + "|" + $_.Name + "|" + $_.FileSha256 })
-    $decodedLibraryValues = @($libraryDecoded.Manifest.Entries | ForEach-Object { $_.PluginGuid + "|" + $_.Name + "|" + $_.FileSha256 })
-    Assert-True (($originalLibraryValues -join "`n") -ceq ($decodedLibraryValues -join "`n")) `
-        "A library/plugin identity, display name or exact hash changed during binary round-trip."
-    foreach ($libraryAdmin in @($false, $true)) {
-        $libraryRejecting = @($libraryCase.Rejecting)
-        $libraryExempted = @()
-        if ($libraryAdmin) { $libraryExempted = @($libraryCase.Exemptible) }
-        else { $libraryRejecting += @($libraryCase.Exemptible) }
-        $libraryContext = "Library matrix: " + $libraryCase.Name + "; administrator=" + $libraryAdmin
-        Assert-ValidationResult (Invoke-Validation $libraryPolicy $libraryManifest $libraryAdmin) `
-            $libraryRejecting $libraryExempted $libraryContext
-        Assert-ValidationResult (Invoke-DecodedValidation $libraryPolicy $libraryDecoded $libraryAdmin) `
-            $libraryRejecting $libraryExempted ("Decoded " + $libraryContext)
-    }
-}
-
 $encoded = Invoke-Encode (New-Manifest @($requiredEntry))
 Assert-True $encoded.Success "A valid manifest did not encode."
 $validPayload = [byte[]]$encoded.Payload
@@ -1741,49 +1693,34 @@ plugins: []
         "policy.source.role_conflict" `
         "The reference-folder role conflict diagnostic changed."
 
+    # Package dependencies are ignored in both roles, including renamed files
+    # and conflicting builds. A real plugin in the same folders stays mandatory.
     $libraryRoot = Join-Path $testRoot "scanner-managed-library"
     $libraryScanner = New-ReferenceScanner $libraryRoot (New-Limits)
     $scannerEnsureDirectories.Invoke($libraryScanner, [object[]]@()) | Out-Null
-    Copy-Item `
-        -LiteralPath $cecilPath `
-        -Destination (Join-Path $libraryRoot "required\RenamedLibrary.dll")
+    Copy-Item -LiteralPath $cecilPath -Destination (Join-Path $libraryRoot "required/RenamedLibrary.dll")
+    New-ManagedReferenceFixture (Join-Path $libraryRoot "optional/OtherBuild.dll") "Mono.Cecil" "99.0.0.0"
     $libraryScan = Invoke-ReferenceScan $libraryScanner
-    $libraryScanRecords = @(Get-HiddenProperty $libraryScan "Records")
-    Assert-True (@(Get-HiddenProperty $libraryScan "Diagnostics").Count -eq 0 -and $libraryScanRecords.Count -eq 1) `
-        "A valid managed dependency without BepInPlugin metadata was not accepted."
-    $scannedLibraryEntry = Get-HiddenProperty $libraryScanRecords[0] "Entry"
-    $expectedLibraryIdentity = [Reflection.AssemblyName]::GetAssemblyName($cecilPath)
-    $expectedLibraryHash = (Get-FileHash -LiteralPath $cecilPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    Assert-True ($scannedLibraryEntry.PluginGuid -ceq "assembly:mono.cecil" -and
-        $scannedLibraryEntry.Name -ceq $expectedLibraryIdentity.FullName -and
-        $scannedLibraryEntry.FileSha256 -ceq $expectedLibraryHash) `
-        "Library identity must come from managed metadata, not a renamed filename, and retain full identity plus exact file hash."
-    Copy-Item -LiteralPath $cecilPath -Destination (Join-Path $libraryRoot "optional\OtherName.dll")
-    Assert-DiagnosticCode `
-        @(Get-HiddenProperty (Invoke-ReferenceScan $libraryScanner) "Diagnostics") `
-        "policy.source.role_conflict" `
-        "The same managed library identity was allowed in both required and optional folders."
-
-    $libraryVariantRoot = Join-Path $testRoot "scanner-library-variants"
-    $libraryVariantStore = $policyStoreConstructor.Invoke([object[]]@([string]$libraryVariantRoot, (New-Limits)))
-    $libraryVariantPaths = @(
-        (Join-Path $libraryVariantRoot "required\FirstVersion.dll"),
-        (Join-Path $libraryVariantRoot "required\SecondVersion.dll"))
-    New-ManagedReferenceFixture $libraryVariantPaths[0] "Library.Variants" "1.0.0.0"
-    New-ManagedReferenceFixture $libraryVariantPaths[1] "Library.Variants" "2.0.0.0"
-    $libraryVariantsReload = $libraryVariantStore.TryReload()
-    Assert-True $libraryVariantsReload.Success "Valid same-name library version variants were rejected."
-    $libraryVariantsSnapshot = $libraryVariantStore.Current
-    $libraryVariantRules = @($libraryVariantsSnapshot.Rules)
-    $expectedVariantHashes = @($libraryVariantPaths | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant() })
-    Assert-True ($libraryVariantRules.Count -eq 1 -and $libraryVariantRules[0].PluginGuid -ceq "assembly:library.variants" -and
-        (($libraryVariantRules[0].AllowedSha256 | Sort-Object) -join ",") -ceq (($expectedVariantHashes | Sort-Object) -join ",")) `
-        "Same-name library variants did not share a required rule containing their exact hashes."
-    Copy-Item -LiteralPath $libraryVariantPaths[0] -Destination (Join-Path $libraryVariantRoot "optional\Library.dll")
-    $libraryVariantConflict = $libraryVariantStore.TryReload()
-    Assert-True (-not $libraryVariantConflict.Success -and
-        [object]::ReferenceEquals($libraryVariantsSnapshot, $libraryVariantStore.Current)) `
-        "A library role conflict replaced the last-known-good policy."
+    Assert-True (@(Get-HiddenProperty $libraryScan "Diagnostics").Count -eq 0 -and
+        @(Get-HiddenProperty $libraryScan "Records").Count -eq 0 -and
+        @(Get-HiddenProperty $libraryScan "SkippedLibraries").Count -eq 2) `
+        "Pure libraries must be reported as skipped without rules or role/hash conflicts."
+    $libraryStore = $policyStoreConstructor.Invoke([object[]]@([string]$libraryRoot, (New-Limits)))
+    $libraryReload = $libraryStore.TryReload()
+    Assert-True ($libraryReload.Success -and $libraryStore.Current.Rules.Count -eq 0) `
+        "A policy containing only dependency DLLs should impose no plugin requirements."
+    Assert-True (Invoke-Validation $libraryStore.Current (New-Manifest @())).Allowed `
+        "Absent standalone libraries blocked admission."
+    Copy-Item -LiteralPath $pluginPath -Destination (Join-Path $libraryRoot "required/ServerManager.dll")
+    Assert-True ($libraryStore.TryReload().Success -and $libraryStore.Current.Rules.Count -eq 1) `
+        "A plugin beside skipped libraries lost its required rule."
+    Assert-True (-not (Invoke-Validation $libraryStore.Current (New-Manifest @())).Allowed) `
+        "Skipped libraries weakened the required-plugin presence check."
+    Copy-Item -LiteralPath $pluginPath -Destination (Join-Path $libraryRoot "optional/ServerManager.dll")
+    $libraryLastGood = $libraryStore.Current
+    Assert-True (-not $libraryStore.TryReload().Success -and
+        [object]::ReferenceEquals($libraryLastGood, $libraryStore.Current)) `
+        "A plugin role conflict beside libraries replaced the last-known-good policy."
 
     $reservedGuidRoot = Join-Path $testRoot "scanner-reserved-plugin-guid"
     $reservedGuidScanner = New-ReferenceScanner $reservedGuidRoot (New-Limits)
@@ -1804,20 +1741,6 @@ plugins: []
     finally { $netmodule.Dispose() }
     Assert-DiagnosticCode @(Get-HiddenProperty (Invoke-ReferenceScan $netmoduleScanner) "Diagnostics") `
         "policy.source.invalid_assembly" "A module without a managed assembly identity became a library rule."
-
-    $libraryBoundRoot = Join-Path $testRoot "scanner-library-target-bound"
-    $libraryBoundStore = $policyStoreConstructor.Invoke([object[]]@([string]$libraryBoundRoot, (New-Limits)))
-    for ($libraryIndex = 0; $libraryIndex -lt 128; $libraryIndex++) {
-        New-ManagedReferenceFixture (Join-Path $libraryBoundRoot ("optional\Library" + $libraryIndex + ".dll")) `
-            ("Library.Bounded." + $libraryIndex)
-    }
-    Assert-True ($libraryBoundStore.TryReload().Success) "The documented 128 distinct library target bound was rejected."
-    $libraryBoundSnapshot = $libraryBoundStore.Current
-    New-ManagedReferenceFixture (Join-Path $libraryBoundRoot "required\Library129.dll") "Library.Bounded.128"
-    $tooManyLibraries = $libraryBoundStore.TryReload()
-    Assert-True (-not $tooManyLibraries.Success -and
-        [object]::ReferenceEquals($libraryBoundSnapshot, $libraryBoundStore.Current)) `
-        "An unrepresentable library target count was published instead of retaining the prior valid policy."
 
     $boundedRoot = Join-Path $testRoot "scanner-bounded"
     $boundedScanner = New-ReferenceScanner `
