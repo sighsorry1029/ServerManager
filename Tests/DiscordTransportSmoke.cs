@@ -73,6 +73,7 @@ internal static class DiscordTransportSmoke
         await CompactTextBoundsAndOutcomes();
         await PartialCharacterSaveWarnings();
         await PlainShoutContent();
+        await DiscordShoutRoutes();
         await AnonymousRouteProjection();
         await SimplifiedCommandPrivacy();
         await AnonymousAliasLifetimeAndBounds();
@@ -300,9 +301,9 @@ internal static class DiscordTransportSmoke
         string[] retiredSelectors = { "combat.pvp_kill", "character.save_rejected", "character.validation_observed",
             "security.detection", "security.response", "server.ready", "server.shutdown", "player.login", "player.leave",
             "raid.started", "raid.ended" };
-        Check(DiscordSettings.PublicEvents.Count == 17 && DiscordSettings.PublicEvents.SetEquals(
-                SourceEventKinds.Select(ExpectedWebhookFilter).Concat(new[] { "cron.executed" })),
-            "Seventeen selectable filters cover all source kinds and the final cron projection.");
+        Check(DiscordSettings.PublicEvents.Count == 18 && DiscordSettings.PublicEvents.SetEquals(
+                SourceEventKinds.Select(ExpectedWebhookFilter).Concat(new[] { "cron.executed", "discord.shout" })),
+            "Eighteen selectable filters cover game, Discord and final cron events.");
         foreach (string kind in SourceEventKinds)
             Check(DiscordSettings.GetWebhookEventFilter(kind) == ExpectedWebhookFilter(kind), "Exact source-to-filter mapping: " + kind);
         foreach (string kind in new[] { "character.validation", "security.alert", "server.status", "player.connection", "raid.status", "cron.executed",
@@ -1586,6 +1587,54 @@ internal static class DiscordTransportSmoke
             Check(ordinary["content"] == null && ordinary["flags"] == null && ordinary["embeds"] is JArray &&
                 !ordinary.ToString().Contains("PRIVATE-PLUGINS"), "Non-shout events use compact, event-specific embeds without raw metadata.");
             CheckCompactEmbed((JObject)ordinary["embeds"]![0]!, "Server ready", null, "ready alongside shout");
+        }
+    }
+
+    private static async Task DiscordShoutRoutes()
+    {
+        const string userId = "123456789012345678";
+        ServerManagerEvent DiscordMessage(string text)
+        {
+            ServerManagerEvent value = Event("discord.shout");
+            value.Actor = new ServerManagerActor("discord:" + userId, "[Discord] Alice", "discord");
+            value.Fields["source"] = "discord";
+            value.Fields["text"] = text;
+            value.Fields["message"] = "[Discord] Alice (ID: " + userId + "): " + text;
+            return value;
+        }
+        using (FakeHandler handler = new FakeHandler())
+        using (DiscordHttp http = new DiscordHttp("", delegate { }, handler))
+        using (DiscordWebhooks webhooks = new DiscordWebhooks(Settings("chat.shout"), http, delegate { }))
+        {
+            ServerManagerEvent value = DiscordMessage("hello");
+            Check(!webhooks.Enqueue(value), "Existing game shout routes do not opt into Discord echoes.");
+            Check(webhooks.Reload(Settings("discord.shout")), "Discord shout selection can be enabled live.");
+            Check(!webhooks.Enqueue(Event("chat.shout")), "Discord-only routes exclude game shouts.");
+            Check(webhooks.Enqueue(value) && !webhooks.Enqueue(value), "One accepted Discord event queues once, with event-ID deduplication.");
+            Task running = webhooks.RunAsync(CancellationToken.None);
+            await WaitFor(() => handler.Requests.Count == 1 && CurrentInFlight(webhooks) == 0);
+            JObject payload = JObject.Parse(handler.Requests[0].Body!);
+            CheckPlainShoutPayload(payload, null, "Discord chat");
+            Check(((string)payload["content"]!).Replace("\\", "") == "[Discord] Alice: hello" &&
+                !payload.ToString().Contains(userId), "Discord chat preserves the author and text without the local audit ID.");
+            Check(value.Fields["message"].Contains(userId), "Webhook projection does not mutate the local audit event.");
+
+            foreach (string prefix in new[] { "", "Guest" })
+            {
+                Check(webhooks.Reload(AnonymousSettings(prefix, "discord.shout")), "Discord anonymity can be reloaded.");
+                foreach (string blank in new[] { "", " \r\n\t" })
+                    Check(!webhooks.Enqueue(DiscordMessage(blank)), "Empty Discord text cannot fall back to the ID-bearing audit line.");
+                ServerManagerEvent missing = DiscordMessage("private fallback");
+                missing.Fields.Remove("text");
+                Check(!webhooks.Enqueue(missing), "Missing Discord text cannot expose the audit line.");
+            }
+            Check(webhooks.Enqueue(DiscordMessage("hello again")), "Anonymous Discord text is accepted.");
+            await webhooks.StopAsync(TimeSpan.FromSeconds(3)); await running;
+            Check(handler.Requests.Count == 2, "Only selected, nonempty, unique Discord events were delivered.");
+            JObject anonymous = JObject.Parse(handler.Requests[1].Body!);
+            CheckPlainShoutPayload(anonymous, "Guest player: hello again", "Discord without a verified Steam account");
+            Check(!anonymous.ToString().Contains("Alice") && !anonymous.ToString().Contains(userId),
+                "Anonymous Discord text exposes neither the author nor the Discord ID.");
         }
     }
 

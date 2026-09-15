@@ -355,8 +355,11 @@ foreach ($entry in @($discordShout, $adminShout)) {
 }
 Assert-True ($discordShout.Parameters.Count -eq 4 -and $discordShout.Parameters[3].ParameterType.FullName -eq 'System.Boolean') 'Discord chat must pass channel classification separately from the real author.'
 Assert-True (Has-Text $discordShout '[Discord] ') 'Public-channel chat must keep the real Discord display name.'
-Assert-True ((Calls $adminShout 'get_Name').Count -eq 0) 'Discord /chat must use the fixed Admin display title, not expose the caller name as its title.'
-Assert-True ((Calls $discordShout 'RecordDiscordShout').Count -eq 1) 'Ordinary Discord shout must retain local-only logging.'
+Assert-True ((Calls $adminShout 'get_Name').Count -eq 1 -and (Calls $adminShout 'RecordDiscordShout').Count -eq 1) 'Discord /chat must retain the real caller name for the post-delivery event.'
+Assert-True ((Calls $discordShout 'RecordDiscordShout').Count -eq 1) 'Ordinary Discord shout must record exactly one post-delivery event.'
+foreach ($entry in @($discordShout, $adminShout)) {
+    Assert-True ((Calls $entry 'RecordDiscordShout')[0].Offset -gt (Calls $entry 'TryBroadcastServerShout')[0].Offset) 'Discord events must be recorded after the validated broadcast.'
+}
 $recordShoutCall = (Calls $discordShout 'RecordDiscordShout')[0]
 Assert-True ($recordShoutCall.Previous.OpCode.Name -eq 'ldarg.2' -and
     $recordShoutCall.Previous.Previous.OpCode.Name -eq 'ldarg.1' -and
@@ -372,8 +375,13 @@ foreach ($removed in @('ExecuteAdminMessage', 'ShowAdminChat', 'ShowServerChat')
 }
 $eventRuntimeIL = $definition.MainModule.GetType('ServerManager.Events.ServerEventRuntime')
 $discordLogIL = @($eventRuntimeIL.Methods | Where-Object Name -eq 'RecordDiscordShout')[0]
-Assert-True ((Calls $discordLogIL 'TryWrite').Count -eq 1) 'Discord-origin shout must use the local event log.'
-Assert-True ((Calls $discordLogIL 'Publish').Count -eq 0) 'Discord-origin shout must never fan out to subscribers/webhooks.'
+Assert-True ((Calls $discordLogIL 'TryWrite').Count -eq 0 -and (Calls $discordLogIL 'Publish').Count -eq 1) 'Discord-origin shout must use the shared publisher once for both local logging and selected webhooks.'
+Assert-True ((Has-Text $discordLogIL 'discord.shout') -and -not (Has-Text $discordLogIL 'chat.shout')) 'Discord-origin chat must use its own event selector.'
+$displayKindsIL = @($eventRuntimeIL.Methods | Where-Object Name -eq 'IsDisplayKind')[0]
+$logOnlyKindsIL = @($eventRuntimeIL.Methods | Where-Object Name -eq 'IsLogOnlyChatKind')[0]
+$chatKindsIL = @($definition.MainModule.GetType('ServerManager.Events.EventLogWriter').Methods | Where-Object Name -eq 'IsChatKind')[0]
+Assert-True (-not (Has-Text $displayKindsIL 'discord.shout') -and -not (Has-Text $logOnlyKindsIL 'discord.shout') -and
+    (Has-Text $chatKindsIL 'discord.shout')) 'Discord shout must stay in the chat log and reach selected webhooks without a second in-game event display.'
 Assert-True ((Has-Text $discordLogIL ' (ID: ') -and (Has-Text $discordLogIL 'discord:') -and
     -not (Has-Text $discordLogIL '[Discord] Admin')) 'The persisted chat message must include the real Discord ID, not the display-only Admin alias.'
 $installedGame = [Reflection.Assembly]::LoadFrom((Join-Path $managedRoot 'assembly_valheim.dll'))

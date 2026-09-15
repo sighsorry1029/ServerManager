@@ -430,6 +430,7 @@ webhooks:
 | `server.announcement` | ServerManager announcements |
 | `player.connection` | Remote player joins, first joins and leaves |
 | `chat.shout` | In-game shout messages |
+| `discord.shout` | Discord user/admin chat and admin `chat` commands delivered to the game |
 | `raid.status` | Raid starts and ends, with name and coordinates |
 | `player.death`, `boss.killed` | Deaths, including PvP, and boss kills |
 | `moderation.action`, `command.executed` | Moderation and manual admin activity |
@@ -489,8 +490,13 @@ needed for either channel list, including admin-only setups.
 
 Ordinary text becomes a global in-game shout, not a command. No prefix is needed.
 For replies from the game, use a webhook with `chat.shout`. Local, whisper and
-clan chat are not sent to public webhooks. Discord messages are not echoed back
-through the shout webhook.
+clan chat are not sent to public webhooks. To also log Discord-to-game messages,
+add `discord.shout` to the webhook's `events`. It displays `[Discord] name: text`
+without the author's Discord ID. With `anonymous_prefix`, Discord authors appear
+as `<prefix> player` because they have no verified Steam account attribution.
+Bot and webhook messages are ignored on input to
+prevent relay loops. If input and output share a channel, the original message
+and its webhook copy will both be visible.
 
 Try `/status`. Use `/discordstatus` for diagnostics. `/discordtest` sends a test
 to routes selecting `server.announcement`.

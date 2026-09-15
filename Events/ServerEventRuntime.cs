@@ -2154,18 +2154,17 @@ namespace ServerManager.Events
             return value;
         }
 
-        // An already-Discord-origin message is deliberately local-log-only:
-        // do not feed it through Publish, subscribers, or outbound webhooks.
+        // Called once after game delivery. A separate event lets webhook routes
+        // opt into Discord-origin chat without echoing every in-game shout route.
         internal static void RecordDiscordShout(string userId, string userName, string text)
         {
             if (!_serverStarted || _shutdownStarted || ZNet.instance == null || !ZNet.instance.IsServer()) return;
             string name = "[Discord] " + Safe(userName, 80);
             string content = Safe(text, 500);
-            LogWriter.TryWrite(new ServerManagerEvent(
-                Guid.NewGuid().ToString("N"), DateTime.UtcNow, _serverId,
-                ServerManagerEventKinds.ChatShout, ServerManagerEventReliability.Observed,
+            Publish(
+                ServerManagerEventKinds.DiscordShout, ServerManagerEventReliability.Observed,
                 new ServerManagerActor("discord:" + Safe(userId, 20), name, "discord"), null,
-                Fields("source", "discord", "message", name + " (ID: " + Safe(userId, 20) + "): " + content, "text", content)));
+                Fields("source", "discord", "message", name + " (ID: " + Safe(userId, 20) + "): " + content, "text", content));
         }
 
         private static bool IsLogOnlyChatKind(string kind)
@@ -2715,6 +2714,7 @@ namespace ServerManager.Events
         private static bool IsChatKind(string kind)
         {
             return kind == ServerManagerEventKinds.ChatShout ||
+                   kind == ServerManagerEventKinds.DiscordShout ||
                    kind == ServerManagerEventKinds.ChatNormal ||
                    kind == ServerManagerEventKinds.ChatWhisper ||
                    kind == ServerManagerEventKinds.ChatClan;

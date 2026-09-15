@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.9
+
+- Added an opt-in `discord.shout` webhook event for Discord user/admin chat and admin `chat` commands delivered to the game.
+- Kept Discord chat notifications compact, with anonymous-prefix support, hidden author IDs, and existing duplicate and relay-loop protection.
+
 ## 1.0.8
 
 - Preserved the appearance selected during character creation on the first server join, while keeping server-defined starting items and progression.

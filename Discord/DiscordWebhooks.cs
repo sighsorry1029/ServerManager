@@ -201,7 +201,7 @@ namespace ServerManager.Discord
             // clan and unknown chat types even if a route explicitly requests them.
             Route[] matches = configuration.Routes.Where(route => route.Events.Contains(eventFilter)).ToArray();
             if (matches.Length == 0) return false;
-            bool isShout = value.Kind == "chat.shout";
+            bool isShout = value.Kind == "chat.shout" || value.Kind == "discord.shout";
             string content = isShout ? BuildShoutContent(value) : string.Empty;
             bool hasAnonymousText = value.Fields.TryGetValue("text", out string? shoutText) &&
                 !string.IsNullOrWhiteSpace(Clean(shoutText));
@@ -406,6 +406,15 @@ namespace ServerManager.Discord
 
         private static string BuildShoutContent(ServerManagerEvent value)
         {
+            // The local Discord audit line includes the author's ID. Public
+            // chat uses only the display name and text; never fall back to it.
+            if (value.Kind == "discord.shout")
+            {
+                if (!value.Fields.TryGetValue("text", out string? text) ||
+                    string.IsNullOrWhiteSpace(Clean(text))) return string.Empty;
+                return RedactPrivateText(value, SafeText(
+                    (value.Actor?.Name ?? "[Discord]") + ": " + text, 2000));
+            }
             // The event producer already builds "player name: text". Project only
             // that line; do not repeat fields or change the original logged event.
             if (!value.Fields.TryGetValue("message", out string? message)) return string.Empty;

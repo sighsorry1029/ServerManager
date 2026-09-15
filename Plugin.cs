@@ -17,7 +17,7 @@ namespace ServerManager;
 public sealed class ServerManagerPlugin : BaseUnityPlugin
 {
     internal const string ModName = "ServerManager";
-    internal const string ModVersion = "1.0.8";
+    internal const string ModVersion = "1.0.9";
     internal const string Author = "sighsorry";
     internal const string ModGuid = "sighsorry.ServerManager";
     internal const bool DefaultEnforceModPolicy = true;

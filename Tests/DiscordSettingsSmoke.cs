@@ -197,8 +197,8 @@ internal static class DiscordSettingsSmoke
             "Generated comments describe every supported webhook event exactly once, with an English description");
         string[] eventLines = generated.Replace("\r\n", "\n").Split('\n')
             .Where(line => line.StartsWith("#   ", StringComparison.Ordinal)).ToArray();
-        Check(eventLines.Length == 17 && eventLines.Length == DiscordSettings.PublicEvents.Count,
-            "Generated comments list all seventeen actual selectable webhook filters");
+        Check(eventLines.Length == 18 && eventLines.Length == DiscordSettings.PublicEvents.Count,
+            "Generated comments list all eighteen actual selectable webhook filters");
         foreach (string line in eventLines)
         {
             Check(!HasCompleteEventCatalog(generated.Replace(line, "")), "Catalog checker detects a missing selectable event");
@@ -265,8 +265,8 @@ internal static class DiscordSettingsSmoke
                 "Each route contains exactly its approved required and optional settings");
         }
         Check(!actualEvents[0].Overlaps(actualEvents[1]) &&
-            new HashSet<string>(actualEvents[0].Concat(actualEvents[1]), StringComparer.Ordinal).SetEquals(DiscordSettings.PublicEvents),
-            "Server status and Moderation partition all seventeen supported filters without gaps or overlap");
+            new HashSet<string>(actualEvents[0].Concat(actualEvents[1]), StringComparer.Ordinal).SetEquals(DiscordSettings.PublicEvents.Except(new[] { "discord.shout" })),
+            "Default routes retain their filters; Discord-origin chat remains explicitly opt-in");
         Check(OperatorKinds.All(actualEvents[1].Contains) && !OperatorKinds.Any(actualEvents[0].Contains),
             "All sensitive operator filters are grouped into Moderation");
         Check(!actualEvents[1].Contains("player.connection") && actualEvents[1].Count == 10,
@@ -565,7 +565,7 @@ internal static class DiscordSettingsSmoke
 
     private static void OperatorRoutes()
     {
-        Check(DiscordSettings.PublicEvents.Count == 17 && OperatorKinds.All(DiscordSettings.PublicEvents.Contains),
+        Check(DiscordSettings.PublicEvents.Count == 18 && OperatorKinds.All(DiscordSettings.PublicEvents.Contains),
             "One supported webhook catalog includes all six exact operator selectors");
         foreach (string kind in OperatorKinds)
         {
@@ -622,7 +622,7 @@ internal static class DiscordSettingsSmoke
         var projected = new HashSet<string>(DiscordSettings.PublicEvents.Where(kind => !SyntheticEventFilters.Contains(kind))
             .Concat(grouped.Keys).Select(kind => DiscordSettings.GetWebhookEventFilter(kind)!), StringComparer.Ordinal);
         projected.Add("cron.executed"); // Selected from final source=cron command results by the dispatcher.
-        Check(projected.SetEquals(DiscordSettings.PublicEvents), "All seventeen selectors correspond to supported real source events or the final cron projection");
+        Check(projected.SetEquals(DiscordSettings.PublicEvents), "All eighteen selectors correspond to supported real source events or the final cron projection");
     }
 
     private static void RemovedWebhookEvents()

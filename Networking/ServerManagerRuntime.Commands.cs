@@ -670,6 +670,8 @@ internal static partial class ServerManagerRuntime
         string message = string.Join(" ", args.Skip(1));
         if (!TryBroadcastServerShout(title, message))
             return ServerCommands.Failure("send_failed", "Shout could not be broadcast. A ready server and 1-500 characters of valid text are required.");
+        if (caller.Source == "discord")
+            ServerEventRuntime.RecordDiscordShout(caller.Id, caller.Name, message);
         return ServerCommands.Success("message_sent", "Global shout broadcast accepted; individual client delivery is not acknowledged.");
     }
     // Literal, server-side delivery only. Public Discord chat must never enter

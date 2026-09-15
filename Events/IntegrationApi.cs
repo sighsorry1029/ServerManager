@@ -21,6 +21,7 @@ namespace ServerManager.Events
         public const string PlayerLogin = "player.login";
         public const string PlayerLeave = "player.leave";
         public const string ChatShout = "chat.shout";
+        public const string DiscordShout = "discord.shout";
         public const string ChatNormal = "chat.normal";
         public const string ChatWhisper = "chat.whisper";
         public const string ChatClan = "chat.clan";

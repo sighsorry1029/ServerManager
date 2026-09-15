@@ -20,7 +20,7 @@ internal sealed class DiscordSettings
     internal static readonly HashSet<string> PublicEvents = new(StringComparer.Ordinal)
     {
         "server.status", "server.saved", "server.announcement",
-        "player.connection", "chat.shout", "raid.status", "player.death",
+        "player.connection", "chat.shout", "discord.shout", "raid.status", "player.death",
         "boss.killed", "moderation.action", "command.executed", "cron.executed",
         "security.alert", "security.admin_bypass",
         "character.validation", "character.shadow_stalled",
@@ -444,6 +444,7 @@ bot:
 #   server.announcement - Server announcement text.
 #   player.connection - Remote player joined (including first-time joins) or disconnected.
 #   chat.shout - In-game shout chat.
+#   discord.shout - Discord chat or an admin chat command delivered to the game.
 #   raid.status - Raid started or ended, with verified center coordinates when available.
 #   player.death - All reported player deaths, including PvP; keeps cause-specific wording.
 #   boss.killed - Boss defeated.
