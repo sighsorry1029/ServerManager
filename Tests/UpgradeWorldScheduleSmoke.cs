@@ -18,10 +18,8 @@ internal static class UpgradeWorldScheduleSmoke
             Check(!UpgradeWorldScheduleBridge.TryCreate(out _, out string absent) && absent == "uw_missing", "Absent dependency");
             BepInEx.Bootstrap.Chainloader.PluginInfos["upgrade_world"] = new();
             var plugin = BepInEx.Bootstrap.Chainloader.PluginInfos["upgrade_world"];
-            plugin.Metadata.Version = new Version(1, 81);
-            Check(!UpgradeWorldScheduleBridge.TryCreate(out _, out string unsupported) && unsupported == "uw_unsupported_version", "Version fail closed");
-            plugin.Metadata.Version = new Version(1, 80);
-            Check(UpgradeWorldScheduleBridge.TryCreate(out var bridge, out _), "Reviewed stub contract accepted");
+            plugin.Metadata.Version = new Version(1, 82);
+            Check(UpgradeWorldScheduleBridge.TryCreate(out var bridge, out _), "Compatible contract accepted regardless of plugin version");
             using (bridge!)
             {
                 Check(HarmonyLib.Harmony.Patched.Count >= 15, "All observation targets registered");

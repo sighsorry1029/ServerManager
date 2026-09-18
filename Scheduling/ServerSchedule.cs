@@ -21,7 +21,8 @@ internal sealed class ServerScheduleSettings
     internal const string AlternateFileName = "cron.yaml";
     internal const string DefaultYaml = @"# Server-local scheduled commands. Valid edits reload; invalid edits keep the last valid settings.
 # local uses the server computer's timezone. UTC and installed timezone IDs also work.
-# Reviewed Upgrade World changes automatically use verified pre/post saves and catch up once after downtime.
+# Compatible Upgrade World tracking adds verified pre/post saves; maintenance catches up once after downtime.
+# Without a compatible tracker, only a single change command is dispatched, without automatic saves or completion confirmation.
 # Other missed offline occurrences are skipped. A running job never overlaps itself.
 # cron.yml and cron_last.yml are the defaults; .yaml is also accepted. Use only one suffix for each file.
 # cron_last.yml is generated ServerManager progress; do not edit or delete it to retry a job.
@@ -41,7 +42,7 @@ jobs: []
 # Comment out or remove a job to disable it. Identical job definitions are rejected.
 # Discord messages use ServerManager's discord.yml, not discordConnector.
 
-# Upgrade World 1.80: one daily batch at 05:35; waits for each command to finish.
+# Upgrade World with compatible completion tracking: daily batch at 05:35.
 # Verified saves are added before and after the batch; no separate save job is needed.
 # Test on a backed-up world before uncommenting this batch.
 # WARNING: safeZones=0 and force disable base protection.

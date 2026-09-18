@@ -1,5 +1,4 @@
 using System;
-using SystemVersion = System.Version;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -23,7 +22,7 @@ internal readonly struct UpgradeWorldScheduleObservation
     { State = state; Code = code; }
 }
 
-// Optional observation adapter for the reviewed Upgrade World 1.80 contract.
+// Optional observation adapter: validate the required runtime contract, not a version number.
 // Only a server-owned command dispatch can claim an operation. Observers never
 // stop, advance or remove Upgrade World's work, including on shutdown/unload.
 internal sealed class UpgradeWorldScheduleBridge : IDisposable
@@ -158,9 +157,6 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
 
     internal static bool IsMaintenanceCommand(string command) => UpgradeWorldScheduleCommands.IsMaintenance(command);
 
-    internal static bool IsSupportedVersion(SystemVersion version) =>
-        version.Major == 1 && version.Minor == 80 && version.Build <= 0 && version.Revision <= 0;
-
     internal static bool TryCreate(out UpgradeWorldScheduleBridge? bridge, out string code)
     {
         bridge = null;
@@ -168,12 +164,9 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
         if (_patchFaulted) { code = "uw_observer_cleanup_failed"; return false; }
         if (_owner != null) { code = "uw_observer_busy"; return false; }
         if (!Chainloader.PluginInfos.TryGetValue("upgrade_world", out var plugin) || plugin.Instance == null) return false;
-        SystemVersion version = plugin.Metadata.Version;
-        if (!IsSupportedVersion(version))
-        { code = "uw_unsupported_version"; return false; }
         try { bridge = new UpgradeWorldScheduleBridge(plugin.Instance.GetType().Assembly); code = "uw_available"; return true; }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
-        { code = "uw_unsupported_contract"; return false; }
+        { code = _patchFaulted ? "uw_observer_cleanup_failed" : "uw_unsupported_contract"; return false; }
     }
 
     internal bool CanRun(out string code)

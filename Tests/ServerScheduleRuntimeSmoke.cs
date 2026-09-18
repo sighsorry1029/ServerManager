@@ -40,7 +40,7 @@ internal static class ServerScheduleRuntimeSmoke
         try
         {
             Lifecycle(); GuardsAndFiles(); AlternateConfiguration(); CanonicalJournalStartup(); RoutingAndBudget(); Gates(); PollingAndLogging(); Saves(); ReloadAndRetirement(); ReentrancyAndSuspension();
-            DurableDispatchAndCatchup(); AutomaticUpgradeWorldPolicies(); UpgradeWorldOwnership(); SynchronousMutationAbort(); MaintenanceSequence(); MaintenanceFailureAndRecovery(); MaintenanceReload(); MaintenanceReviewBarrier(); MaintenanceAdmission();
+            DurableDispatchAndCatchup(); AutomaticUpgradeWorldPolicies(); UpgradeWorldOwnership(); UntrackedUpgrade(); SynchronousMutationAbort(); MaintenanceSequence(); MaintenanceFailureAndRecovery(); MaintenanceReload(); MaintenanceReviewBarrier(); MaintenanceAdmission();
             Console.WriteLine("ServerScheduleRuntimeSmoke: PASS (" + _checks +
                 " assertions; source-linked runtime/parser/engine/journal; stub game/command/Upgrade World boundaries, no native game execution).");
             return 0;
@@ -559,6 +559,37 @@ internal static class ServerScheduleRuntimeSmoke
         }
     }
 
+    private static void UntrackedUpgrade()
+    {
+        Activate(Maintenance("zones_generate start"));
+        BepInEx.Bootstrap.Chainloader.PluginInfos["upgrade_world"].Metadata.Version = new Version(1, 82);
+        UpgradeWorldScheduleBridge.Available = false;
+        UpgradeWorldScheduleBridge.FailureCode = "uw_unsupported_contract";
+        Due();
+        Check(ServerConsoleExecutor.Lines.SequenceEqual(new[] { "zones_generate start" }) &&
+            ServerEventRuntime.Saves.Count == 0 && UpgradeWorldScheduleBridge.Begun.Count == 0,
+            "Single incompatible-contract command dispatches once without implicit saves or observer.");
+        Check(Runs.Count == 0 && JournalState() == "ready" && Claims == 0,
+            "Dispatch-only occurrence finishes durably without a retry claim.");
+        Check(ServerEventRuntime.Audits.Last().Code == "cron_dispatched_untracked" && ServerEventRuntime.Audits.Last().Success,
+            "Durable final result reports dispatch, never operation completion.");
+        Tick(); Check(ServerConsoleExecutor.Lines.Count == 1, "No retry after untracked dispatch.");
+        foreach (string[] commands in new[] { new[] { "zones_generate start", "save" }, new[] { "zones_generate start", "zones_reset start" } })
+        {
+            Activate(Maintenance(commands));
+            UpgradeWorldScheduleBridge.Available = false;
+            UpgradeWorldScheduleBridge.FailureCode = "uw_unsupported_contract";
+            Due();
+            Check(ServerConsoleExecutor.Lines.Count == 0 && ServerEventRuntime.Saves.Count == 0,
+                "Unobservable sequences stop before any command or implicit save.");
+        }
+        Activate(Maintenance("zones_generate start"));
+        UpgradeWorldScheduleBridge.Available = false;
+        UpgradeWorldScheduleBridge.FailureCode = "uw_observer_cleanup_failed";
+        Due();
+        Check(ServerConsoleExecutor.Lines.Count == 0, "Unsafe observer failures never enable fallback.");
+    }
+
     private static void MaintenanceSequence()
     {
         Activate(Maintenance("zones_reset start", "vegetation_reset start"));
@@ -588,7 +619,7 @@ internal static class ServerScheduleRuntimeSmoke
     private static void UpgradeWorldOwnership()
     {
         foreach (string command in new[] { "objects_remove start", "world_clean", "objects_count" })
-        foreach (string failure in new[] { "missing_plugin", "missing_command", "foreign_handler", "mixed_handler", "no_handler", "unsupported_version" })
+        foreach (string failure in new[] { "missing_plugin", "missing_command", "foreign_handler", "mixed_handler", "no_handler" })
         {
             Activate(Config(command));
             string verb = command.Split(' ')[0];
@@ -599,7 +630,6 @@ internal static class ServerScheduleRuntimeSmoke
                 case "foreign_handler": ValheimPrivateAccess.Commands[verb] = new Terminal.ConsoleCommand(GC.Collect); break;
                 case "mixed_handler": ValheimPrivateAccess.Commands[verb] = new Terminal.ConsoleCommand((Action)FixtureUpgradeWorld.NoOp + GC.Collect); break;
                 case "no_handler": ValheimPrivateAccess.Commands[verb] = new Terminal.ConsoleCommand((Action?)null); break;
-                case "unsupported_version": BepInEx.Bootstrap.Chainloader.PluginInfos["upgrade_world"].Metadata.Version = new Version(1, 81); break;
             }
             Due();
             Check(ServerConsoleExecutor.Lines.Count == 0 && UpgradeWorldScheduleBridge.Begun.Count == 0 && ServerEventRuntime.Saves.Count == 0,
@@ -916,7 +946,6 @@ namespace ServerManager
             Observation = new(UpgradeWorldScheduleState.Pending, "uw_pending");
         }
         internal static bool IsMaintenanceCommand(string command) => UpgradeWorldScheduleCommands.IsMaintenance(command);
-        internal static bool IsSupportedVersion(Version version) => version == new Version(1, 80);
         internal static bool TryCreate(out UpgradeWorldScheduleBridge? bridge, out string code)
         { bridge = Available ? new UpgradeWorldScheduleBridge() : null; code = Available ? "uw_ready" : FailureCode; return Available; }
         internal bool TryGetIdle(out bool idle, out string code)

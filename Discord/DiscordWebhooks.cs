@@ -757,7 +757,7 @@ namespace ServerManager.Discord
         {
             string code = OperatorToken(value.Fields, "result_code", 64);
             string marker = Field(value, "success") == "false" ? "\u274c" :
-                code == "cron_skipped" ? "\u23ed" : "\u2705";
+                code == "cron_skipped" ? "\u23ed" : code == "cron_dispatched_untracked" ? "\u2139" : "\u2705";
             string verb = OperatorToken(value.Fields, "cron_verb", 64);
             string count = OperatorToken(value.Fields, "cron_command_count", 2);
             string subject = verb.Length > 0 ? verb : count.Length > 0 ? count + " commands" : string.Empty;
@@ -770,7 +770,8 @@ namespace ServerManager.Discord
             string verb = OperatorToken(value.Fields, "cron_verb", 64);
             if (summary == verb) summary = string.Empty;
             string schedule = Field(value, "cron_schedule", 256);
-            string result = Field(value, "success") == "false" ? CommandResult(value, false) : string.Empty;
+            string result = Field(value, "success") == "false" ? CommandResult(value, false) :
+                Field(value, "result_code") == "cron_dispatched_untracked" ? "Dispatched; completion not tracked" : string.Empty;
             return string.Join(" · ", new[] { summary, schedule, result }.Where(text => text.Length > 0));
         }
 

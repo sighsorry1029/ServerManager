@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.10
+
+- Allowed ordinary wrong-password attempts to retry without entering the process-lifetime Steam authentication quarantine.
+- Made scheduled Upgrade World integration validate its runtime contract instead of requiring version 1.80 exactly.
+- Added a single-command dispatch fallback when Upgrade World completion cannot be tracked, with no automatic saves, retries or completion claim.
+
 ## 1.0.9
 
 - Added an opt-in `discord.shout` webhook event for Discord user/admin chat and admin `chat` commands delivered to the game.

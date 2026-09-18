@@ -793,11 +793,20 @@ internal static class DiscordTransportSmoke
             failed.Fields["cron_schedule"] = "30 5 * * *";
             failed.Fields["cron_summary"] = "zones_reset → save";
             Check(webhooks.Enqueue(failed), "Failed multi-command cron result uses the same compact final card.");
+            ServerManagerEvent untracked = Event("command.executed");
+            untracked.Fields["source"] = "cron";
+            untracked.Fields["command"] = "maintenance";
+            untracked.Fields["success"] = "true";
+            untracked.Fields["result_code"] = "cron_dispatched_untracked";
+            untracked.Fields["cron_verb"] = "zones_generate";
+            untracked.Fields["cron_schedule"] = "37 21 * * *";
+            Check(webhooks.Enqueue(untracked), "Dispatch-only cron result is visible.");
+
 
             Task running = webhooks.RunAsync(CancellationToken.None);
             await webhooks.StopAsync(TimeSpan.FromSeconds(3));
             await running;
-            Check(handler.Requests.Count == 3 && handler.Requests[0].Url.StartsWith(Webhook, StringComparison.Ordinal) &&
+            Check(handler.Requests.Count == 4 && handler.Requests[0].Url.StartsWith(Webhook, StringComparison.Ordinal) &&
                 handler.Requests.Skip(1).All(request => request.Url.StartsWith(ReloadedWebhook, StringComparison.Ordinal)),
                 "Manual and cron results reach only their independently selected destinations.");
             CheckCompactEmbed((JObject)JObject.Parse(handler.Requests[0].Body!)["embeds"]![0]!,
@@ -808,6 +817,9 @@ internal static class DiscordTransportSmoke
             CheckCompactEmbed((JObject)JObject.Parse(handler.Requests[2].Body!)["embeds"]![0]!,
                 "❌ Cron · 2 commands", "zones\\_reset → save · 30 5 \\* \\* \\* · Failed: uw\\_partial\\_failure",
                 "Failed cron card combines the job and result without a second schedule card");
+            CheckCompactEmbed((JObject)JObject.Parse(handler.Requests[3].Body!)["embeds"]![0]!,
+                "ℹ Cron · zones\\_generate", "37 21 \\* \\* \\* · Dispatched; completion not tracked",
+                "Untracked dispatch uses informational status and never claims completion");
         }
     }
 

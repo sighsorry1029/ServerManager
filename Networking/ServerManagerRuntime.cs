@@ -2586,6 +2586,20 @@ internal static partial class ServerManagerRuntime
                 return false;
             }
 
+            if (IsPlainWrongServerPassword(package))
+            {
+                // Vanilla verifies the Steam ticket before its password check.
+                // Reject an ordinary wrong password first so it cannot create an
+                // ambiguous Steam callback generation and process-lifetime ban.
+                rpc.Invoke(
+                    "Error",
+                    (int)ZNet.ConnectionStatus.ErrorPassword);
+                ServerManagerPlugin.Log.LogInfo(
+                    "Rejected an incorrect server password before beginning " +
+                    "Steam authentication; the account may retry normally.");
+                return false;
+            }
+
             if (!TryEnterSteamPeerInfo(
                     znet,
                     rpc,
@@ -2613,6 +2627,19 @@ internal static partial class ServerManagerRuntime
                 exception.Message);
             return false;
         }
+    }
+
+    private static bool IsPlainWrongServerPassword(ZPackage package)
+    {
+        return BoundedPeerInfoRpcTransport.TryReadServerCredentials(
+                   package,
+                   out string submittedPassword,
+                   out string inviteSecret) &&
+               inviteSecret.Length == 0 &&
+               !string.Equals(
+                   submittedPassword,
+                   ValheimPrivateAccess.GetServerPasswordHash(),
+                   StringComparison.Ordinal);
     }
 
     internal static void AfterServerPeerInfo(

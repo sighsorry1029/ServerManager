@@ -282,6 +282,48 @@ namespace ServerManager
             return true;
         }
 
+        internal static bool TryReadServerCredentials(
+            ZPackage package,
+            out string password,
+            out string inviteSecret)
+        {
+            password = string.Empty;
+            inviteSecret = string.Empty;
+            if (package == null || package.Size() > MaximumPeerInfoBytes)
+            {
+                return false;
+            }
+
+            try
+            {
+                ZPackage copy = new ZPackage(package.GetArray());
+                copy.ReadLong();
+                string versionString = copy.ReadString();
+                if (GameVersion.TryParseGameVersion(
+                        versionString,
+                        out GameVersion gameVersion) &&
+                    ValheimPrivateAccess.UsesNetworkVersion(gameVersion))
+                {
+                    copy.ReadUInt();
+                }
+
+                copy.ReadVector3();
+                copy.ReadString();
+                copy.ReadString();
+                SimulationDistance.Deserialize(ref copy);
+                password = copy.ReadString();
+                inviteSecret = copy.ReadString();
+                return true;
+            }
+            catch (Exception exception)
+                when (!IntegrityCanonical.IsFatal(exception))
+            {
+                password = string.Empty;
+                inviteSecret = string.Empty;
+                return false;
+            }
+        }
+
         private static bool Malformed(
             string safeMessage,
             out ProtocolRejection rejection)

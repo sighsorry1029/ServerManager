@@ -549,7 +549,7 @@ are not supported.
 
 ### Upgrade World maintenance
 
-Requires the separately installed **Upgrade World 1.80**.
+Requires separately installed **Upgrade World**. Completion tracking checks the required runtime members rather than enforcing an exact plugin version.
 Back up the world and test your commands before enabling maintenance.
 Put related changes in one job. This example is disabled:
 
@@ -569,6 +569,8 @@ waits for its operations. Queued changes require `start`; unsupported operations
 are refused. Maintenance batches may contain supported world changes and plain
 `save`, not announcements or unrelated commands. If Upgrade World’s `Root users`
 is restricted, include `-1` for dedicated-console execution.
+
+If the completion-tracking contract is incompatible, a job with exactly one world-change command is dispatched through the normal server console instead. Its report says **Dispatched; completion not tracked**, not completed. This fallback adds no automatic pre/post saves and never advances a multi-command sequence. Missing plugins, replaced command handlers, permission denials and observer cleanup failures do not enable fallback. Untracked work may overlap later scheduled operations; choose intervals accordingly. A delivered occurrence is recorded without automatic retry. After an interrupted dispatch, review is still required.
 
 Maintenance can catch up once after downtime. Failed or interrupted work pauses
 later maintenance for that world. Inspect the world and backups, then use:

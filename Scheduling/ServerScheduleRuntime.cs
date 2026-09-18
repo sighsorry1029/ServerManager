@@ -77,7 +77,6 @@ internal static class ServerScheduleRuntime
         bool known = kind != UpgradeWorldCommandKind.None;
         if (!Chainloader.PluginInfos.TryGetValue("upgrade_world", out var plugin) || plugin.Instance == null)
             return known ? "uw_missing" : null;
-        if (known && !UpgradeWorldScheduleBridge.IsSupportedVersion(plugin.Metadata.Version)) return "uw_unsupported_version";
         try
         {
             if (ConsoleAction == null || ConsoleActionFailable == null ||
@@ -112,7 +111,8 @@ internal static class ServerScheduleRuntime
         internal Task<ServerManagerCommandResult>? Pending;
         internal bool Common, SaveRequested, WaitingSave, Retired;
         internal bool PendingDurable, Started, Finishing, WaitingUpgrade, Skip, PreflightDone;
-        internal readonly string[] Commands;
+        internal string[] Commands;
+        internal bool UntrackedUpgrade;
         internal string Verb = "", BaselineSave = "", SaveId = "";
         internal long Deadline;
         internal Run(ServerScheduleOccurrence occurrence)
@@ -248,12 +248,24 @@ internal static class ServerScheduleRuntime
                             }
                             run.PreflightDone = true;
                         }
-                        if (_upgradeBridge == null && !UpgradeWorldScheduleBridge.TryCreate(out _upgradeBridge, out string unavailable))
-                        { EndRun(run, false, unavailable); return; }
-                        if (!_upgradeBridge!.CanRun(out string denied)) { EndRun(run, false, denied); return; }
-                        if (!_upgradeBridge.TryGetIdle(out bool idle, out string observationError))
-                        { EndRun(run, false, observationError); return; }
-                        if (!idle || _network.IsSaving() || _runs.Any(other => other.Pending != null || other.WaitingSave || other.SaveRequested)) continue;
+                        if (!run.UntrackedUpgrade && _upgradeBridge == null && !UpgradeWorldScheduleBridge.TryCreate(out _upgradeBridge, out string unavailable))
+                        {
+                            // Only an incompatible observation contract permits dispatch-only mode.
+                            // Busy/failed observer cleanup and other safety denials remain blocking.
+                            if (unavailable != "uw_unsupported_contract" || run.Occurrence.Job.Commands.Count != 1)
+                            { EndRun(run, false, unavailable); return; }
+                            run.UntrackedUpgrade = true;
+                            // No implicit pre/post saves: completion and ordering cannot be observed.
+                            run.Commands = run.Occurrence.Job.Commands.ToArray();
+                        }
+                        if (!run.UntrackedUpgrade)
+                        {
+                            if (!_upgradeBridge!.CanRun(out string denied)) { EndRun(run, false, denied); return; }
+                            if (!_upgradeBridge.TryGetIdle(out bool idle, out string observationError))
+                            { EndRun(run, false, observationError); return; }
+                            if (!idle) continue;
+                        }
+                        if (_network.IsSaving() || _runs.Any(other => other.Pending != null || other.WaitingSave || other.SaveRequested)) continue;
                         _maintenanceOwner = run;
                     }
                     else if (_maintenanceOwner != null && !CanInterleave(run.Commands[run.Index])) continue;
@@ -338,6 +350,16 @@ internal static class ServerScheduleRuntime
             {
                 string? validation = ValidateUpgradeWorldCommand(line);
                 if (validation != null) { CompleteCommand(run, Result(false, validation, "The scheduled Upgrade World command is not supported by the active registry.")); return; }
+            }
+            if (run.UntrackedUpgrade)
+            {
+                Warn("Job '" + run.Occurrence.Job.Id + "' is dispatch-only: Upgrade World completion cannot be tracked. " +
+                    "No automatic saves or retries; overlap with later scheduled operations cannot be ruled out.");
+                _console ??= new ServerConsoleExecutor(Warn);
+                ServerManagerCommandResult dispatched = _console.Execute(line, ServerCommands.MaximumOutputLength);
+                CompleteCommand(run, dispatched.Success
+                    ? Result(true, "cron_dispatched_untracked", "Dispatched; completion not tracked.") : dispatched);
+                return;
             }
             if (run.Occurrence.Job.Maintenance)
             {
@@ -437,7 +459,7 @@ internal static class ServerScheduleRuntime
                 EndRun(run, false, result.Code);
                 return;
             }
-            if (++run.Index >= run.Commands.Length) EndRun(run, true, "cron_completed");
+            if (++run.Index >= run.Commands.Length) EndRun(run, true, run.UntrackedUpgrade ? "cron_dispatched_untracked" : "cron_completed");
         }
 
         private static void Audit(Run run, ServerManagerCommandResult result) =>
@@ -460,7 +482,8 @@ internal static class ServerScheduleRuntime
                 else if (!success) Warn("Job '" + run.Occurrence.Job.Id + "' stopped (" + code + ").");
                 else if (run.Occurrence.Job.Log && (code != "cron_skipped" || _settings!.LogSkipped))
                     ServerManagerPlugin.Log.LogInfo("Cron: Job '" + run.Occurrence.Job.Id + "' " +
-                        (code == "cron_skipped" ? "skipped (chance or global-key conditions)." : "completed."));
+                        (code == "cron_skipped" ? "skipped (chance or global-key conditions)." :
+                            code == "cron_dispatched_untracked" ? "dispatched; completion not tracked." : "completed."));
                 Finish(run);
             });
         }

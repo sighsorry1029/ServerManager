@@ -41,14 +41,17 @@ function Write-CommonPeerInfo([IO.BinaryWriter]$Writer) {
     $Writer.Write([int]3); $Writer.Write([int]2); $Writer.Write($false)
 }
 
-function New-PeerInfo([bool]$ReceivingOnServer) {
+function New-PeerInfo(
+    [bool]$ReceivingOnServer,
+    [string]$Password = 'password-hash',
+    [string]$InviteSecret = 'invite-secret') {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream, [Text.Encoding]::UTF8, $true)
     try {
         Write-CommonPeerInfo $writer
         if ($ReceivingOnServer) {
-            $writer.Write('password-hash')
-            $writer.Write('invite-secret')
+            $writer.Write($Password)
+            $writer.Write($InviteSecret)
             $ticket = [byte[]](1, 2, 3, 4, 5, 6)
             $writer.Write($ticket.Length); $writer.Write($ticket)
         } else {
@@ -73,6 +76,9 @@ Assert-True ($null -ne $method) 'The PeerInfo preflight entry point is missing.'
 $envelopeMethod = $type.GetMethod('TryPreflightPeerInfoEnvelope',
     [Reflection.BindingFlags]'Static, NonPublic')
 Assert-True ($null -ne $envelopeMethod) 'The PeerInfo envelope preflight entry point is missing.'
+$credentialsMethod = $type.GetMethod('TryReadServerCredentials',
+    [Reflection.BindingFlags]'Static, NonPublic')
+Assert-True ($null -ne $credentialsMethod) 'The bounded credential reader is missing.'
 
 function Invoke-Preflight([byte[]]$Payload, [bool]$ReceivingOnServer) {
     $arguments = [object[]]@($Payload, 0, $Payload.Length, $ReceivingOnServer, $null)
@@ -108,6 +114,52 @@ foreach ($direction in @($true, $false)) {
 
     $truncated = Invoke-Preflight ([byte[]]$payload[0..($payload.Length - 2)]) $direction
     Assert-True (-not $truncated.Accepted) 'A truncated PeerInfo payload was accepted.'
+}
+
+$serverBytes = [byte[]](New-PeerInfo $true)
+$serverPackage = [Activator]::CreateInstance([ZPackage], [object[]]@(,$serverBytes))
+$credentialArguments = [object[]]@($serverPackage, $null, $null)
+Assert-True ([bool]$credentialsMethod.Invoke($null, $credentialArguments) -and
+    $credentialArguments[1] -ceq 'password-hash' -and
+    $credentialArguments[2] -ceq 'invite-secret' -and
+    $serverPackage.GetPos() -eq 0) `
+    'The bounded credential reader changed the packet or decoded the wrong fields.'
+$badBytes = [byte[]](1, 2, 3)
+$badPackage = [Activator]::CreateInstance([ZPackage], [object[]]@(,$badBytes))
+$badCredentialArguments = [object[]]@($badPackage, $null, $null)
+Assert-True (-not [bool]$credentialsMethod.Invoke($null, $badCredentialArguments) -and
+    $badCredentialArguments[1] -ceq '' -and $badCredentialArguments[2] -ceq '') `
+    'A malformed credential packet produced a password classification.'
+
+$pluginAssembly = [AppDomain]::CurrentDomain.GetAssemblies() |
+    Where-Object { $_.GetName().Name -eq 'ServerManager' } |
+    Select-Object -First 1
+$runtimeType = $pluginAssembly.GetType('ServerManager.ServerManagerRuntime', $true)
+$wrongPasswordMethod = $runtimeType.GetMethod('IsPlainWrongServerPassword',
+    [Reflection.BindingFlags]'Static, NonPublic')
+$passwordField = [ZNet].GetField('m_serverPassword',
+    [Reflection.BindingFlags]'Static, NonPublic')
+Assert-True ($null -ne $wrongPasswordMethod -and $null -ne $passwordField) `
+    'The pre-Steam password classification boundary is missing.'
+$previousPassword = $passwordField.GetValue($null)
+try {
+    $passwordField.SetValue($null, 'expected-hash')
+    function Is-PlainWrongPassword([string]$Password, [string]$InviteSecret) {
+        $bytes = [byte[]](New-PeerInfo $true $Password $InviteSecret)
+        $packet = [Activator]::CreateInstance([ZPackage], [object[]]@(,$bytes))
+        return [bool]$wrongPasswordMethod.Invoke($null, [object[]]@($packet))
+    }
+    Assert-True (-not (Is-PlainWrongPassword 'expected-hash' '')) `
+        'The correct password was classified as an early rejection.'
+    Assert-True (Is-PlainWrongPassword 'wrong-hash' '') `
+        'A plain wrong password would still enter Steam authentication.'
+    Assert-True (-not (Is-PlainWrongPassword 'wrong-hash' 'invite-secret')) `
+        'A possible vanilla invite-secret bypass was preempted.'
+    Assert-True (-not [bool]$wrongPasswordMethod.Invoke(
+        $null, [object[]]@($badPackage))) `
+        'A malformed packet was misclassified as an ordinary password error.'
+} finally {
+    $passwordField.SetValue($null, $previousPassword)
 }
 
 # Pin the preflight layout to the target game's actual SendPeerInfo writer.
