@@ -160,15 +160,11 @@
     </ItemGroup>
     <ItemGroup>
         <EmbeddedResource Include="translations\*.yml"/>
-        <EmbeddedResource Include="LICENSE.txt">
-            <LogicalName>ServerManager.LICENSE.txt</LogicalName>
-        </EmbeddedResource>
         <EmbeddedResource Include="THIRD_PARTY_NOTICES.md">
             <LogicalName>ServerManager.THIRD_PARTY_NOTICES.md</LogicalName>
         </EmbeddedResource>
         <Content Include=".gitignore"/>
         <Content Include="environment.props"/>
-        <Content Include="LICENSE.txt"/>
         <Content Include="README.md"/>
         <Content Include="Thunderstore\CHANGELOG.md"/>
         <Content Include="Thunderstore\icon.png"/>

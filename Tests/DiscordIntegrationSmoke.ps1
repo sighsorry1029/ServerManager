@@ -18,8 +18,8 @@ $parameters.ReadingMode = [Mono.Cecil.ReadingMode]::Deferred
 $assembly = [Mono.Cecil.AssemblyDefinition]::ReadAssembly($pluginPath, $parameters)
 try {
     $module = $assembly.MainModule
-    # Both distribution archives retain the complete notices inside their single DLL.
-    foreach ($notice in @('LICENSE.txt', 'THIRD_PARTY_NOTICES.md')) {
+    # Both distribution archives retain the complete third-party notices inside their single DLL.
+    foreach ($notice in @('THIRD_PARTY_NOTICES.md')) {
         $resourceName = 'ServerManager.' + $notice
         $resource = @($module.Resources | Where-Object Name -eq $resourceName)
         Assert-True ($resource.Count -eq 1 -and $resource[0] -is [Mono.Cecil.EmbeddedResource]) `

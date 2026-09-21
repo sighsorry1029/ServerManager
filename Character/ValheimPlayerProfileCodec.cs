@@ -1317,8 +1317,30 @@ namespace ServerManager
 
                 if (prefabHash == 0 || stack < 1 || (cheatFlags & ~1) != 0)
                 {
-                    throw new CharacterProtocolException(
-                        "The inner Player contains invalid inventory item data.");
+                    // Describe only serialized facts. A missing identity cannot
+                    // identify a prefab or its creating mod without live state.
+                    // Keep formatting off the successful snapshot path.
+                    StringBuilder diagnostic = new StringBuilder(
+                        "The inner Player contains invalid inventory item data. " +
+                        $"Item #{index + 1}/{itemCount} at zero-based slot ({positionX}, {positionY}): " +
+                        $"prefabHash=0x{prefabHash:X8}, itemFlags=0x{flags:X2}, cheatFlags=0x{cheatFlags:X2}.");
+                    if (prefabHash == 0)
+                    {
+                        diagnostic.Append((flags & 64) == 0
+                            ? " The saved prefab identity is missing (prefab flag 0x40 is not set); " +
+                              "the item may have been created without assigning m_dropPrefab."
+                            : " The saved prefab hash is zero despite prefab flag 0x40 being set.");
+                    }
+                    if (stack < 1)
+                    {
+                        diagnostic.Append($" Invalid stack={stack} (expected at least 1).");
+                    }
+                    if ((cheatFlags & ~1) != 0)
+                    {
+                        diagnostic.Append(
+                            $" Unsupported cheat flag bits=0x{cheatFlags & ~1:X2} (supported mask=0x01).");
+                    }
+                    throw new CharacterProtocolException(diagnostic.ToString());
                 }
 
                 if (positionX >= 0 && positionY >= 0)

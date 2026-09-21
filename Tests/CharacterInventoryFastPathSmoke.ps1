@@ -126,6 +126,42 @@ function New-CustomDictionaryFixture {
     finally { $writer.Dispose(); $stream.Dispose() }
 }
 
+function New-InventoryDiagnosticFixture {
+    param(
+        [bool]$IncludePrefab = $true,
+        [int]$PrefabHash = 123,
+        [uint16]$Stack = 1,
+        [byte]$CheatFlags = 0
+    )
+
+    $stream = [IO.MemoryStream]::new()
+    $writer = [IO.BinaryWriter]::new($stream)
+    try {
+        # Independent compact inventory-109 wire records. The second record
+        # tests ordinal/slot reporting even when the first item is valid.
+        $writer.Write([int]109)
+        $writer.Write([uint16]2)
+        $writer.Write([int]0)
+        $writer.Write([byte[]]@(0, 0, 0, 64))
+        $writer.Write([int]456)
+        $writer.Write([byte]0)
+
+        $writer.Write([int]0)
+        $flags = 8 -bor 128
+        if ($IncludePrefab) { $flags = $flags -bor 64 }
+        $writer.Write([byte[]]@(3, 1, 0, $flags))
+        $writer.Write($Stack)
+        if ($IncludePrefab) { $writer.Write($PrefabHash) }
+        $writer.Write([byte]1)
+        $writer.Write('private.fixture.key')
+        $writer.Write('private-fixture-value')
+        $writer.Write($CheatFlags)
+        $writer.Flush()
+        return $stream.ToArray()
+    }
+    finally { $writer.Dispose(); $stream.Dispose() }
+}
+
 function New-InventorySnapshotBytes {
     param(
         [string]$PrefabName = "",
@@ -814,6 +850,59 @@ foreach ($invalidCheatFlags in @(2, 128, 255)) {
         (Test-ByteArrayEqual $fullProfile $fullProfileBefore)) `
         "Rejected world-level data altered the authoritative full-profile input."
 }
+
+# Diagnostics must identify the failed record and each invalid field without
+# changing acceptance, guessing its creating mod, or exposing custom data.
+foreach ($case in @(
+    @{ Name = 'missing identity'; Args = @{ IncludePrefab = $false }; Details = @(
+        'prefabHash=0x00000000', 'saved prefab identity is missing', 'may have been created without assigning m_dropPrefab') },
+    @{ Name = 'explicit zero hash'; Args = @{ PrefabHash = 0 }; Details = @(
+        'saved prefab hash is zero despite prefab flag 0x40 being set') },
+    @{ Name = 'zero stack'; Args = @{ Stack = 0 }; Details = @(
+        'prefabHash=0x0000007B', 'Invalid stack=0') },
+    @{ Name = 'unsupported flag'; Args = @{ CheatFlags = 2 }; Details = @(
+        'cheatFlags=0x02', 'Unsupported cheat flag bits=0x02') },
+    @{ Name = 'high unsupported flag'; Args = @{ CheatFlags = 128 }; Details = @(
+        'cheatFlags=0x80', 'Unsupported cheat flag bits=0x80') },
+    @{ Name = 'combined fields'; Args = @{ IncludePrefab = $false; Stack = 0; CheatFlags = 255 }; Details = @(
+        'saved prefab identity is missing', 'Invalid stack=0', 'cheatFlags=0xFF', 'Unsupported cheat flag bits=0xFE') }
+)) {
+    $fixtureArguments = $case.Args
+    [byte[]]$diagnosticInventory = New-InventoryDiagnosticFixture @fixtureArguments
+    [byte[]]$diagnosticBefore = $diagnosticInventory.Clone()
+    $diagnosticError = Assert-ThrowsLike `
+        { Invoke-OneArgument $validateInventory $profileCodec $diagnosticInventory } `
+        '*invalid inventory item data*' "Accepted $($case.Name)."
+    Assert-True ($diagnosticError.GetType() -eq $protocolExceptionType) `
+        "Changed exception type for $($case.Name)."
+    foreach ($detail in (@('Item #2/2 at zero-based slot (3, 1)') + $case.Details)) {
+        Assert-True ($diagnosticError.Message.Contains($detail)) `
+            "Missing diagnostic '$detail' for $($case.Name): $($diagnosticError.Message)"
+    }
+    Assert-True (-not $diagnosticError.Message.Contains('private.fixture.key') -and
+        -not $diagnosticError.Message.Contains('private-fixture-value')) `
+        'Inventory diagnostics leaked custom data.'
+    if ($case.Name -eq 'explicit zero hash') {
+        Assert-True (-not $diagnosticError.Message.Contains('m_dropPrefab')) `
+            'A serialized zero hash was incorrectly attributed to an unassigned prefab reference.'
+    }
+
+    $diagnosticInner = New-InnerPlayerDataFixture $diagnosticInventory
+    [byte[]]$diagnosticProfile = New-PlayerProfilePayload `
+        -CharacterName 'FastPathHero' -PlayerId ([long]76561198000000001) `
+        -PlayerData $diagnosticInner.Bytes
+    $diagnosticProfileError = Assert-ThrowsLike `
+        { Invoke-TwoArguments $validateSnapshot $profileCodec $identity $diagnosticProfile } `
+        '*invalid inventory item data*' "Full-profile parsing accepted $($case.Name)."
+    Assert-True ($diagnosticProfileError.Message -ceq $diagnosticError.Message -and
+        (Test-ByteArrayEqual $diagnosticInventory $diagnosticBefore)) `
+        'Full-profile and inventory diagnostics differ, or input bytes changed.'
+}
+foreach ($allowedCheatFlags in @(0, 1)) {
+    [byte[]]$validDiagnosticInventory = New-InventoryDiagnosticFixture -CheatFlags $allowedCheatFlags
+    Invoke-OneArgument $validateInventory $profileCodec $validDiagnosticInventory | Out-Null
+}
+Write-Output 'Inventory diagnostics: missing/zero prefab identity, zero stack, unsupported/allowed flags, combined failures and full-profile parity passed.'
 
 # Removing key-name policy must neither strip values nor relax wire structure.
 $largeRetainedCustomValue = "v" * (60 * 1024)

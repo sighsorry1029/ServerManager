@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0
+
+- Added detailed character-save errors with the affected inventory item number, slot, saved prefab hash and flag values.
+- Distinguished missing prefab identity, a zero prefab hash, invalid stack counts and unsupported flag bits while preserving existing save validation rules.
+
 ## 1.0.10
 
 - Allowed ordinary wrong-password attempts to retry without entering the process-lifetime Steam authentication quarantine.
