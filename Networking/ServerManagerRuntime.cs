@@ -663,6 +663,8 @@ internal static partial class ServerManagerRuntime
 
         internal ClientCharacterSavePipeline SavePipeline { get; }
 
+        internal ClientInventoryOverlapRetry InventoryOverlapRetry { get; } = new(Stopwatch.Frequency);
+
         internal long FullProfileSafetySaveDueTimestamp { get; set; }
 
         internal long NextFullProfileSafetySaveAllowedTimestamp { get; set; }
@@ -722,6 +724,8 @@ internal static partial class ServerManagerRuntime
         internal bool ServerGateAcknowledged { get; set; }
 
         internal bool FinalCaptureAttempted { get; set; }
+
+        internal bool FinalCaptureRetryPending { get; set; }
 
         internal bool ClientWorldBarrierSent { get; set; }
 
@@ -2759,7 +2763,7 @@ internal static partial class ServerManagerRuntime
             return;
         }
 
-        if (_deferredClientExit != null)
+        if (_deferredClientExit != null || session.InventoryOverlapRetry.Pending)
         {
             return;
         }
@@ -2784,6 +2788,11 @@ internal static partial class ServerManagerRuntime
                 session,
                 profileBytes,
                 ClientCharacterSaveReason.Vanilla);
+        }
+        catch (CharacterProtocolException exception) when (exception.IsInventoryOverlap)
+        {
+            if (!TryDeferClientInventoryOverlap(session, exception))
+                FailClientForInventoryOverlap(session);
         }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
         {
@@ -7533,9 +7542,55 @@ internal static partial class ServerManagerRuntime
                 "character session.");
         }
 
-        return session.SavePipeline.Offer(
+        ulong captureId = session.SavePipeline.Offer(
             payloadBytes,
             reason);
+        if (ClientCharacterSavePipeline.IsFullProfileReason(reason))
+            session.InventoryOverlapRetry.Clear();
+        return captureId;
+    }
+
+    private static bool TryDeferClientInventoryOverlap(ClientConnection session, CharacterProtocolException exception)
+    {
+        if (!session.InventoryOverlapRetry.TryDefer(exception, Stopwatch.GetTimestamp(), out bool warn))
+            return false;
+        if (warn)
+            ServerManagerPlugin.Log.LogWarning(
+                $"Character inventory overlap; retrying local capture for up to {ClientInventoryOverlapRetry.GraceSeconds}s " +
+                $"at {ClientInventoryOverlapRetry.RetrySeconds}s intervals. The invalid snapshot was not submitted. " +
+                DescribeInventoryOverlap(exception));
+        return true;
+    }
+
+    // The wire codec also runs on server workers. Only this client-side diagnostic
+    // resolves local prefab names, and only after capture failed (never per frame).
+    private static string DescribeInventoryOverlap(CharacterProtocolException exception)
+    {
+        string Name(int hash)
+        {
+            string? name = ObjectDB.instance?.GetItemPrefab(hash)?.name;
+            if (name == null || name.Length == 0) return "unresolved";
+            return name.Substring(0, Math.Min(name.Length, 128)).Replace('\r', ' ').Replace('\n', ' ');
+        }
+        try
+        {
+            return exception.Message + $" Local prefabs: first={Name(exception.FirstOverlapPrefabHash)}, " +
+                   $"second={Name(exception.SecondOverlapPrefabHash)}.";
+        }
+        catch (Exception lookupError) when (!IntegrityCanonical.IsFatal(lookupError))
+        {
+            return exception.Message;
+        }
+    }
+
+    private static void FailClientForInventoryOverlap(ClientConnection session)
+    {
+        CharacterProtocolException? error = session.InventoryOverlapRetry.LastError;
+        session.SavePipeline.Close();
+        FailClient(session.Rpc,
+            "Character inventory overlap did not resolve within the capture retry grace. " +
+            (error == null ? string.Empty : DescribeInventoryOverlap(error)),
+            playerMessage: PlayerLocalizer.Text("sm_character_inventory_overlap"));
     }
 
     private static void ProcessClientCharacterSavePipeline(
@@ -7572,14 +7627,21 @@ internal static partial class ServerManagerRuntime
             return;
         }
 
+        if (_deferredClientExit == null && session.InventoryOverlapRetry.HasExpired(now))
+        {
+            FailClientForInventoryOverlap(session);
+            return;
+        }
+
         bool fullProfileFallbackDue =
-            session.FullProfileSafetySaveDueTimestamp != 0 &&
-            now >= session.FullProfileSafetySaveDueTimestamp;
+            (session.FullProfileSafetySaveDueTimestamp != 0 &&
+             now >= session.FullProfileSafetySaveDueTimestamp) ||
+            session.InventoryOverlapRetry.Pending;
         bool fullProfileHeartbeatDue =
             session.NextFullProfileHeartbeatTimestamp != 0 &&
             now >= session.NextFullProfileHeartbeatTimestamp;
         if ((fullProfileFallbackDue || fullProfileHeartbeatDue) &&
-            _deferredClientExit == null)
+            _deferredClientExit == null && session.InventoryOverlapRetry.CanAttempt(now))
         {
             try
             {
@@ -7621,6 +7683,14 @@ internal static partial class ServerManagerRuntime
                             InventoryFastSaveMinimumIntervalTicks);
                 }
             }
+            catch (CharacterProtocolException exception) when (exception.IsInventoryOverlap)
+            {
+                if (!TryDeferClientInventoryOverlap(session, exception))
+                {
+                    FailClientForInventoryOverlap(session);
+                    return;
+                }
+            }
             catch (Exception exception)
                 when (!IntegrityCanonical.IsFatal(exception))
             {
@@ -7637,7 +7707,9 @@ internal static partial class ServerManagerRuntime
             session.InventoryFastSaveDueTimestamp != 0 &&
             now >= session.InventoryFastSaveDueTimestamp &&
             !session.SavePipeline.HasPendingFullProfile &&
-            _deferredClientExit == null)
+            _deferredClientExit == null &&
+            !session.InventoryOverlapRetry.Pending &&
+            session.FullProfileSafetySaveDueTimestamp == 0)
         {
             try
             {
@@ -7657,7 +7729,7 @@ internal static partial class ServerManagerRuntime
                             _profileCodec!.CaptureInventoryToBytes(
                                 player.GetInventory());
                     }
-                    catch (CharacterProtocolException exception)
+                    catch (CharacterProtocolException exception) when (!exception.IsInventoryOverlap)
                     {
                         // A modded inventory can legitimately exceed the
                         // dedicated 1 MiB fast-path bound. Keep the connection
@@ -7684,6 +7756,14 @@ internal static partial class ServerManagerRuntime
                         AddStopwatchDuration(
                             now,
                             InventoryFastSaveMinimumIntervalTicks);
+                }
+            }
+            catch (CharacterProtocolException exception) when (exception.IsInventoryOverlap)
+            {
+                if (!TryDeferClientInventoryOverlap(session, exception))
+                {
+                    FailClientForInventoryOverlap(session);
+                    return;
                 }
             }
             catch (Exception exception)
@@ -8090,6 +8170,17 @@ internal static partial class ServerManagerRuntime
             return;
         }
 
+        if (session.InventoryOverlapRetry.HasExpired(now))
+        {
+            session.SavePipeline.Close();
+            ServerManagerPlugin.Log.LogWarning(
+                "Final character capture overlap did not resolve within the retry grace. " +
+                DescribeInventoryOverlap(session.InventoryOverlapRetry.LastError!));
+            ResumeDeferredClientExit(succeeded: false,
+                PlayerLocalizer.Text("sm_character_inventory_overlap"));
+            return;
+        }
+
         if (!deferred.ClientWorldBarrierSent)
         {
             try
@@ -8138,6 +8229,10 @@ internal static partial class ServerManagerRuntime
             return;
         }
 
+        // Wait before settling the world for the first capture. Otherwise an
+        // existing periodic retry can leave a gap between drain and capture.
+        if (!deferred.FinalCaptureAttempted && !session.InventoryOverlapRetry.CanAttempt(now)) return;
+
         if (!deferred.ReadyStateResolved)
         {
             try
@@ -8173,14 +8268,32 @@ internal static partial class ServerManagerRuntime
             deferred.FinalCaptureAttempted = true;
             try
             {
+                // A retry must not discard mutations that happened after the
+                // previous settled capture: their world effects are not drained.
+                if (deferred.FinalCaptureRetryPending && deferred.InventoryChangedAfterQuiescence)
+                    throw new InvalidOperationException(
+                        "Client inventory changed while waiting to retry the final snapshot.");
                 // Inventory changes caused by pre-gate gameplay or death are
                 // part of the settled state. From this point through capture,
                 // any synchronous inventory mutation is a consistency failure.
                 deferred.InventoryChangedAfterQuiescence = false;
-                byte[] profileBytes =
-                    CaptureDeferredClientExitSnapshot(
+                byte[] profileBytes;
+                try
+                {
+                    profileBytes = CaptureDeferredClientExitSnapshot(
                         session,
                         deferredPlayer);
+                }
+                catch (CharacterProtocolException exception) when (exception.IsInventoryOverlap)
+                {
+                    // Retry only capture. Never repeat Offer/Send, and do not
+                    // overlook a mutation of the already quiesced player.
+                    if (deferred.InventoryChangedAfterQuiescence ||
+                        !TryDeferClientInventoryOverlap(session, exception)) throw;
+                    deferred.FinalCaptureRetryPending = true;
+                    deferred.FinalCaptureAttempted = false;
+                    return;
+                }
                 if (deferred.InventoryChangedAfterQuiescence)
                 {
                     throw new InvalidOperationException(

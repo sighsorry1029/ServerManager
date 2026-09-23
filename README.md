@@ -216,6 +216,14 @@ periodically and during save/logout handling. The server keeps accepted updates
 in memory, so reconnecting to the same running server can restore progress not
 yet written to disk. Remaining poison is retained from the latest full update.
 
+If a remote client's snapshot contains two items in the same inventory slot,
+ServerManager retries capture once per second for up to 10 seconds. Invalid
+snapshots are never submitted. The client log identifies the slot and both
+items; retry warnings are limited to once per 30 seconds per connection. If the
+overlap persists, the client disconnects with an explanation. Existing save
+acknowledgement and logout deadlines still apply. This grace does not repair
+items or relax the server's validation; the inventory mod may still need a fix.
+
 Character files are written after a successful world save. One failed character
 write does not stop the world or other characters from saving.
 

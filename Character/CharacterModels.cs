@@ -1661,6 +1661,20 @@ namespace ServerManager
 
     public sealed class CharacterProtocolException : Exception
     {
+        // Local capture may briefly retry this specific structural error.
+        // It remains a protocol rejection on the server; do not match log text.
+        internal bool IsInventoryOverlap { get; private set; }
+        internal int FirstOverlapPrefabHash { get; private set; }
+        internal int SecondOverlapPrefabHash { get; private set; }
+
+        internal CharacterProtocolException WithInventoryOverlap(int firstPrefabHash, int secondPrefabHash)
+        {
+            IsInventoryOverlap = true;
+            FirstOverlapPrefabHash = firstPrefabHash;
+            SecondOverlapPrefabHash = secondPrefabHash;
+            return this;
+        }
+
         // Optional player-facing metadata; Message remains the original
         // diagnostic for logs and callers that do not render localized UI.
         internal string PlayerMessageKey { get; private set; } = string.Empty;

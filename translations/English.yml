@@ -32,6 +32,7 @@ sm_fresh_character_required: "This server has no saved character for the selecte
 sm_character_apply_failed: "The server character could not be loaded or applied. Reconnect and try again. If this continues, contact a server administrator."
 sm_character_load_unsafe: "Character loading did not complete, so entry was stopped and saving was blocked. Check mod compatibility, then restart Valheim. See the ServerManager log for details or contact the server administrator."
 sm_character_save_failed: "The server could not accept the character save. Reconnect and try again. If this continues, contact a server administrator."
+sm_character_inventory_overlap: "Two inventory items still occupy the same slot after a short retry period. The invalid snapshot was not sent to the server. Check your inventory mods and the ServerManager log, then reconnect."
 sm_character_active: "This character is already connected. Wait for the previous connection to close, then try again."
 sm_character_profile_limit: "This account has reached the server's limit of {0} characters, including characters that are connecting. Contact a server administrator."
 sm_character_restore_unavailable: "This character is unavailable while a server administrator verifies its recovery. Contact a server administrator."

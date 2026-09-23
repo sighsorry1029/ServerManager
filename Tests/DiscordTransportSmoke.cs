@@ -394,9 +394,11 @@ internal static class DiscordTransportSmoke
                     if (index < 2)
                         CheckCompactEmbed(card, Story(events[index], anonymous ? "Guest 1" : "Victim",
                             index == 1 ? anonymous ? "Guest 2" : "Attacker" : string.Empty, language),
-                            PlayerLocalizer.TextForLanguage(language, "sm_event_client_report"),
+                            null,
                             "Grouped death keeps the original language, variant, victim and PvP attacker");
-                    if (index == 2) Check(((string)card["title"]!).StartsWith("Security observation", StringComparison.Ordinal), "Detection keeps its observation card.");
+                    if (index == 2) CheckCompactEmbed(card, "Security observation — " + (anonymous ? "Guest 1" : "Victim"),
+                        anonymous ? "Security finding" : "validation.required\\_plugin\\_missing",
+                        "Detection keeps its finding without a client-report suffix.");
                     if (index == 3) Check(((string)card["description"]!).Contains("Ban-list update call completed"), "Response success remains visible after detection.");
                     if (index == 4) Check(((string)card["description"]!).Contains("Ban list update failed"), "Distinct response failure remains visible after success.");
                     if (index == 5) Check(((string)card["description"]!).Contains("observe only"), "Observed character data is not presented as rejected.");
@@ -886,8 +888,8 @@ internal static class DiscordTransportSmoke
             {
                 JObject payload = JObject.Parse(handler.Requests[index].Body!);
                 JObject embed = (JObject)payload["embeds"]![0]!;
-                CheckCompactEmbed(embed, cases[index].Item2, cases[index].Item1.Reliability == "client_reported" ? "Client report" : null,
-                    "Smoke/freezing shares its phrase with the game and retains the client-report marker");
+                CheckCompactEmbed(embed, cases[index].Item2, null,
+                    "Smoke/freezing shares its phrase with the game without a client-report line");
                 Check(!payload.ToString().Contains("VICTIM_PRIVATE_ID") && !payload.ToString().Contains("steamworks:") &&
                     !payload.ToString().Contains("was defeated by"), "Environmental causes do not expose identifiers or become a PvP notification.");
                 if (anonymous) Check(!payload.ToString().Contains("Complete") &&
@@ -958,15 +960,13 @@ internal static class DiscordTransportSmoke
                     string expected = Story(value, actor, target, language);
                     JObject payload = JObject.Parse(handler.Requests[index * 4 + route].Body!);
                     JObject card = (JObject)payload["embeds"]![0]!;
-                    string? report = value.Reliability == "client_reported" ? PlayerLocalizer.TextForLanguage(language, "sm_event_client_report") : null;
-                    CheckCompactEmbed(card, expected, report, "Localized shared story");
+                    CheckCompactEmbed(card, expected, null, "Localized shared story without a client-report line");
                     if (route == 0) english = expected;
                     if (route == 3) Check(expected == english, "Missing safe locale falls back to the exact English sentence and variant");
                     if (route == 1 || anonymous)
                     {
                         Check(expected.Any(ch => ch >= '\uac00' && ch <= '\ud7a3') && expected != english,
                             "Actual embedded Korean resources render a translated sentence for every family");
-                        if (report != null) Check(report.Any(ch => ch >= '\uac00' && ch <= '\ud7a3'), "Client-report label is translated with its route");
                     }
                     if (anonymous) Check(!payload.ToString().Contains("Complete") && !payload.ToString().Contains("halla"),
                         "Translated anonymous route hides player identities while preserving named nonplayer foes");
@@ -1003,7 +1003,7 @@ internal static class DiscordTransportSmoke
             for (int index = 1; index < 3; ++index)
                 CheckCompactEmbed((JObject)JObject.Parse(handler.Requests[index].Body!)["embeds"]![0]!,
                     Story(events[index], EventMessageText.PlayerName(events[index]), EventMessageText.OtherName(events[index]), "Korean"),
-                    PlayerLocalizer.TextForLanguage("Korean", "sm_event_client_report"), "Language snapshot survives later DTO mutation and rejected reload");
+                    null, "Language snapshot survives later DTO mutation and rejected reload");
         }
     }
 
@@ -1398,7 +1398,7 @@ internal static class DiscordTransportSmoke
                 Check(story.Length > 256, "Escaped two-name combat sentence exercises Discord's title overflow path.");
                 string original = EventFingerprint(value);
                 Check(webhooks.Enqueue(value) && original == EventFingerprint(value), "Long-story rendering preserves factual event data.");
-                cases.Add(Tuple.Create(value, story + (reported ? "\nClient report" : "")));
+                cases.Add(Tuple.Create(value, story));
             }
             Task running = webhooks.RunAsync(CancellationToken.None);
             await webhooks.StopAsync(TimeSpan.FromSeconds(3)); await running;
@@ -1452,8 +1452,8 @@ internal static class DiscordTransportSmoke
                     "Compact dynamic text never enables mentions or appends redundant raw account IDs.");
             }
             JObject deathCard = (JObject)JObject.Parse(handler.Requests[0].Body!)["embeds"]![0]!;
-            Check(!((string)deathCard["title"]!).Contains("\n") && (string?)deathCard["description"] == "Client report",
-                "Player name and death cause are single-line while client-reported evidence is explicit.");
+            Check(!((string)deathCard["title"]!).Contains("\n") && deathCard["description"] == null,
+                "Player name and death cause are single-line without a client-report description.");
             string requested = JObject.Parse(handler.Requests[1].Body!).ToString().ToLowerInvariant();
             string failed = JObject.Parse(handler.Requests[2].Body!).ToString().ToLowerInvariant();
             Check(requested.Contains("requested") && !requested.Contains("banned") && failed.Contains("failed") && !failed.Contains("banned"),

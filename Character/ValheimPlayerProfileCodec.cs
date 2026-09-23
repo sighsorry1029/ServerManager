@@ -1291,7 +1291,7 @@ namespace ServerManager
             }
 
             int itemCount = reader.ValidateCount(reader.ReadUInt16("inventory items"), "inventory items", 256);
-            HashSet<long> occupiedPositions = new HashSet<long>();
+            Dictionary<long, int> occupiedPositions = new Dictionary<long, int>();
             List<CharacterSemanticItemState> items =
                 new List<CharacterSemanticItemState>(itemCount);
             for (int index = 0; index < itemCount; ++index)
@@ -1343,15 +1343,24 @@ namespace ServerManager
                     throw new CharacterProtocolException(diagnostic.ToString());
                 }
 
-                if (positionX >= 0 && positionY >= 0)
+                // Inventory 109 encodes coordinates as unsigned bytes. Retain
+                // the first entry's index so a collision identifies both items.
                 {
                     long positionKey =
                         ((long)positionX << 32) | (uint)positionY;
-                    if (!occupiedPositions.Add(positionKey))
+                    if (occupiedPositions.TryGetValue(positionKey, out int firstIndex))
                     {
+                        CharacterSemanticItemState first = items[firstIndex];
                         throw new CharacterProtocolException(
-                            "The inner Player inventory contains overlapping items.");
+                            "The inner Player inventory contains overlapping items. " +
+                            $"Zero-based slot ({positionX}, {positionY}), {itemCount} items: " +
+                            $"item #{firstIndex + 1} [prefabHash=0x{first.PrefabHash:X8}, " +
+                            $"stack={first.Stack}, quality={first.Quality}, worldLevel={first.WorldLevel}] " +
+                            $"conflicts with item #{index + 1} [prefabHash=0x{prefabHash:X8}, " +
+                            $"stack={stack}, quality={quality}, worldLevel={worldLevel}].")
+                            .WithInventoryOverlap(first.PrefabHash, prefabHash);
                     }
+                    occupiedPositions.Add(positionKey, index);
                 }
 
                 // Preserve the serialized quality/variant/durability and custom

@@ -275,6 +275,7 @@ Assert-True (
     [Text.RegularExpressions.Regex]::IsMatch(
         $runtimeSource,
         'catch\s*\(CharacterProtocolException exception\)\s*' +
+        'when\s*\(!exception\.IsInventoryOverlap\)\s*' +
         '\{.*?session\.FullProfileSafetySaveDueTimestamp\s*=.*?' +
         'falling back to a full character snapshot',
         [Text.RegularExpressions.RegexOptions]::Singleline)) `
@@ -1242,6 +1243,27 @@ $sendClientSaveCall = $processSavePipelineCalls |
         $_.Operand.Name -eq "SendClientSave"
     } |
     Select-Object -Last 1
+$overlapDeferCalls = @($processSavePipelineCalls | Where-Object {
+    $_.Operand.Name -eq 'TryDeferClientInventoryOverlap'
+})
+Assert-True ($overlapDeferCalls.Count -eq 2) 'Full and inventory captures must share the overlap retry gate.'
+foreach ($deferCall in $overlapDeferCalls) {
+    Assert-True (Test-CecilReachable $deferCall.Next $tryStartSaveCall) `
+        'A deferred overlap capture prevents queued valid saves from reaching the dispatch pump.'
+}
+foreach ($entryPoint in @('AfterGameSave', 'AfterInventoryChanged', 'ApplySaveResponse',
+    'TickClientAdminAction')) {
+    $method = Get-PluginMethodDefinition 'ServerManager.ServerManagerRuntime' $entryPoint
+    Assert-True ($null -eq (Get-CecilCall $method 'ServerManager.ClientInventoryOverlapRetry' 'Clear')) `
+        "$entryPoint resets the fixed overlap deadline without a valid full capture."
+}
+$offerClientSave = Get-PluginMethodDefinition 'ServerManager.ServerManagerRuntime' 'OfferClientSave'
+$offeredSnapshot = Get-CecilCall $offerClientSave 'ServerManager.ClientCharacterSavePipeline' 'Offer'
+$clearOverlap = Get-CecilCall $offerClientSave 'ServerManager.ClientInventoryOverlapRetry' 'Clear'
+$fullReasonCheck = Get-CecilCall $offerClientSave 'ServerManager.ClientCharacterSavePipeline' 'IsFullProfileReason'
+Assert-True ($null -ne $offeredSnapshot -and $null -ne $clearOverlap -and $null -ne $fullReasonCheck -and
+    $offeredSnapshot.Offset -lt $fullReasonCheck.Offset -and $fullReasonCheck.Offset -lt $clearOverlap.Offset) `
+    'Overlap recovery is cleared before the validated full snapshot is offered.'
 $sendFailureHandler = $processSavePipeline.Body.ExceptionHandlers |
     Where-Object {
         Test-CecilInstructionInRange `
@@ -1508,6 +1530,59 @@ $pipelineConstructor = $pipelineType.GetConstructor(
     $null)
 Assert-True ($null -ne $pipelineConstructor) `
     "The save-pipeline constructor changed."
+
+# Exercise the production retry clock with deterministic time; no wall-clock
+# sleeps or Unity instance are required. No transport failure is fed into it.
+$retryType = $plugin.GetType('ServerManager.ClientInventoryOverlapRetry', $true)
+$protocolErrorType = $plugin.GetType('ServerManager.CharacterProtocolException', $true)
+$retryConstructor = $retryType.GetConstructor($instanceFlags, $null, [Type[]]@([long]), $null)
+$tryDefer = Get-InstanceMethod $retryType 'TryDefer' 3
+$canAttempt = Get-InstanceMethod $retryType 'CanAttempt' 1
+$hasExpired = Get-InstanceMethod $retryType 'HasExpired' 1
+$clearRetry = Get-InstanceMethod $retryType 'Clear' 0
+$markOverlap = Get-InstanceMethod $protocolErrorType 'WithInventoryOverlap' 2
+$overlapError = [Activator]::CreateInstance($protocolErrorType, [object[]]@('collision fixture'))
+$markOverlap.Invoke($overlapError, [object[]]@([int]123, [int]456)) | Out-Null
+# The same words without typed metadata must never enable grace.
+$otherError = [Activator]::CreateInstance($protocolErrorType, [object[]]@('overlapping items'))
+function Defer-Overlap {
+    param([object]$Retry, [long]$Now, [object]$Error = $overlapError)
+    $arguments = [object[]]@($Error, $Now, $false)
+    $accepted = $tryDefer.Invoke($Retry, $arguments)
+    return [pscustomobject]@{ Accepted = $accepted; Warn = $arguments[2] }
+}
+$retry = $retryConstructor.Invoke([object[]]@([long]100))
+Assert-True ($canAttempt.Invoke($retry, [object[]]@([long]1000)) -and
+    -not (Defer-Overlap $retry 1000 $otherError).Accepted -and
+    -not (Get-InstanceProperty $retry 'Pending')) 'Unrelated errors activated the overlap grace.'
+$firstFailure = Defer-Overlap $retry 1000
+Assert-True ($firstFailure.Accepted -and $firstFailure.Warn -and
+    -not $canAttempt.Invoke($retry, [object[]]@([long]1099)) -and
+    $canAttempt.Invoke($retry, [object[]]@([long]1100))) `
+    'Overlap capture is not limited to one attempt per second.'
+foreach ($now in 1100, 1200, 1500, 1900, 1999) {
+    $again = Defer-Overlap $retry $now
+    Assert-True ($again.Accepted -and -not $again.Warn) 'A repeated overlap escaped warning throttling.'
+}
+Assert-True (-not $hasExpired.Invoke($retry, [object[]]@([long]1999)) -and
+    $hasExpired.Invoke($retry, [object[]]@([long]2000)) -and
+    -not $canAttempt.Invoke($retry, [object[]]@([long]2100)) -and
+    -not (Defer-Overlap $retry 2000).Accepted) 'Repeated capture errors extended the fixed ten-second grace.'
+$clearRetry.Invoke($retry, @()) | Out-Null
+Assert-True (-not (Get-InstanceProperty $retry 'Pending') -and
+    $null -eq (Get-InstanceProperty $retry 'LastError') -and
+    $canAttempt.Invoke($retry, [object[]]@([long]2001))) 'Recovery left the capture gate blocked.'
+$shortRecurrence = Defer-Overlap $retry 2100
+Assert-True ($shortRecurrence.Accepted -and -not $shortRecurrence.Warn -and
+    -not $hasExpired.Invoke($retry, [object[]]@([long]3099)) -and
+    $hasExpired.Invoke($retry, [object[]]@([long]3100))) `
+    'A recovered episode lost its warning cooldown or fresh bounded grace.'
+$clearRetry.Invoke($retry, @()) | Out-Null
+$laterRecurrence = Defer-Overlap $retry 4000
+Assert-True ($laterRecurrence.Accepted -and $laterRecurrence.Warn) 'Warning did not resume after thirty seconds.'
+$newSessionRetry = $retryConstructor.Invoke([object[]]@([long]100))
+Assert-True ((Defer-Overlap $newSessionRetry 4001).Warn) 'Retry warnings leaked between connections.'
+Write-Output 'Overlap retry: typed classification, one-second backoff, fixed deadline, recovery and per-connection warning cooldown passed.'
 
 $staticFlags = [Reflection.BindingFlags]::Static -bor
     [Reflection.BindingFlags]::Public -bor

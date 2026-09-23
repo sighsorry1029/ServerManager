@@ -201,6 +201,24 @@ function New-InventorySnapshotBytes {
     }
 }
 
+function New-InventoryOverlapFixture {
+    param([int]$SecondX = 0, [int]$Y = 4)
+    $stream = [IO.MemoryStream]::new()
+    $writer = [IO.BinaryWriter]::new($stream)
+    try {
+        $writer.Write([int]109)
+        $writer.Write([uint16]2)
+        [byte[]]$custom = New-CustomDictionaryFixture -Key 'private.overlap.key' -Value 'private-overlap-value'
+        [Valheim107Fixture]::Item($writer, 'Stone', 7, 12.5, 0, $Y, $false,
+            2, 0, 1, 'private-crafter', $custom, 1, $true, $false)
+        [Valheim107Fixture]::Item($writer, 'Coal', 3, 8.5, $SecondX, $Y, $false,
+            3, 0, 2, 'private-crafter', $custom, 7, $true, $false)
+        $writer.Flush()
+        return $stream.ToArray()
+    }
+    finally { $writer.Dispose(); $stream.Dispose() }
+}
+
 function New-InnerPlayerDataFixture {
     param(
         [byte[]]$InventorySnapshot,
@@ -625,6 +643,48 @@ Assert-True (
     -Stack 2 `
     -WorldLevel 10 `
     -CustomValue "base-value"
+
+$overlapFlag = $protocolExceptionType.GetProperty('IsInventoryOverlap',
+    [Reflection.BindingFlags]'Instance,NonPublic')
+$firstOverlapHash = $protocolExceptionType.GetProperty('FirstOverlapPrefabHash',
+    [Reflection.BindingFlags]'Instance,NonPublic')
+$secondOverlapHash = $protocolExceptionType.GetProperty('SecondOverlapPrefabHash',
+    [Reflection.BindingFlags]'Instance,NonPublic')
+foreach ($overlapY in @(0, 4, 255)) {
+    # Expanded mod slots remain valid. Only shared coordinates are rejected.
+    [byte[]]$separateSlots = New-InventoryOverlapFixture -SecondX 1 -Y $overlapY
+    Invoke-OneArgument $validateInventory $profileCodec $separateSlots | Out-Null
+    [byte[]]$overlapBytes = New-InventoryOverlapFixture -Y $overlapY
+    [byte[]]$overlapBefore = $overlapBytes.Clone()
+    $overlapError = Assert-ThrowsLike `
+        { Invoke-OneArgument $validateInventory $profileCodec $overlapBytes } `
+        '*overlapping items*' 'Shared inventory coordinates were accepted.'
+    Assert-True ($overlapError.GetType() -eq $protocolExceptionType -and
+        $overlapFlag.GetValue($overlapError) -and
+        $firstOverlapHash.GetValue($overlapError) -eq [Valheim107Fixture]::Hash('Stone') -and
+        $secondOverlapHash.GetValue($overlapError) -eq [Valheim107Fixture]::Hash('Coal')) `
+        'Typed overlap diagnostics do not identify both colliding prefabs.'
+    foreach ($detail in @("Zero-based slot (0, $overlapY), 2 items", 'item #1', 'item #2',
+        ('prefabHash=0x{0:X8}' -f [Valheim107Fixture]::Hash('Stone')),
+        ('prefabHash=0x{0:X8}' -f [Valheim107Fixture]::Hash('Coal')),
+        'stack=7, quality=2, worldLevel=1', 'stack=3, quality=3, worldLevel=7')) {
+        Assert-True ($overlapError.Message.Contains($detail)) "Missing overlap diagnostic: $detail"
+    }
+    Assert-True (-not $overlapError.Message.Contains('private')) `
+        'Overlap diagnostics exposed crafter or custom data.'
+    $overlapInner = New-InnerPlayerDataFixture $overlapBytes
+    [byte[]]$overlapProfile = New-PlayerProfilePayload `
+        -CharacterName 'FastPathHero' -PlayerId ([long]76561198000000001) -PlayerData $overlapInner.Bytes
+    $fullOverlapError = Assert-ThrowsLike `
+        { Invoke-TwoArguments $validateSnapshot $profileCodec $identity $overlapProfile } `
+        '*overlapping items*' 'Full-profile validation accepted shared inventory coordinates.'
+    Assert-True ($overlapFlag.GetValue($fullOverlapError) -and
+        $fullOverlapError.Message -ceq $overlapError.Message -and
+        (Test-ByteArrayEqual $overlapBytes $overlapBefore)) `
+        'Full and inventory overlap classification differ, or rejected input was modified.'
+}
+Write-Output 'Overlap diagnostics: both items, original/expanded slots, full-profile parity and private-data exclusion passed.'
+
 [byte[]]$replacementInventory = New-InventorySnapshotBytes `
     -PrefabName "FastInventoryItem" `
     -Stack 7 `
@@ -653,6 +713,8 @@ $trailingError = Assert-ThrowsLike `
     "The standalone inventory parser accepted trailing bytes."
 Assert-True ($trailingError.GetType() -eq $protocolExceptionType) `
     "Trailing inventory bytes did not fail as a protocol error."
+Assert-True (-not $overlapFlag.GetValue($trailingError)) `
+    'An unrelated format failure was classified as a retryable overlap.'
 
 [byte[]]$oversizedInventory = [byte[]]::new(
     $maximumInventoryBytes + 1)

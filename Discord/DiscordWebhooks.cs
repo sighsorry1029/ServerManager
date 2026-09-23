@@ -488,8 +488,6 @@ namespace ServerManager.Discord
                     }
                     if (!EventMessageText.TryFormat(value, storyPlayer, storyOther, language, out title))
                         title = "Server event";
-                    description = value.Reliability == "client_reported"
-                        ? PlayerLocalizer.TextForLanguage(language, "sm_event_client_report") : string.Empty;
                     break;
                 case "raid.started": case "raid.ended":
                     // Bound external translations before appending the subject
@@ -530,7 +528,7 @@ namespace ServerManager.Discord
                     break;
                 case "security.detection":
                     title = "Security observation — " + player;
-                    description = Diagnostic(value, anonymous, "Security finding") + ReportSuffix(value);
+                    description = Diagnostic(value, anonymous, "Security finding");
                     break;
                 case "security.response":
                     title = "Security response — " + player;
@@ -651,9 +649,6 @@ namespace ServerManager.Discord
             string text = Clean(value).Replace('\n', ' ').Replace('\r', ' ').Replace('\t', ' ').Trim();
             return text.Length == 0 ? fallback : Limit(text, length);
         }
-
-        private static string ReportSuffix(ServerManagerEvent value) =>
-            value.Reliability == "client_reported" ? " (client report)" : string.Empty;
 
         private static string Diagnostic(ServerManagerEvent value, bool anonymous, string fallback)
         {

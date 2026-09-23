@@ -416,9 +416,21 @@ internal static partial class ServerManagerRuntime
             if (action.AwaitTeleport && Player.m_localPlayer.IsTeleporting()) return;
             if (action.Capture == 0)
             {
+                if (!client.InventoryOverlapRetry.CanAttempt(now)) return;
                 EnsureCharacterCodecs();
                 client.ManagedProfile!.SaveLogoutPoint();
-                byte[] profile = _profileCodec!.CaptureProfileToBytes(client.ManagedProfile!, Player.m_localPlayer);
+                byte[] profile;
+                try
+                {
+                    profile = _profileCodec!.CaptureProfileToBytes(client.ManagedProfile!, Player.m_localPlayer);
+                }
+                catch (CharacterProtocolException error) when (error.IsInventoryOverlap)
+                {
+                    // The action already ran. Retry capture only, within both
+                    // the shared overlap grace and this action's own deadline.
+                    if (!TryDeferClientInventoryOverlap(client, error)) throw;
+                    return;
+                }
                 action.Capture = OfferClientSave(client, profile, ClientCharacterSaveReason.Vanilla);
             }
             if (!client.SavePipeline.HasAcknowledgedCapture(action.Capture)) return;

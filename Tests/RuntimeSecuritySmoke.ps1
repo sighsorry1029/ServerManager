@@ -2497,6 +2497,28 @@ Assert-True (
     $startFinalDispatchCall.Offset -lt $sendFinalDispatchCall.Offset -and
     $postGateRecaptureCalls.Count -eq 0) `
     "The final-save Ready path no longer settles, drains, captures, and dispatches atomically."
+$retryPendingGuard = $processDeferredExitCalls |
+    Where-Object { $_.Operand.Name -eq 'get_FinalCaptureRetryPending' } | Select-Object -First 1
+$finalRetryTimeGate = $processDeferredExitCalls |
+    Where-Object { $_.Operand.Name -eq 'CanAttempt' -and $_.Operand.DeclaringType.FullName -eq
+        'ServerManager.ClientInventoryOverlapRetry' } | Select-Object -First 1
+Assert-True ($null -ne $finalRetryTimeGate -and $finalRetryTimeGate.Offset -lt $settleDeathCall.Offset) `
+    'A prior periodic overlap can defer the first final capture after the world was already settled.'
+$retryMutationGuard = $processDeferredExitCalls |
+    Where-Object { $_.Operand.Name -eq 'get_InventoryChangedAfterQuiescence' } | Select-Object -First 1
+$retryMutationFailure = $processDeferredExitDefinition.Body.Instructions |
+    Where-Object { $_.OpCode.Name -eq 'ldstr' -and $_.Operand -eq
+        'Client inventory changed while waiting to retry the final snapshot.' } | Select-Object -First 1
+$retryMutationBranch = Get-FirstConditionalBranch $retryMutationGuard $retryMutationFailure
+Assert-True ($null -ne $retryPendingGuard -and $null -ne $retryMutationGuard -and
+    $null -ne $retryMutationFailure -and $null -ne $retryMutationBranch -and
+    $retryPendingGuard.Offset -lt $retryMutationGuard.Offset -and
+    $retryMutationFailure.Offset -lt $resetPostBarrierInventoryGuard.Offset -and
+    @(Get-CecilSuccessors $retryMutationBranch | Where-Object {
+        Test-CecilReachable $_ $retryMutationFailure
+    }).Count -eq 1 -and
+    -not (Test-CecilReachable $retryMutationFailure $resetPostBarrierInventoryGuard)) `
+    'Final-capture retries can erase mutations made after the previous world drain.'
 $afterInventoryDefinition = $runtimeDefinition.Methods |
     Where-Object Name -eq "AfterInventoryChanged"
 $postBarrierInventoryMarker = $afterInventoryDefinition.Body.Instructions |

@@ -3,6 +3,60 @@ using System.Collections.Generic;
 
 namespace ServerManager;
 
+/// <summary>
+/// A local capture retry clock, independent of network pacing and ACKs.
+/// Dirty notifications cannot extend the first failure's fixed deadline.
+/// </summary>
+internal sealed class ClientInventoryOverlapRetry
+{
+    internal const int GraceSeconds = 10;
+    internal const int RetrySeconds = 1;
+    internal const int WarningIntervalSeconds = 30;
+    private readonly long _graceTicks;
+    private readonly long _retryTicks;
+    private readonly long _warningTicks;
+    private long _deadline;
+    private long _nextAttempt;
+    private long _nextWarning;
+
+    internal ClientInventoryOverlapRetry(long frequency)
+    {
+        if (frequency <= 0) throw new ArgumentOutOfRangeException(nameof(frequency));
+        _graceTicks = checked(frequency * GraceSeconds);
+        _retryTicks = checked(frequency * RetrySeconds);
+        _warningTicks = checked(frequency * WarningIntervalSeconds);
+    }
+
+    internal CharacterProtocolException? LastError { get; private set; }
+    internal bool Pending => LastError != null;
+    internal bool CanAttempt(long now) => !Pending || (now >= _nextAttempt && !HasExpired(now));
+    internal bool HasExpired(long now) => Pending && now >= _deadline;
+
+    internal bool TryDefer(CharacterProtocolException error, long now, out bool warn)
+    {
+        warn = false;
+        if (!error.IsInventoryOverlap) return false;
+        if (!Pending) _deadline = checked(now + _graceTicks);
+        LastError = error;
+        if (HasExpired(now)) return false;
+        _nextAttempt = checked(now + _retryTicks);
+        if (now >= _nextWarning)
+        {
+            _nextWarning = checked(now + _warningTicks);
+            warn = true;
+        }
+        return true;
+    }
+
+    internal void Clear()
+    {
+        LastError = null;
+        _deadline = 0;
+        _nextAttempt = 0;
+        // Keep the warning cooldown across short repeated episodes.
+    }
+}
+
 internal enum ClientCharacterSaveReason
 {
     Vanilla = 1,

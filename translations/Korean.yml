@@ -32,6 +32,7 @@ sm_fresh_character_required: "선택한 계정과 이름에 해당하는 서버 
 sm_character_apply_failed: "서버 캐릭터를 불러오거나 적용하지 못했습니다. 다시 접속하세요. 문제가 계속되면 서버 관리자에게 문의하세요."
 sm_character_load_unsafe: "캐릭터 로딩이 완료되지 않아 입장을 중단하고 저장을 차단했습니다. 모드 호환성을 확인한 뒤 발헤임을 다시 실행하세요. 자세한 원인은 ServerManager 로그를 확인하거나 서버 관리자에게 문의하세요."
 sm_character_save_failed: "서버에서 캐릭터 저장을 승인하지 못했습니다. 다시 접속하세요. 문제가 계속되면 서버 관리자에게 문의하세요."
+sm_character_inventory_overlap: "잠시 재시도했지만 같은 인벤토리 칸에 아이템이 겹쳐 있습니다. 문제가 있는 캐릭터 상태는 서버로 전송하지 않았습니다. 인벤토리 모드와 ServerManager 로그를 확인한 뒤 다시 접속하세요."
 sm_character_active: "이미 접속 중인 캐릭터입니다. 이전 연결이 종료된 뒤 다시 시도하세요."
 sm_character_profile_limit: "접속 중인 캐릭터를 포함해 이 계정의 서버 캐릭터 수가 제한({0}개)에 도달했습니다. 서버 관리자에게 문의하세요."
 sm_character_restore_unavailable: "관리자가 복구 상태를 확인해야 하므로 이 캐릭터를 사용할 수 없습니다. 서버 관리자에게 문의하세요."

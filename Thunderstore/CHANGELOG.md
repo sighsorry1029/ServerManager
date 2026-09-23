@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1
+
+- Added inventory overlap diagnostics identifying the slot and both conflicting items, with local prefab names when available.
+- Added a brief client-side capture retry for overlapping inventory items: once per second for up to 10 seconds, with warnings limited to once per 30 seconds. Invalid snapshots remain blocked, and existing save and logout deadlines still apply.
+- Removed the redundant "Client report" labels from Discord combat and security webhook cards.
+- Simplified anonymous webhook prefix validation and scheduler state handling while preserving configuration and saved schedule identities.
+
 ## 1.1.0
 
 - Added detailed character-save errors with the affected inventory item number, slot, saved prefab hash and flag values.
