@@ -826,19 +826,9 @@ namespace ServerManager.Discord
 
         private static bool ValidAnonymousPrefix(string raw)
         {
-            if (raw.Trim().Length > 32) return false;
             // Defend direct DTO callers too; settings perform the same check
             // before trimming the YAML scalar and retaining the last good file.
-            for (int index = 0; index < raw.Length; ++index)
-            {
-                char value = raw[index];
-                bool pair = char.IsHighSurrogate(value) && index + 1 < raw.Length && char.IsLowSurrogate(raw[index + 1]);
-                if ((char.IsSurrogate(value) && !pair) || char.IsControl(value)) return false;
-                UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(raw, index);
-                if (category == UnicodeCategory.Format || category == UnicodeCategory.LineSeparator || category == UnicodeCategory.ParagraphSeparator) return false;
-                if (pair) ++index;
-            }
-            return true;
+            return raw.Trim().Length <= 32 && DiscordSettings.HasValidAnonymousPrefixCharacters(raw);
         }
 
         private static string OperatorAccount(ServerManagerEvent value)

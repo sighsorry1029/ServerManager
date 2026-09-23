@@ -304,6 +304,16 @@ internal sealed class DiscordSettings
         if (!route.TryGetValue("anonymous_prefix", out YamlNode node)) return string.Empty;
         string prefix = Scalar(node, location + ".anonymous_prefix");
         string raw = ((YamlScalarNode)node).Value!;
+        if (!HasValidAnonymousPrefixCharacters(raw))
+            throw Invalid(location + " has an invalid anonymous prefix");
+        if (prefix.Length > 32) throw Invalid(location + " anonymous prefix exceeds 32 characters");
+        return prefix;
+    }
+
+    // Shared by YAML parsing and direct webhook DTO admission. Each caller
+    // retains its own length check, error reporting and invalid-route handling.
+    internal static bool HasValidAnonymousPrefixCharacters(string raw)
+    {
         // Validate before trimming so trailing controls cannot be hidden by
         // normalization. Preserve printable Unicode, including paired surrogates.
         for (int index = 0; index < raw.Length; ++index)
@@ -311,14 +321,13 @@ internal sealed class DiscordSettings
             char value = raw[index];
             bool pair = char.IsHighSurrogate(value) && index + 1 < raw.Length && char.IsLowSurrogate(raw[index + 1]);
             if (char.IsSurrogate(value) && !pair || char.IsControl(value))
-                throw Invalid(location + " has an invalid anonymous prefix");
+                return false;
             UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(raw, index);
             if (category == UnicodeCategory.Format || category == UnicodeCategory.LineSeparator || category == UnicodeCategory.ParagraphSeparator)
-                throw Invalid(location + " has an invalid anonymous prefix");
+                return false;
             if (pair) ++index;
         }
-        if (prefix.Length > 32) throw Invalid(location + " anonymous prefix exceeds 32 characters");
-        return prefix;
+        return true;
     }
 
     private static Dictionary<string, YamlNode> Section(Dictionary<string, YamlNode> parent,
