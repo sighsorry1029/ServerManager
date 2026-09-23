@@ -22,10 +22,34 @@ internal static class ServerScheduleJournalSmoke
     {
         try
         {
-            CanonicalFileName(); LiveAliases(); Resume(); Interrupted(); Mutation(); CompletionCoverage(); Integrity(); ClocksAndBounds();
+            PersistedIdentityCompatibility(); CanonicalFileName(); LiveAliases(); Resume(); Interrupted(); Mutation(); CompletionCoverage(); Integrity(); ClocksAndBounds();
             Console.WriteLine("PASS: durable cron journal " + _checks + " assertions; isolated temporary files only."); return 0;
         }
         catch (Exception error) { Console.Error.WriteLine(error); return 1; }
+    }
+    private static void PersistedIdentityCompatibility()
+    {
+        // Captured from the compiled pre-refactor scheduler (c3c937f source).
+        // A fingerprint change would reset existing ready/pending journal cursors.
+        var cases = new[]
+        {
+            new { Command = "announce Hello", GameTime = false,
+                Id = "announce-d3996d060b6657f12186a3f824f92d10ddc7fc5b",
+                Fingerprint = "1ba5cc9d3bbea23e1e9fa379edf83df69381bb5aa0e85e2e5b813e50b0f2548c" },
+            new { Command = "zones_reset start", GameTime = false,
+                Id = "zones_reset-81d7c16b040cf7569778320d9a1d289b80555a16",
+                Fingerprint = "8ddd3efccc00ea31b3f9bb2bd2646bba3eef6a9d525fd206d23da1f3f3ca7614" },
+            new { Command = "world_clean", GameTime = true,
+                Id = "world_clean-369cf8ae831628bbe94db6aa79070d3540165fca",
+                Fingerprint = "bcbe48af61406d59f3e3133167f76ece5540ccf53793339dc2433c8d472fbb4c" }
+        };
+        foreach (var item in cases)
+        {
+            ServerScheduleSettings settings = Settings(game: item.GameTime, command: item.Command);
+            ServerScheduleJob job = settings.Jobs[0];
+            Check(job.Id == item.Id && ServerScheduleJournal.Fingerprint(settings, job) == item.Fingerprint,
+                "Persisted job identity must retain the pre-refactor format: " + item.Command);
+        }
     }
     private static void CanonicalFileName()
     {

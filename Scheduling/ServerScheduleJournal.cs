@@ -122,7 +122,7 @@ internal sealed class ServerScheduleJournal : IDisposable
                     _dirty = true;
                 }
                 else if (record.State != "running" && record.State != "needs_review" &&
-                    (record.Fingerprint != fingerprint || record.State == "pending" && (!job.CatchUp || !job.Enabled)))
+                    (record.Fingerprint != fingerprint || record.State == "pending" && !job.CatchUp))
                 {
                     record.Fingerprint = fingerprint; record.GameTime = job.UseGameTime; record.Maintenance = job.Maintenance;
                     Reset(record, now); _dirty = true;
@@ -139,7 +139,7 @@ internal sealed class ServerScheduleJournal : IDisposable
             Check(); Dictionary<string, DateTime> result = new(StringComparer.Ordinal);
             foreach (ServerScheduleJob job in settings.Jobs)
             {
-                if (!job.Enabled || !job.CatchUp || !Records.TryGetValue(job.Id, out Record record) ||
+                if (!job.CatchUp || !Records.TryGetValue(job.Id, out Record record) ||
                     record.Fingerprint != Fingerprint(settings, job)) continue;
                 if (record.State == "ready") result.Add(job.Id, record.Cursor);
                 else if (record.State == "pending" && record.Due.HasValue)

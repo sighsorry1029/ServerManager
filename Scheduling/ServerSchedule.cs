@@ -145,8 +145,8 @@ jobs: []
                 List<string> bannedKeys = job.TryGetValue("bannedGlobalKeys", out YamlNode banned) ? Keys(banned) : new();
                 string id = CreateId(cron, commands, chance, gameTime, gameTime ? "UTC" : timeZone.Id, requiredKeys, bannedKeys);
                 if (!ids.Add(id)) throw Invalid("identical job definitions are not supported");
-                jobs.Add(new ServerScheduleJob(id, cron, expression, commands, true,
-                    chance, gameTime, requiredKeys, bannedKeys, maintenance, maintenance, Boolean(job, "log", logJobs)));
+                jobs.Add(new ServerScheduleJob(id, cron, expression, commands,
+                    chance, gameTime, requiredKeys, bannedKeys, maintenance, Boolean(job, "log", logJobs)));
             }
         }
         return new ServerScheduleSettings(timeZone, interval, logSkipped, jobs);
@@ -371,29 +371,31 @@ internal sealed class ServerScheduleJob
     public string Cron { get; }
     internal CronExpression Expression { get; }
     public IReadOnlyList<string> Commands { get; }
-    public bool Enabled { get; }
+    // Parsed jobs are active; commenting out/removing a job disables it.
+    // Keep these derived values for the existing journal fingerprint contract.
+    public bool Enabled => true;
     public double Chance { get; }
     public bool UseGameTime { get; }
-    public bool CatchUp { get; }
+    public bool CatchUp => Maintenance;
     public bool Maintenance { get; }
     public bool Log { get; }
     public IReadOnlyList<string> GlobalKeys { get; }
     public IReadOnlyList<string> BannedGlobalKeys { get; }
 
     internal ServerScheduleJob(string id, string cron, CronExpression expression, List<string> commands,
-        bool enabled, double chance, bool gameTime, List<string> globalKeys, List<string> bannedGlobalKeys,
-        bool catchUp = false, bool maintenance = false, bool log = true)
+        double chance, bool gameTime, List<string> globalKeys, List<string> bannedGlobalKeys,
+        bool maintenance = false, bool log = true)
     {
         Id = id; Cron = cron; Expression = expression; Commands = commands.AsReadOnly();
-        Enabled = enabled; Chance = chance; UseGameTime = gameTime;
-        CatchUp = catchUp; Maintenance = maintenance;
+        Chance = chance; UseGameTime = gameTime;
+        Maintenance = maintenance;
         Log = log;
         GlobalKeys = globalKeys.AsReadOnly(); BannedGlobalKeys = bannedGlobalKeys.AsReadOnly();
     }
 
     internal bool SameAs(ServerScheduleJob other) => Id == other.Id && Cron == other.Cron &&
-        Enabled == other.Enabled && Chance == other.Chance && UseGameTime == other.UseGameTime &&
-        CatchUp == other.CatchUp && Maintenance == other.Maintenance &&
+        Chance == other.Chance && UseGameTime == other.UseGameTime &&
+        Maintenance == other.Maintenance &&
         Commands.SequenceEqual(other.Commands) && GlobalKeys.SequenceEqual(other.GlobalKeys) &&
         BannedGlobalKeys.SequenceEqual(other.BannedGlobalKeys);
 }
@@ -422,7 +424,7 @@ internal sealed class ServerScheduleEngine
         internal readonly TimeZoneInfo Zone;
         internal DateTime? Next;
         internal State(ServerScheduleJob job, TimeZoneInfo zone, DateTime now)
-        { Job = job; Zone = zone; Next = job.Enabled ? job.Expression.GetNextOccurrence(now, zone) : null; }
+        { Job = job; Zone = zone; Next = job.Expression.GetNextOccurrence(now, zone); }
     }
     private Dictionary<string, State> _states = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _claims = new(StringComparer.Ordinal);
@@ -492,7 +494,7 @@ internal sealed class ServerScheduleEngine
         ValidateClocks(utcNow, gameUtcNow);
         if (!_states.TryGetValue(jobId, out State state)) return;
         DateTime now = state.Job.UseGameTime ? gameUtcNow : utcNow;
-        state.Next = state.Job.Enabled ? state.Job.Expression.GetNextOccurrence(now, state.Zone) : null;
+        state.Next = state.Job.Expression.GetNextOccurrence(now, state.Zone);
         // Operator acknowledgement affects only the reviewed job's timer. Other
         // queued/running occurrences retain their claims and captured definitions.
     }
