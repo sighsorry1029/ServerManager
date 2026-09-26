@@ -71,7 +71,8 @@ namespace ServerManager.PlayerLogging
         public long MaximumFileBytes { get; set; } = 32L * 1024L * 1024L;
 
         /// <summary>
-        /// Total character/date and same-day segment files retained per Steam account.
+        /// Total character/date and same-day segments retained per Steam account,
+        /// including gzip archives. A publication-recovery pair counts once.
         /// </summary>
         public int MaximumFilesPerPlayer { get; set; } = 30;
 

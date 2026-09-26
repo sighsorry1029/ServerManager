@@ -490,6 +490,12 @@ try {
     }
     Assert-True (Test-CallsMethod $writeInventoryDetail $activityFullName "TryWriteBlock") `
         "The detailed inventory snapshot is not emitted as one atomic block."
+    Assert-True (Test-CallsMethod $writeInventoryDetail $activityFullName "HashInventoryDetail") `
+        "Repeated full inventory bodies are no longer compared with a bounded fingerprint."
+    Assert-True (Test-ReferencesMember $writeInventoryDetail "set_LastInventorySnapshotCheckTimestamp") `
+        "Skipped/rejected inventory checks no longer advance their independent timer."
+    Assert-True (Test-CallsMethod $writeInventoryDetail $writerType.FullName "GetStatistics") `
+        "Inventory deduplication no longer observes asynchronous disk write failures."
     Assert-True (Test-CallsMethod $appendInventoryDetail $activityFullName "InventoryItemName") `
         "Detailed inventory output no longer resolves saved item hashes to prefab names."
     $inventoryItemName = Get-MethodDefinition $activityType "InventoryItemName"
@@ -983,14 +989,14 @@ try {
                 "Register") -eq 6) `
         "The reviewed custom RPC registration count changed; inspect it for client telemetry."
 
-    # Execute the actual cadence/prefix methods and state constructor in memory.
+    # Execute the actual cadence/prefix/inventory methods and state constructor in memory.
     # Only the game objects, clock, log sink and unrelated activity producers are
     # inert boundaries; the scheduling and validation logic is not copied.
     $activitySource = Get-Content -LiteralPath (
         Join-Path $projectRoot 'PlayerLogging/PlayerActivityRuntime.cs') -Raw
     $coordinateImplementation = foreach ($fieldName in @(
             'CoordinateIntervalSeconds', 'CoordinateInitialDelaySeconds',
-            'InventorySnapshotIntervalSeconds', '_coordinateIntervalTicks',
+            'InventorySnapshotIntervalSeconds', 'MaximumInventoryDetailEntries', '_coordinateIntervalTicks',
             '_coordinateInitialDelayTicks', '_inventorySnapshotTicks')) {
         $declaration = [regex]::Match($activitySource,
             '(?m)^    private (?:const|static readonly) \w+ ' + $fieldName + '\s*=[\s\S]*?;')
@@ -1000,10 +1006,11 @@ try {
     $coordinateImplementation += foreach ($methodName in @(
             'TickState', 'CompleteState', 'WritePosition', 'ActivityPrefix',
             'TryGetPosition', 'IsFinitePosition', 'SecondsToTicks', 'AddTicks',
-            'IsFinite', 'FormatFloat')) {
+            'IsFinite', 'FormatFloat', 'WriteInventoryDetailSnapshot',
+            'HashInventoryDetail', 'AppendInventoryDetail', 'QuoteJsonString', 'Invariant')) {
         $declarations = [regex]::Matches($activitySource,
             '(?m)^    private static [^\r\n]*\b' + $methodName + '\([\s\S]*?^    \}')
-        $expectedCount = if ($methodName -eq 'ActivityPrefix') { 2 } else { 1 }
+        $expectedCount = if ($methodName -eq 'ActivityPrefix') { 2 } elseif ($methodName -eq 'Invariant') { 3 } else { 1 }
         Assert-True ($declarations.Count -eq $expectedCount) `
             "Cannot source-link coordinate method $methodName unambiguously."
         $declarations | ForEach-Object Value
@@ -1017,9 +1024,26 @@ try {
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 public static class PlayerActivityCoordinateSmoke
 {
     private static readonly List<string> Messages = new List<string>();
+    private static readonly List<string[]> InventoryBlocks = new List<string[]>();
+    private static TimeZoneInfo _serverTimeZone = TimeZoneInfo.Local;
+    private static int BlockAttempts = 0;
+    private static DateTime LastBlockOccurredAtUtc;
+    private static FakeWriter _writer = new FakeWriter();
+    private static bool FailDuringNextEnqueue = false;
+    private sealed class FakeWriterStatistics { internal long WriteFailures; }
+    private sealed class FakeWriter
+    {
+        internal long WriteFailures = 0;
+        internal int StatisticsReads = 0;
+        internal FakeWriterStatistics GetStatistics() { ++StatisticsReads; return new FakeWriterStatistics { WriteFailures = WriteFailures }; }
+    }
     private const long DeathCorrelationTicks = 1000;
     private static bool AcceptWrites = true;
     private static class Stopwatch { internal const long Frequency = 1000; internal static long Now = 0; internal static long GetTimestamp() => Now; }
@@ -1033,19 +1057,44 @@ public static class PlayerActivityCoordinateSmoke
         internal int Reads = 0;
         internal Vector3 GetRefPos() { ++Reads; if (Unavailable) throw new InvalidOperationException(); return Position; }
     }
-    private sealed class CharacterSemanticSnapshot { }
+    private sealed class CharacterSemanticSnapshot
+    {
+        internal List<CharacterSemanticItemState> Items = new List<CharacterSemanticItemState>();
+    }
+    private sealed class CharacterSemanticItemState
+    {
+        internal string PrefabName = "Wood";
+        internal int Stack = 1;
+        internal int Quality = 1;
+        internal int PositionX = 0;
+        internal int PositionY = 0;
+        internal float Durability = 100;
+        internal bool Equipped = false;
+        internal Dictionary<string, string> CustomData = new Dictionary<string, string>();
+    }
     private sealed class DamageCounterpart { }
     private static class IntegrityCanonical { internal static bool IsFatal(Exception exception) => false; }
     private static string Clip(string value, int maximumCharacters) => value;
     private static string FormatReason(string reason) => reason.Replace('_', ' ');
     private static bool TryEnsureLoginWritten(ActivityPeerState state) => true;
     private static void ClearRecentIncomingDamage(ActivityPeerState state) { }
-    private static void WriteInventoryDetailSnapshot(ActivityPeerState state, CharacterSemanticSnapshot snapshot, long now) { }
+    private static string InventoryItemName(CharacterSemanticItemState item) => item.PrefabName;
+    private static bool TryWriteBlock(ActivityPeerState state, DateTime occurredAtUtc, string header, IReadOnlyList<string> lines)
+    {
+        ++BlockAttempts;
+        if (!AcceptWrites) return false;
+        if (FailDuringNextEnqueue) { ++_writer.WriteFailures; FailDuringNextEnqueue = false; }
+        LastBlockOccurredAtUtc = occurredAtUtc;
+        InventoryBlocks.Add(lines.ToArray());
+        return true;
+    }
     private static bool TryWrite(ActivityPeerState state, string message) { if (!AcceptWrites) return false; Messages.Add(message); return true; }
     private static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException("Coordinate fixture: " + message); }
     private static ActivityPeerState Open(bool remote = true)
     {
         Messages.Clear(); AcceptWrites = true; Stopwatch.Now = 100000;
+        InventoryBlocks.Clear(); BlockAttempts = 0;
+        _writer = new FakeWriter(); FailDuringNextEnqueue = false;
         return new ActivityPeerState("account", "character", 1, remote ? new ZNetPeer() : null, remote ? null : new Player(), Stopwatch.Now, DateTime.UtcNow);
     }
     private static void Tick(ActivityPeerState state, long now) { Stopwatch.Now = now; TickState(state, now); }
@@ -1098,6 +1147,81 @@ public static class PlayerActivityCoordinateSmoke
         Require(Messages.Count == 1, "a later valid position did not recover at the next deadline");
         state = Open(); AcceptWrites = false; Tick(state, 105000);
         Require(!state.HasLoggedPosition && state.NextCoordinateTimestamp == 405000, "failed writes must not claim a logged position or cause a tight retry loop");
+
+        // Only successful full log blocks establish a deduplication baseline.
+        state = Open();
+        CharacterSemanticItemState item = new CharacterSemanticItemState();
+        item.CustomData.Add("z", "last"); item.CustomData.Add("a", "first");
+        CharacterSemanticSnapshot snapshot = new CharacterSemanticSnapshot();
+        snapshot.Items.Add(item); state.LatestSemanticSnapshot = snapshot;
+        WriteInventoryDetailSnapshot(state, snapshot, 100000);
+        Require(InventoryBlocks.Count == 1 && InventoryBlocks[0][0] == "  - Wood", "initial full inventory must be recorded and omit x1/Q1");
+        Require(InventoryBlocks[0][2].Contains("\"a\":") && InventoryBlocks[0][3].Contains("\"z\":"), "custom-data keys must have deterministic ordering");
+        Require(state.LastInventorySnapshotFingerprint?.Length == 32, "each session must retain only a bounded content fingerprint");
+        Require(state.LastInventorySnapshotLocalDate == TimeZoneInfo.ConvertTimeFromUtc(LastBlockOccurredAtUtc, _serverTimeZone).Date, "dedup date and queued block timestamp must agree");
+        Tick(state, 399999);
+        Require(BlockAttempts == 1, "inventory must not be checked before its own five-minute deadline");
+        item.CustomData.Clear(); item.CustomData.Add("a", "first"); item.CustomData.Add("z", "last");
+        item.Equipped = true; item.Durability = 1; state.Peer!.Position = new Vector3(90, 80, 70);
+        Tick(state, 400000);
+        Require(BlockAttempts == 1 && state.LastInventorySnapshotCheckTimestamp == 400000, "same visible body must ignore dictionary order, durability, equipment and coordinates while advancing the check timer");
+        Tick(state, 400001);
+        Require(BlockAttempts == 1 && state.LastInventorySnapshotCheckTimestamp == 400000, "deduplication must not produce a per-tick formatting loop");
+
+        item.Stack = 2; Tick(state, 700000);
+        Require(InventoryBlocks.Count == 2 && InventoryBlocks[1][0] == "  - Wood x2", "changed stack must be recorded");
+        item.Quality = 2; Tick(state, 1000000);
+        Require(InventoryBlocks.Count == 3 && InventoryBlocks[2][0] == "  - Wood x2 Q2", "changed quality must be recorded");
+        item.PrefabName = "Stone"; Tick(state, 1300000);
+        Require(InventoryBlocks.Count == 4 && InventoryBlocks[3][0] == "  - Stone x2 Q2", "changed prefab must be recorded");
+        string largeValue = new string('x', 65536) + "CUSTOM_DATA_END";
+        item.CustomData["a"] = largeValue; Tick(state, 1600000);
+        Require(InventoryBlocks.Count == 5 && InventoryBlocks[4][2].Contains(largeValue), "custom-data changes and large values must be preserved without truncation");
+        Require(!InventoryBlocks.SelectMany(lines => lines).Any(line => line.Contains("SHA-256") || line.Contains("fingerprint")), "dedup hashes must never appear in player logs");
+        byte[] acceptedFingerprint = state.LastInventorySnapshotFingerprint!;
+        item.CustomData["a"] = "after queue rejection"; AcceptWrites = false; Tick(state, 1900000);
+        Require(InventoryBlocks.Count == 5 && ReferenceEquals(state.LastInventorySnapshotFingerprint, acceptedFingerprint) && state.LastInventorySnapshotCheckTimestamp == 1900000, "queue rejection must retain the accepted baseline and advance the check timer");
+        int attemptsAfterRejection = BlockAttempts;
+        AcceptWrites = true; Tick(state, 1900001); Tick(state, 2199999);
+        Require(BlockAttempts == attemptsAfterRejection, "queue rejection must not retry a large block every tick");
+        Tick(state, 2200000);
+        Require(InventoryBlocks.Count == 6 && !ReferenceEquals(state.LastInventorySnapshotFingerprint, acceptedFingerprint), "a rejected changed body must recover at the next interval");
+
+        state.LastInventorySnapshotLocalDate = state.LastInventorySnapshotLocalDate.AddDays(-1);
+        Tick(state, 2500000);
+        Require(InventoryBlocks.Count == 7, "the first full block on a new local date must be logged even if unchanged");
+        Tick(state, 2800000);
+        Require(InventoryBlocks.Count == 7, "subsequent same-date unchanged blocks must be suppressed");
+        WriteInventoryDetailSnapshot(state, snapshot, 2800001, force: true);
+        Require(InventoryBlocks.Count == 8, "new managed listen-host session readiness must force its initial block");
+        ActivityPeerState reconnected = new ActivityPeerState("account", "character", 1, new ZNetPeer(), null, 2800002, DateTime.UtcNow);
+        WriteInventoryDetailSnapshot(reconnected, snapshot, 2800002);
+        Require(InventoryBlocks.Count == 9, "a new connection/session must not inherit the prior session's dedup baseline");
+        snapshot.Items.Clear(); WriteInventoryDetailSnapshot(reconnected, snapshot, 3100002);
+        Require(InventoryBlocks.Count == 10 && InventoryBlocks[9].Single() == "  - [empty]", "inventory becoming empty must be recorded");
+        WriteInventoryDetailSnapshot(reconnected, snapshot, 3400002);
+        Require(InventoryBlocks.Count == 10, "unchanged empty inventories must deduplicate too");
+
+        // Model an asynchronous append failure, including one racing enqueue.
+        state = Open(); state.LatestSemanticSnapshot = snapshot;
+        FailDuringNextEnqueue = true;
+        WriteInventoryDetailSnapshot(state, snapshot, 100000);
+        Require(state.LastInventorySnapshotWriteFailures == 0 && _writer.WriteFailures == 1, "failure baseline must be captured before queue acceptance, not after a fast disk failure");
+        Tick(state, 399999);
+        Require(_writer.StatisticsReads == 1, "writer statistics must not be polled before the five-minute inventory check");
+        Tick(state, 400000);
+        Require(InventoryBlocks.Count == 2 && state.LastInventorySnapshotWriteFailures == 1, "unchanged inventory must be retried after a post-queue disk failure");
+        Tick(state, 700000);
+        Require(InventoryBlocks.Count == 2, "recovered inventory must deduplicate once failure count is unchanged");
+        ++_writer.WriteFailures; AcceptWrites = false; Tick(state, 1000000);
+        Require(state.LastInventorySnapshotWriteFailures == 1 && state.LastInventorySnapshotCheckTimestamp == 1000000, "rejected recovery must not acknowledge the new disk-failure count or loop every tick");
+        int rejectedRecoveryAttempts = BlockAttempts;
+        AcceptWrites = true; Tick(state, 1000001);
+        Require(BlockAttempts == rejectedRecoveryAttempts, "rejected disk-failure recovery must respect the full check interval");
+        Tick(state, 1300000);
+        Require(InventoryBlocks.Count == 3 && state.LastInventorySnapshotWriteFailures == 2, "disk-failure recovery must survive an intervening queue rejection");
+        Tick(state, 1600000);
+        Require(InventoryBlocks.Count == 3, "successful recovery must restore normal deduplication");
     }
     // SOURCE_LINKED_COORDINATE_IMPLEMENTATION
 }
@@ -1108,7 +1232,7 @@ public static class PlayerActivityCoordinateSmoke
     [PlayerActivityCoordinateSmoke]::Run()
 
     Write-Host (
-        "Player activity integration smoke passed: five-second coordinate grace, five-minute stationary/moving Position cadence, live event prefixes, forced logout, per-character identity, atomic inventory blocks, and no new client telemetry surface.")
+        "Player activity integration smoke passed: five-second coordinate grace, five-minute Position cadence, live event prefixes, forced logout, per-character identity, accepted-body inventory deduplication/date rollover/retry cadence, intact custom data, atomic blocks, and no new client telemetry surface.")
 }
 finally {
     $assembly.Dispose()

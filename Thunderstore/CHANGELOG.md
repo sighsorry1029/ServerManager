@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.3
+
+- Reduced player-log size by skipping unchanged full inventory snapshots at the five-minute check, while keeping the first snapshot after joining or on a new local date.
+- Added background gzip compression for past-date player logs and completed size-split parts. Active logs stay plain text, and compression is verified before removing the original.
+- Preserved late-arriving records and existing log retention rules across compressed files, with recovery tests for failed writes and archive conflicts.
+- Kept individual inventory-change entries, character transfers, and save timing unchanged.
+
 ## 1.1.2
 
 - Allowed leading and trailing spaces in character names, preserving every space so distinct native profiles keep separate storage identities.

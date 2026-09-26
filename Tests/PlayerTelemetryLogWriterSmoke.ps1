@@ -192,26 +192,83 @@ function Get-ExpectedLine {
         [Globalization.CultureInfo]::InvariantCulture) + '] ' + $Message
 }
 
+# A completed segment may be compressed by the background worker. Logical
+# names remain stable: these helpers read either form without hiding duplicate
+# or conflicting source/archive fixtures in the dedicated gzip tests below.
+function Test-LogPath {
+    param([string]$Path)
+    return (Test-Path -LiteralPath $Path) -or
+        (Test-Path -LiteralPath ($Path + '.gz'))
+}
+
+function Read-LogBytes {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { $Path += '.gz' }
+    if (-not $Path.EndsWith('.gz', [StringComparison]::Ordinal)) {
+        return ,([IO.File]::ReadAllBytes($Path))
+    }
+    $inputStream = [IO.File]::OpenRead($Path)
+    try {
+        $gzip = [IO.Compression.GZipStream]::new(
+            $inputStream, [IO.Compression.CompressionMode]::Decompress)
+        try {
+            $outputStream = [IO.MemoryStream]::new()
+            try {
+                $gzip.CopyTo($outputStream)
+                return ,($outputStream.ToArray())
+            }
+            finally { $outputStream.Dispose() }
+        }
+        finally { $gzip.Dispose() }
+    }
+    finally { $inputStream.Dispose() }
+}
+
+function Read-LogText {
+    param([string]$Path)
+    return [Text.UTF8Encoding]::new($false, $true).GetString((Read-LogBytes $Path))
+}
+
+function Write-GzipFixture {
+    param([string]$Path, [byte[]]$Bytes)
+    $outputStream = [IO.File]::Open(
+        $Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    try {
+        $gzip = [IO.Compression.GZipStream]::new(
+            $outputStream, [IO.Compression.CompressionMode]::Compress)
+        try { $gzip.Write($Bytes, 0, $Bytes.Length) }
+        finally { $gzip.Dispose() }
+    }
+    finally { $outputStream.Dispose() }
+}
+
+function Wait-ForArchive {
+    param([string]$Path)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath $Path) -and
+        $watch.Elapsed -lt [TimeSpan]::FromSeconds(10)) {
+        [Threading.Thread]::Sleep(20)
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Background archive was not completed: $Path"
+    }
+}
+
 $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $testRoot = Join-Path $temporaryRoot `
     ('ServerManager-player-telemetry-smoke-' + [Guid]::NewGuid().ToString('N'))
 $playerKey = '76561198000000001'
 $characterName = 'halla'
 $playerId = [long]770260545
-$primaryDateUtc = [DateTime]::new(
-    2026,
-    8,
-    31,
-    23,
-    59,
-    0,
-    [DateTimeKind]::Utc)
+# Keep generic format/rotation fixtures outside the real past-date archive
+# sweep. Dedicated archive fixtures below use yesterday/today explicitly.
+$primaryDateUtc = [DateTime]::UtcNow.Date.AddDays(30).AddHours(23).AddMinutes(59)
 $nextDateUtc = $primaryDateUtc.AddDays(2)
 $primaryFileName = Get-LocalLogName $primaryDateUtc $characterName $playerId
 $nextFileName = Get-LocalLogName $nextDateUtc $characterName $playerId
 $logFilePattern = '^' +
     [regex]::Escape($characterName + '_' + $playerId + '_') +
-    '\d{4}-\d{2}-\d{2}\.log(?:\.\d{2,})?$'
+    '\d{4}-\d{2}-\d{2}\.log(?:\.\d{2,})?(?:\.gz)?$'
 
 try {
     $mainRoot = Join-Path $testRoot 'main'
@@ -300,14 +357,15 @@ try {
 
     $allLines = @()
     foreach ($file in $files) {
-        $bytes = [IO.File]::ReadAllBytes($file.FullName)
+        $bytes = Read-LogBytes $file.FullName
         if ($bytes.Length -ge 3 -and
             $bytes[0] -eq 0xef -and
             $bytes[1] -eq 0xbb -and
             $bytes[2] -eq 0xbf) {
             throw 'A player log file unexpectedly contains a UTF-8 BOM.'
         }
-        $allLines += @(Get-Content -LiteralPath $file.FullName)
+        $allLines += @(([Text.Encoding]::UTF8.GetString($bytes)).Split(
+            [char[]]@([char]10), [StringSplitOptions]::RemoveEmptyEntries))
     }
     if ($allLines.Count -lt 2) {
         throw 'The primary writer did not retain readable plain-text records.'
@@ -771,9 +829,9 @@ try {
         -not $rotationWriter.Stop([TimeSpan]::FromSeconds(5))) {
         throw 'The monotonic-rotation writer failed.'
     }
-    if ((Test-Path -LiteralPath ($rotationActivePath + '.02')) -or
-        -not (Test-Path -LiteralPath $rotationFourPath) -or
-        [IO.File]::ReadAllText($rotationFourPath) -ne $rotationActiveSeed) {
+    if ((Test-LogPath ($rotationActivePath + '.02')) -or
+        -not (Test-LogPath $rotationFourPath) -or
+        (Read-LogText $rotationFourPath) -ne $rotationActiveSeed) {
         throw 'Rotation reused a gap, shifted, or overwrote a segment.'
     }
 
@@ -839,8 +897,8 @@ try {
     $legacyCanonicalActivePath = Join-Path $legacyPlayerDirectory $primaryFileName
     if ((Test-Path -LiteralPath $olderUppercasePath) -or
         -not (Test-Path -LiteralPath $legacyCanonicalActivePath) -or
-        -not (Test-Path -LiteralPath ($legacyCanonicalActivePath + '.01')) -or
-        (Test-Path -LiteralPath ($legacyCanonicalActivePath + '.100'))) {
+        -not (Test-LogPath ($legacyCanonicalActivePath + '.01')) -or
+        (Test-LogPath ($legacyCanonicalActivePath + '.100'))) {
         throw 'Uppercase canonical retention or suffix-free rotation generations failed.'
     }
 
@@ -936,18 +994,319 @@ try {
     if (@(Get-ChildItem -LiteralPath $thirtyPlayerDirectory -File).Count -ne 30 -or
         (Test-Path -LiteralPath $thirtyOldestPath) -or
         -not (Test-Path -LiteralPath $thirtyActivePath) -or
-        -not (Test-Path -LiteralPath ($thirtyActivePath + '.01'))) {
+        -not (Test-LogPath ($thirtyActivePath + '.01'))) {
         throw 'Rotation did not count as file 31 or retention failed to remove the oldest account file.'
     }
     foreach ($retainedPath in $thirtyRetainedPaths) {
-        if (-not (Test-Path -LiteralPath $retainedPath) -or
-            [IO.File]::ReadAllText($retainedPath) -ne "retained-account-record`n") {
+        if (-not (Test-LogPath $retainedPath) -or
+            (Read-LogText $retainedPath) -ne "retained-account-record`n") {
             throw 'Account retention changed the surviving character/date/rotation groups.'
         }
     }
     if (@(Get-ChildItem -LiteralPath $otherAccountDirectory -File).Count -ne 1 -or
         [IO.File]::ReadAllText($otherAccountPath) -ne "other-account-record`n") {
         throw 'One Steam account retention budget removed another account log.'
+    }
+
+    # Startup maintenance must archive even an inactive account. Today's active
+    # file stays directly readable; completed segments archive regardless of date.
+    $archiveRoot = Join-Path $testRoot 'gzip-inactive-startup'
+    $archiveAccount = Join-Path $archiveRoot $playerKey
+    [IO.Directory]::CreateDirectory($archiveAccount) | Out-Null
+    $todayUtc = [DateTime]::Now.Date.AddHours(12).ToUniversalTime()
+    $yesterdayUtc = $todayUtc.AddDays(-1)
+    $archivePath = Join-Path $archiveAccount (
+        Get-LocalLogName $yesterdayUtc $characterName $playerId)
+    $todayPath = Join-Path $archiveAccount (
+        Get-LocalLogName $todayUtc $characterName $playerId)
+    $archiveText = "[12:00:00] [-1, 2, 3] Inventory:`n  - Wood x50`n" +
+        "    CustomData:`n      `"unicode`": `"" +
+        (-join [char[]]@(0xD55C, 0xAE00)) + "`"`n" + ('v' * 32768) + "`n"
+    $archiveBytes = [Text.UTF8Encoding]::new($false).GetBytes($archiveText)
+    [IO.File]::WriteAllBytes($archivePath, $archiveBytes)
+    [IO.File]::WriteAllText($todayPath, "today-stays-readable`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText(($todayPath + '.01'), "completed-segment`n", [Text.UTF8Encoding]::new($false))
+    $nonLogPath = Join-Path $archiveAccount 'notes.log'
+    [IO.File]::WriteAllText($nonLogPath, 'not a canonical player log', [Text.UTF8Encoding]::new($false))
+    $archiveWriter = [ServerManager.PlayerLogging.PlayerTelemetryLogWriter]::new()
+    try {
+        $archiveWriter.Initialize((New-WriterOptions $archiveRoot))
+        $archiveWriter.Start()
+        Wait-ForArchive ($archivePath + '.gz')
+        Wait-ForArchive ($todayPath + '.01.gz')
+        if (-not $archiveWriter.Stop([TimeSpan]::FromSeconds(5))) {
+            throw 'The inactive-account archive writer did not drain.'
+        }
+    }
+    finally { $archiveWriter.Dispose() }
+    if ((Test-Path -LiteralPath $archivePath) -or
+        (Test-Path -LiteralPath ($todayPath + '.01')) -or
+        -not (Test-Path -LiteralPath $todayPath) -or
+        (Test-Path -LiteralPath ($todayPath + '.gz')) -or
+        (Read-LogText $archivePath) -cne $archiveText -or
+        (Read-LogText ($todayPath + '.01')) -cne "completed-segment`n" -or
+        [IO.File]::ReadAllText($nonLogPath) -cne 'not a canonical player log') {
+        throw 'Startup gzip was not lossless, touched today/unknown files, or retained a verified source.'
+    }
+    if ((Get-Item -LiteralPath ($archivePath + '.gz')).Length -ge $archiveBytes.Length -or
+        @(Get-ChildItem -LiteralPath $archiveAccount -Filter '*.tmp' -File).Count -ne 0) {
+        throw 'A compressible inventory did not shrink or left an unfinished temporary archive.'
+    }
+
+    # Reopening an archived date preserves the old compressed bytes as a
+    # completed numbered segment. New events use one plain active .log again,
+    # avoiding a separate compressed segment for every delayed batch.
+    $archivedBefore = [Convert]::ToBase64String([IO.File]::ReadAllBytes($archivePath + '.gz'))
+    $lateWriter = [ServerManager.PlayerLogging.PlayerTelemetryLogWriter]::new()
+    try {
+        $lateWriter.Initialize((New-WriterOptions $archiveRoot))
+        $lateWriter.Start()
+        if (-not $lateWriter.TryWrite($playerKey, $characterName, $playerId,
+                $yesterdayUtc, 'late event after archive') -or
+            -not $lateWriter.Stop([TimeSpan]::FromSeconds(5))) {
+            throw 'A delayed event could not be written after archive completion.'
+        }
+    }
+    finally { $lateWriter.Dispose() }
+    if (-not (Test-Path -LiteralPath ($archivePath + '.01.gz')) -or
+        (Test-Path -LiteralPath ($archivePath + '.01')) -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($archivePath + '.01.gz')) -cne $archivedBefore -or
+        (Read-LogText $archivePath) -cne (
+            (Get-ExpectedLine $yesterdayUtc 'late event after archive') + "`n")) {
+        throw 'Late/clock-rollback logging altered the original archive or lost the new event.'
+    }
+    $lateArchiveWriter = [ServerManager.PlayerLogging.PlayerTelemetryLogWriter]::new()
+    try {
+        $lateArchiveWriter.Initialize((New-WriterOptions $archiveRoot))
+        $lateArchiveWriter.Start()
+        Wait-ForArchive ($archivePath + '.gz')
+        if (-not $lateArchiveWriter.Stop([TimeSpan]::FromSeconds(5))) {
+            throw 'The reopened-date archive writer did not drain.'
+        }
+    }
+    finally { $lateArchiveWriter.Dispose() }
+    if ((Test-Path -LiteralPath $archivePath) -or
+        (Read-LogText $archivePath) -cne (
+            (Get-ExpectedLine $yesterdayUtc 'late event after archive') + "`n")) {
+        throw 'The reopened past-date active file was not archived losslessly on the next sweep.'
+    }
+
+    # Simulate a clock rollback by supplying today's date with an archive
+    # already present. Its old bytes move aside, while today's new .log stays
+    # plain and accepts later batches without generating extra archives.
+    $rollbackRoot = Join-Path $testRoot 'gzip-clock-rollback'
+    $rollbackAccount = Join-Path $rollbackRoot $playerKey
+    [IO.Directory]::CreateDirectory($rollbackAccount) | Out-Null
+    $rollbackPath = Join-Path $rollbackAccount (
+        Get-LocalLogName $todayUtc $characterName $playerId)
+    Write-GzipFixture ($rollbackPath + '.gz') ([Text.Encoding]::UTF8.GetBytes("before-clock-rollback`n"))
+    $rollbackGzip = [Convert]::ToBase64String([IO.File]::ReadAllBytes($rollbackPath + '.gz'))
+    foreach ($message in @('rollback first', 'rollback second')) {
+        $rollbackWriter = [ServerManager.PlayerLogging.PlayerTelemetryLogWriter]::new()
+        try {
+            $rollbackWriter.Initialize((New-WriterOptions $rollbackRoot))
+            $rollbackWriter.Start()
+            if (-not $rollbackWriter.TryWrite($playerKey, $characterName, $playerId,
+                    $todayUtc, $message) -or
+                -not $rollbackWriter.Stop([TimeSpan]::FromSeconds(5))) {
+                throw 'The clock-rollback writer did not drain.'
+            }
+        }
+        finally { $rollbackWriter.Dispose() }
+    }
+    if (-not (Test-Path -LiteralPath $rollbackPath) -or
+        (Test-Path -LiteralPath ($rollbackPath + '.gz')) -or
+        (Test-LogPath ($rollbackPath + '.02')) -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($rollbackPath + '.01.gz')) -cne $rollbackGzip -or
+        (Read-LogText $rollbackPath) -cne (
+            (Get-ExpectedLine $todayUtc 'rollback first') + "`n" +
+            (Get-ExpectedLine $todayUtc 'rollback second') + "`n")) {
+        throw 'Clock rollback did not preserve compressed history and one plain active stream.'
+    }
+
+    # Existing .gz generations count when allocating a rotation suffix.
+    $compressedRotationRoot = Join-Path $testRoot 'gzip-generation'
+    $compressedRotationAccount = Join-Path $compressedRotationRoot $playerKey
+    [IO.Directory]::CreateDirectory($compressedRotationAccount) | Out-Null
+    $compressedActivePath = Join-Path $compressedRotationAccount $primaryFileName
+    [IO.File]::WriteAllText($compressedActivePath, $rotationActiveSeed, [Text.UTF8Encoding]::new($false))
+    Write-GzipFixture ($compressedActivePath + '.03.gz') (
+        [Text.Encoding]::UTF8.GetBytes("existing-generation-three`n"))
+    $compressedRotationWriter = [ServerManager.PlayerLogging.PlayerTelemetryLogWriter]::new()
+    try {
+        $compressedRotationWriter.Initialize((New-WriterOptions $compressedRotationRoot 512 600 10))
+        $compressedRotationWriter.Start()
+        if (-not $compressedRotationWriter.TryWrite($playerKey, $characterName, $playerId,
+                $primaryDateUtc, 'rotate after archived generation')) {
+            throw 'The compressed-generation writer rejected a valid event.'
+        }
+        Wait-ForArchive ($compressedActivePath + '.04.gz')
+        if (-not $compressedRotationWriter.Stop([TimeSpan]::FromSeconds(5))) {
+            throw 'The compressed-generation writer did not drain.'
+        }
+    }
+    finally { $compressedRotationWriter.Dispose() }
+    if (-not (Test-Path -LiteralPath ($compressedActivePath + '.04.gz')) -or
+        (Test-LogPath ($compressedActivePath + '.01')) -or
+        (Test-LogPath ($compressedActivePath + '.02')) -or
+        (Read-LogText ($compressedActivePath + '.03')) -cne "existing-generation-three`n" -or
+        (Read-LogText ($compressedActivePath + '.04')) -cne $rotationActiveSeed) {
+        throw 'A .gz generation was ignored, overwritten, or renumbered during rotation.'
+    }
+
+    # Recovery after a crash between archive rename and source deletion removes
+    # the source only after equality verification. A conflicting/corrupt .gz or
+    # a locked source must leave every original byte available for recovery.
+    $conflictRoot = Join-Path $testRoot 'gzip-crash-recovery'
+    $conflictAccount = Join-Path $conflictRoot $playerKey
+    [IO.Directory]::CreateDirectory($conflictAccount) | Out-Null
+    $conflictFixtures = @{}
+    foreach ($fixture in @('equal', 'different', 'corrupt', 'locked')) {
+        $fixturePath = Join-Path $conflictAccount (
+            Get-LocalLogName $yesterdayUtc $fixture ([long]9000))
+        $fixtureBytes = [Text.Encoding]::UTF8.GetBytes("original-$fixture`n")
+        [IO.File]::WriteAllBytes($fixturePath, $fixtureBytes)
+        if ($fixture -eq 'equal') { Write-GzipFixture ($fixturePath + '.gz') $fixtureBytes }
+        elseif ($fixture -eq 'different') {
+            Write-GzipFixture ($fixturePath + '.gz') ([Text.Encoding]::UTF8.GetBytes("different-content`n"))
+        }
+        elseif ($fixture -eq 'corrupt') {
+            [IO.File]::WriteAllBytes(($fixturePath + '.gz'), [byte[]]@(1, 2, 3, 4, 5))
+        }
+        $conflictFixtures[$fixture] = @{
+            Path = $fixturePath
+            Bytes = [Convert]::ToBase64String($fixtureBytes)
+            Gzip = if (Test-Path -LiteralPath ($fixturePath + '.gz')) {
+                [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixturePath + '.gz'))
+            } else { $null }
+        }
+    }
+    $lockedSource = [IO.File]::Open($conflictFixtures.locked.Path,
+        [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $archiveClosedLog = $writerType.GetMethod('ArchiveClosedLog',
+        [Reflection.BindingFlags]'Instance,NonPublic')
+    if ($null -eq $archiveClosedLog) { throw 'The archive primitive is unavailable.' }
+    $archiveVerifier = [ServerManager.PlayerLogging.PlayerTelemetryLogWriter]::new()
+    try {
+        # Invoke the exact worker primitive to exercise each failure path
+        # deterministically, without depending on filesystem enumeration order.
+        foreach ($fixture in @('equal', 'different', 'corrupt', 'locked')) {
+            $archiveFailed = $false
+            $archiveError = ''
+            try {
+                $archiveClosedLog.Invoke($archiveVerifier,
+                    [object[]]@([string]$conflictFixtures[$fixture].Path)) | Out-Null
+            }
+            catch {
+                $archiveFailed = $true
+                $archiveError = $_.Exception.ToString()
+            }
+            if ($archiveFailed -ne ($fixture -ne 'equal')) {
+                throw "Unexpected archive outcome for $fixture source/destination. $archiveError"
+            }
+        }
+        $archiveAttempt = $writerType.GetMethod('TryArchiveClosedLog',
+            [Reflection.BindingFlags]'Instance,NonPublic')
+        $archiveAttempt.Invoke($archiveVerifier,
+            [object[]]@([string]$conflictFixtures['different'].Path)) | Out-Null
+        if ($archiveVerifier.GetStatistics().WriteFailures -ne 0) {
+            throw 'An archive failure must not masquerade as a lost append and invalidate inventory baselines.'
+        }
+    }
+    finally { $archiveVerifier.Dispose(); $lockedSource.Dispose() }
+    foreach ($fixture in @('equal', 'different', 'corrupt', 'locked')) {
+        $saved = $conflictFixtures[$fixture]
+        if ($fixture -eq 'equal') {
+            if ((Test-Path -LiteralPath $saved.Path) -or
+                [Convert]::ToBase64String((Read-LogBytes $saved.Path)) -cne $saved.Bytes) {
+                throw 'An equal crash-recovery archive was not safely reconciled.'
+            }
+        }
+        elseif (-not (Test-Path -LiteralPath $saved.Path) -or
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($saved.Path)) -cne $saved.Bytes) {
+            throw "Archive failure deleted or changed the $fixture source."
+        }
+        if ($null -ne $saved.Gzip -and
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($saved.Path + '.gz')) -cne $saved.Gzip) {
+            throw "Archive recovery overwrote the $fixture destination."
+        }
+    }
+
+    # A surviving source/.gz pair represents one logical file, not two budget
+    # entries. A conflicting destination remains untouched until normal age-
+    # based retention evicts that complete logical group.
+    $pairedRoot = Join-Path $testRoot 'gzip-paired-retention'
+    $pairedAccount = Join-Path $pairedRoot $playerKey
+    [IO.Directory]::CreateDirectory($pairedAccount) | Out-Null
+    $pairedPath = Join-Path $pairedAccount (
+        Get-LocalLogName $primaryDateUtc.AddDays(-1) 'paired' 999)
+    [IO.File]::WriteAllText($pairedPath, 'retained source', [Text.UTF8Encoding]::new($false))
+    Write-GzipFixture ($pairedPath + '.gz') ([Text.Encoding]::UTF8.GetBytes('conflicting archive'))
+    foreach ($offset in @(0, 1)) {
+        $pairedWriter = [ServerManager.PlayerLogging.PlayerTelemetryLogWriter]::new()
+        try {
+            $pairedWriter.Initialize((New-WriterOptions $pairedRoot 2048 4096 2))
+            $pairedWriter.Start()
+            if (-not $pairedWriter.TryWrite($playerKey, $characterName, $playerId,
+                    $primaryDateUtc.AddDays($offset), 'retention probe') -or
+                -not $pairedWriter.Stop([TimeSpan]::FromSeconds(5))) {
+                throw 'The source/archive-pair retention writer did not drain.'
+            }
+        }
+        finally { $pairedWriter.Dispose() }
+        if ($offset -eq 0) {
+            if (@(Get-ChildItem -LiteralPath $pairedAccount -File).Count -ne 3 -or
+                -not (Test-Path -LiteralPath $pairedPath) -or
+                -not (Test-Path -LiteralPath ($pairedPath + '.gz'))) {
+                throw 'A source/archive pair consumed two retention slots.'
+            }
+        }
+        elseif (@(Get-ChildItem -LiteralPath $pairedAccount -File).Count -ne 2 -or
+            (Test-LogPath $pairedPath)) {
+            throw 'Retention failed to evict both members of the oldest logical group.'
+        }
+    }
+
+    # Never follow account-directory reparse points while sweeping. Junctions
+    # do not need Windows symlink privileges and the target is still entirely
+    # within this disposable fixture tree.
+    $junctionRoot = Join-Path $testRoot 'gzip-no-reparse'
+    $junctionTarget = Join-Path $testRoot 'gzip-junction-target'
+    [IO.Directory]::CreateDirectory($junctionRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($junctionTarget) | Out-Null
+    $junctionFile = Join-Path $junctionTarget (
+        Get-LocalLogName $yesterdayUtc $characterName $playerId)
+    [IO.File]::WriteAllText($junctionFile, 'outside logging root', [Text.UTF8Encoding]::new($false))
+    $junctionPath = Join-Path $junctionRoot $playerKey
+    $junctionCreated = $false
+    try {
+        try {
+            New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget -ErrorAction Stop | Out-Null
+            $junctionCreated = $true
+        }
+        catch {
+            Write-Host ('SKIP: account-junction archive test unavailable: ' + $_.Exception.Message)
+        }
+        if ($junctionCreated) {
+            $junctionWriter = [ServerManager.PlayerLogging.PlayerTelemetryLogWriter]::new()
+            try {
+                $junctionWriter.Initialize((New-WriterOptions $junctionRoot))
+                $junctionWriter.Start()
+                [Threading.Thread]::Sleep(500)
+                if (-not $junctionWriter.Stop([TimeSpan]::FromSeconds(5))) {
+                    throw 'The no-reparse archive writer did not drain.'
+                }
+            }
+            finally { $junctionWriter.Dispose() }
+            if (-not (Test-Path -LiteralPath $junctionFile) -or
+                (Test-Path -LiteralPath ($junctionFile + '.gz')) -or
+                [IO.File]::ReadAllText($junctionFile) -cne 'outside logging root') {
+                throw 'Startup archive followed an account-directory reparse point.'
+            }
+        }
+    }
+    finally {
+        if ($junctionCreated) { [IO.Directory]::Delete($junctionPath) }
     }
 
     # A timed-out Stop is terminal and Dispose waits for the original worker.
@@ -994,7 +1353,7 @@ try {
     $blockingCallback.Dispose()
 
     Write-Host (
-        'Player log writer smoke test passed: suffix-free Steam64/character/playerID/local-date routing, canonical filename safety, legacy suffix exclusion, [HH:mm:ss] plain format, compact inventory headers, exact CustomData log-to-YAML round-trip, atomic indented inventory blocks, control sanitization, UTF-8 no BOM, rotation, retention hard cap, crash-tail repair, and lifecycle drain passed.')
+        'Player log writer smoke test passed: canonical Steam64/character/playerID/local-date routing, plain UTF-8 formatting, compact lossless CustomData blocks, rotation/retention, inactive startup gzip, late-event archive preservation, compressed generation allocation, source/archive conflict recovery, logical-group retention, no-reparse sweep, crash-tail repair, and lifecycle drain passed.')
 }
 finally {
     $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)

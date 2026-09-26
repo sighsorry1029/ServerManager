@@ -687,6 +687,18 @@ and logout entries as well. Other events can include coordinates between those
 updates. Damage is recorded before resistances, with one decimal place and
 separate sent/received cooldowns.
 
-Up to 30 player-log files are kept per Steam account, including rotated parts.
-This is a file limit, not a 30-day limit. Logs can contain private player data;
-share them carefully.
+Full inventory details are checked every five minutes. Identical contents are
+not repeated, but the first snapshot after joining or on a new local date is
+always recorded. Item-count change lines (`Inv:`) still record each accepted
+change; character transfers and saves are unaffected.
+
+Today's active player log stays plain text. Completed size-split parts and past
+dates are compressed in the background as `.log.01.gz` and `.log.gz`. Existing
+past logs are processed gradually after startup and at the local date change.
+Extract a `.gz` file with an archive tool to read the original log. Compression
+is verified before removing the plain copy; failures leave the original intact.
+When late records arrive, the existing archive becomes a numbered part and new records use the plain active log.
+
+Up to 30 player-log files are kept per Steam account, including compressed and
+rotated parts. This is a file limit, not a 30-day limit. Server audit/chat logs
+are unchanged. Logs can contain private player data; share them carefully.

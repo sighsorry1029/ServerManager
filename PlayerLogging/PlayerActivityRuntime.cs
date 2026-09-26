@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using ServerManager.Events;
 using Steamworks;
@@ -52,6 +53,7 @@ internal static class PlayerActivityRuntime
     private static ObjectDB? _itemPrefabNameSource;
     private static bool _started;
     private static long _nextSweepTimestamp;
+    private static TimeZoneInfo _serverTimeZone = TimeZoneInfo.Local;
 
     internal static void Start(string dataRoot)
     {
@@ -104,6 +106,7 @@ internal static class PlayerActivityRuntime
         }
 
         _writer = writer;
+        _serverTimeZone = TimeZoneInfo.Local;
         _nextSweepTimestamp = Stopwatch.GetTimestamp();
         _started = true;
         ServerEventRuntime.AuthenticatedPlayerDeathPublished -=
@@ -395,7 +398,7 @@ internal static class PlayerActivityRuntime
         state.ManagedCharacterSessionId = session.SessionId;
         state.LatestSemanticSnapshot = snapshot;
         long now = Stopwatch.GetTimestamp();
-        WriteInventoryDetailSnapshot(state, snapshot, now);
+        WriteInventoryDetailSnapshot(state, snapshot, now, force: true);
     }
 
     internal static void OnLocalHostCharacterShadowAccepted(
@@ -555,7 +558,7 @@ internal static class PlayerActivityRuntime
 
         if (state.LatestSemanticSnapshot != null &&
             now >= AddTicks(
-                state.LastInventorySnapshotTimestamp,
+                state.LastInventorySnapshotCheckTimestamp,
                 _inventorySnapshotTicks))
         {
             WriteInventoryDetailSnapshot(
@@ -1204,8 +1207,20 @@ internal static class PlayerActivityRuntime
     private static void WriteInventoryDetailSnapshot(
         ActivityPeerState state,
         CharacterSemanticSnapshot snapshot,
-        long now)
+        long now,
+        bool force = false)
     {
+        // A skipped or rejected block still completes this five-minute check.
+        // The accepted-content baseline below advances only after queue success.
+        state.LastInventorySnapshotCheckTimestamp = now;
+        DateTime occurredAtUtc = DateTime.UtcNow;
+        DateTime localDate = TimeZoneInfo.ConvertTimeFromUtc(
+            occurredAtUtc, _serverTimeZone).Date;
+        // Queue acceptance is not disk acknowledgement. Any writer failure
+        // since the baseline conservatively permits the next full block again.
+        // Read before enqueueing so a fast asynchronous failure cannot become
+        // part of this block's successful baseline.
+        long writeFailures = _writer?.GetStatistics().WriteFailures ?? 0L;
         List<string> lines = new();
         int included = 0;
         IEnumerable<CharacterSemanticItemState> ordered = snapshot.Items
@@ -1229,13 +1244,58 @@ internal static class PlayerActivityRuntime
             lines.Add("  - [empty]");
         }
 
+        byte[] fingerprint = HashInventoryDetail(lines);
+        if (!force && state.LastInventorySnapshotLocalDate == localDate &&
+            state.LastInventorySnapshotWriteFailures == writeFailures &&
+            state.LastInventorySnapshotFingerprint != null &&
+            fingerprint.SequenceEqual(state.LastInventorySnapshotFingerprint))
+        {
+            return;
+        }
+
         if (TryWriteBlock(
                 state,
+                occurredAtUtc,
                 ActivityPrefix(state) + " Inventory:",
                 lines))
         {
-            state.LastInventorySnapshotTimestamp = now;
+            state.LastInventorySnapshotFingerprint = fingerprint;
+            state.LastInventorySnapshotLocalDate = localDate;
+            state.LastInventorySnapshotWriteFailures = writeFailures;
         }
+    }
+
+    private static byte[] HashInventoryDetail(IReadOnlyList<string> lines)
+    {
+        // Compare only the emitted body (not time/position, durability or
+        // equipment state). Retain 32 bytes per session, not a second copy of
+        // potentially large CustomData. The fingerprint is never logged.
+        using SHA256 hash = SHA256.Create();
+        using (CryptoStream stream = new(Stream.Null, hash, CryptoStreamMode.Write))
+        {
+            byte[] buffer = new byte[4096];
+            foreach (string line in lines)
+            {
+                for (int offset = 0; offset < line.Length;)
+                {
+                    int count = Math.Min(buffer.Length / 2, line.Length - offset);
+                    for (int index = 0; index < count; ++index)
+                    {
+                        char character = line[offset + index];
+                        buffer[index * 2] = (byte)character;
+                        buffer[index * 2 + 1] = (byte)(character >> 8);
+                    }
+
+                    stream.Write(buffer, 0, count * 2);
+                    offset += count;
+                }
+
+                stream.WriteByte((byte)'\n');
+                stream.WriteByte(0);
+            }
+        }
+
+        return hash.Hash!;
     }
 
     private static void AppendInventoryDetail(
@@ -1253,7 +1313,8 @@ internal static class PlayerActivityRuntime
         }
 
         lines.Add("    CustomData:");
-        foreach (KeyValuePair<string, string> pair in item.CustomData)
+        foreach (KeyValuePair<string, string> pair in item.CustomData
+                     .OrderBy(pair => pair.Key, StringComparer.Ordinal))
         {
             lines.Add(
                 "      " + QuoteJsonString(pair.Key) + ": " +
@@ -1648,6 +1709,7 @@ internal static class PlayerActivityRuntime
 
     private static bool TryWriteBlock(
         ActivityPeerState state,
+        DateTime occurredAtUtc,
         string header,
         IReadOnlyList<string> continuationLines)
     {
@@ -1663,7 +1725,7 @@ internal static class PlayerActivityRuntime
                 state.PlayerDirectoryKey,
                 state.CharacterName,
                 state.PlayerId,
-                DateTime.UtcNow,
+                occurredAtUtc,
                 Clip(header, MaximumLogMessageCharacters),
                 continuationLines);
         }
@@ -1961,7 +2023,10 @@ internal static class PlayerActivityRuntime
         internal Vector3 LastLoggedPosition { get; set; }
         internal bool HasObservedPosition { get; set; }
         internal Vector3 LastObservedPosition { get; set; }
-        internal long LastInventorySnapshotTimestamp { get; set; }
+        internal long LastInventorySnapshotCheckTimestamp { get; set; }
+        internal byte[]? LastInventorySnapshotFingerprint { get; set; }
+        internal DateTime LastInventorySnapshotLocalDate { get; set; }
+        internal long LastInventorySnapshotWriteFailures { get; set; }
         internal CharacterSemanticSnapshot? LatestSemanticSnapshot { get; set; }
         internal Guid ManagedCharacterSessionId { get; set; }
         internal long NextOutgoingDamageLogTimestamp { get; set; }

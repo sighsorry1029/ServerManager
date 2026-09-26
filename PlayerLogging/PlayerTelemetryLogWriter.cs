@@ -5,13 +5,15 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Text;
 using System.Threading;
 
 namespace ServerManager.PlayerLogging
 {
     /// <summary>
-    /// Bounded, asynchronous, per-player plain-text audit writer. TryWrite
+    /// Bounded, asynchronous, per-player audit writer with plain active logs
+    /// and losslessly compressed closed logs. TryWrite
     /// validates and formats one human-readable line; directory and file
     /// operations are confined to the background worker.
     /// </summary>
@@ -23,6 +25,7 @@ namespace ServerManager.PlayerLogging
         private const ulong MaximumIndividualSteamId64 =
             IndividualSteamId64Base + uint.MaxValue;
         private const string LogFileExtension = ".log";
+        private const string ArchiveExtension = ".gz";
         private static readonly UTF8Encoding Utf8WithoutBom =
             new UTF8Encoding(false, true);
 
@@ -38,6 +41,7 @@ namespace ServerManager.PlayerLogging
         private long _queueDrops;
         private long _byteBudgetDrops;
         private long _writeFailures;
+        private long _archiveFailures;
 
         private enum WriterState
         {
@@ -400,6 +404,7 @@ namespace ServerManager.PlayerLogging
 
         private void WriteLoop()
         {
+            IEnumerator<string>? archiveCandidates = null;
             try
             {
                 BlockingCollection<QueuedRecord>? queue = _queue;
@@ -412,8 +417,23 @@ namespace ServerManager.PlayerLogging
                 List<QueuedRecord> batch =
                     new List<QueuedRecord>(options.MaximumBatchEvents);
                 QueuedRecord? carried = null;
+                DateTime archiveSweepDate = default;
+                DateTime nextArchiveSweepUtc = DateTime.MinValue;
                 while (carried != null || !queue.IsCompleted)
                 {
+                    DateTime nowUtc = DateTime.UtcNow;
+                    DateTime localDate = TimeZoneInfo.ConvertTimeFromUtc(
+                        nowUtc, options.ServerTimeZone).Date;
+                    if (localDate != archiveSweepDate ||
+                        (archiveCandidates == null && nowUtc >= nextArchiveSweepUtc))
+                    {
+                        archiveCandidates?.Dispose();
+                        archiveCandidates = EnumerateClosedLogs(options.RootDirectory, localDate)
+                            .GetEnumerator();
+                        archiveSweepDate = localDate;
+                        nextArchiveSweepUtc = nowUtc.AddMinutes(1);
+                    }
+
                     QueuedRecord? first;
                     if (carried != null)
                     {
@@ -424,6 +444,7 @@ namespace ServerManager.PlayerLogging
                     {
                         if (!queue.TryTake(out first, 250))
                         {
+                            ArchiveNext(ref archiveCandidates);
                             continue;
                         }
 
@@ -482,6 +503,9 @@ namespace ServerManager.PlayerLogging
 
                     WriteBatch(batch, options);
                     batch.Clear();
+                    // Bound maintenance to one historical file between batches;
+                    // never drain every account before accepting new log writes.
+                    if (!queue.IsAddingCompleted) ArchiveNext(ref archiveCandidates);
                 }
             }
             catch (Exception exception) when (!IsFatal(exception))
@@ -494,6 +518,7 @@ namespace ServerManager.PlayerLogging
             }
             finally
             {
+                archiveCandidates?.Dispose();
                 BlockingCollection<QueuedRecord>? queue = _queue;
                 lock (_lifecycleGate)
                 {
@@ -565,7 +590,7 @@ namespace ServerManager.PlayerLogging
             }
         }
 
-        private static void WritePlayerBatch(
+        private void WritePlayerBatch(
             string playerDirectoryKey,
             List<QueuedRecord> records,
             FrozenOptions options)
@@ -618,17 +643,23 @@ namespace ServerManager.PlayerLogging
                 playerDirectory,
                 options.MaximumFilesPerPlayer,
                 protectedActivePaths);
+
+            // Past-date late arrivals remain appendable until the next sweep,
+            // rather than consuming a retention slot on every small batch.
         }
 
-        private static string WritePlayerDateBatch(
+        private string WritePlayerDateBatch(
             string playerDirectory,
             string localDateFileName,
             List<QueuedRecord> records,
             FrozenOptions options)
         {
-            string activePath = GetContainedFilePath(
+            string basePath = GetContainedFilePath(
                 playerDirectory,
                 localDateFileName);
+            // Preserve an archived day's earlier content as a closed segment,
+            // then reuse the ordinary plaintext active path for late arrivals.
+            string activePath = GetWritablePath(basePath);
             StringBuilder pending = new StringBuilder();
             long pendingBytes = 0;
             long activeBytes = GetRegularFileLength(activePath);
@@ -659,6 +690,7 @@ namespace ServerManager.PlayerLogging
                     }
 
                     Rotate(activePath);
+                    activePath = GetWritablePath(basePath);
                     activeBytes = 0;
                 }
 
@@ -725,7 +757,16 @@ namespace ServerManager.PlayerLogging
             }
         }
 
-        private static void Rotate(string activePath)
+        private static string GetWritablePath(string basePath)
+        {
+            string archive = basePath + ArchiveExtension;
+            EnsureRegularFileIfPresent(archive);
+            if (File.Exists(archive))
+                File.Move(archive, GetNextRotatedPath(basePath) + ArchiveExtension);
+            return basePath;
+        }
+
+        private void Rotate(string activePath)
         {
             EnsureRegularFileIfPresent(activePath);
             if (!File.Exists(activePath))
@@ -733,7 +774,9 @@ namespace ServerManager.PlayerLogging
                 return;
             }
 
-            File.Move(activePath, GetNextRotatedPath(activePath));
+            string rotatedPath = GetNextRotatedPath(activePath);
+            File.Move(activePath, rotatedPath);
+            TryArchiveClosedLog(rotatedPath);
         }
 
         private static string GetNextRotatedPath(string activePath)
@@ -753,7 +796,7 @@ namespace ServerManager.PlayerLogging
                          prefix + "*",
                          SearchOption.TopDirectoryOnly))
             {
-                string fileName = Path.GetFileName(candidate);
+                string fileName = WithoutArchiveSuffix(Path.GetFileName(candidate));
                 if (!fileName.StartsWith(prefix, StringComparison.Ordinal))
                 {
                     continue;
@@ -776,7 +819,7 @@ namespace ServerManager.PlayerLogging
                     ? StringComparison.OrdinalIgnoreCase
                     : StringComparison.Ordinal;
                 if (!string.Equals(
-                        Path.GetFullPath(candidate),
+                        WithoutArchiveSuffix(Path.GetFullPath(candidate)),
                         Path.GetFullPath(canonical),
                         comparison))
                 {
@@ -803,12 +846,203 @@ namespace ServerManager.PlayerLogging
                 CultureInfo.InvariantCulture);
         }
 
+        private static string WithoutArchiveSuffix(string path) =>
+            path.EndsWith(ArchiveExtension, StringComparison.Ordinal)
+                ? path.Substring(0, path.Length - ArchiveExtension.Length)
+                : path;
+
+        private IEnumerable<string> EnumerateClosedLogs(string root, DateTime localDate)
+        {
+            if (!Directory.Exists(root)) yield break;
+            EnsureRegularDirectory(root, "player log root");
+            foreach (string directory in Directory.EnumerateDirectories(root))
+            {
+                string[] paths;
+                try
+                {
+                    if (!IsValidIndividualSteam64(Path.GetFileName(directory)) ||
+                        (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                        continue;
+                    EnsureContained(directory, root);
+                    paths = Directory.GetFiles(directory);
+                }
+                catch (Exception exception) when (!IsFatal(exception))
+                {
+                    ReportArchiveFailure(exception);
+                    continue;
+                }
+                foreach (string path in paths)
+                {
+                    if (path.EndsWith(ArchiveExtension, StringComparison.Ordinal) ||
+                        !TryParseTelemetryFileName(Path.GetFileName(path), out DateTime date,
+                            out long generation) || (generation == 0 && date >= localDate))
+                        continue;
+                    yield return path;
+                }
+            }
+        }
+
+        private void ArchiveNext(ref IEnumerator<string>? candidates)
+        {
+            if (candidates == null) return;
+            try
+            {
+                if (candidates.MoveNext())
+                {
+                    TryArchiveClosedLog(candidates.Current);
+                    return;
+                }
+            }
+            catch (Exception exception) when (!IsFatal(exception))
+            {
+                ReportArchiveFailure(exception);
+            }
+            candidates.Dispose();
+            candidates = null;
+        }
+
+        private void TryArchiveClosedLog(string path)
+        {
+            try
+            {
+                ArchiveClosedLog(path);
+            }
+            catch (OperationCanceledException) when (
+                (WriterState)Volatile.Read(ref _state) == WriterState.Stopping)
+            {
+                // Let shutdown drain accepted records; a later worker can
+                // compress the untouched original without any recovery step.
+            }
+            catch (Exception exception) when (!IsFatal(exception))
+            {
+                // Archiving must never reject a written record or discard its
+                // original. Leave conflicts for inspection instead of overwrite.
+                ReportArchiveFailure(exception);
+            }
+        }
+
+        private void ReportArchiveFailure(Exception exception)
+        {
+            // A failed archive leaves its written source intact. It must not
+            // invalidate inventory baselines as if an append had been lost.
+            long failures = Interlocked.Increment(ref _archiveFailures);
+            ReportSparsely(PlayerTelemetryDiagnosticKind.WriteFailure,
+                "Player log archiving failed with " + exception.GetType().Name +
+                "; the original log was retained.", failures);
+        }
+
+        private void ArchiveClosedLog(string path)
+        {
+            EnsureRegularDirectory(Path.GetDirectoryName(path)!, "player log directory");
+            EnsureRegularFileIfPresent(path);
+            if (!File.Exists(path)) return;
+            string archivePath = path + ArchiveExtension;
+            string temporaryPath = archivePath + ".tmp";
+            EnsureRegularFileIfPresent(archivePath);
+            DateTime originalWriteTime = File.GetLastWriteTimeUtc(path);
+            long originalLength;
+            bool createdTemporary = false;
+            try
+            {
+                using (FileStream source = new FileStream(path, FileMode.Open,
+                           FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan))
+                {
+                    originalLength = source.Length;
+                    if (File.Exists(archivePath))
+                    {
+                        // Recover publication-before-delete without trusting an
+                        // existing .gz merely because its filename matches.
+                        VerifyArchive(archivePath, source);
+                    }
+                    else
+                    {
+                        // A prior interrupted compression can leave this reserved
+                        // temporary file. Its complete original still exists.
+                        DeleteRegularFileIfPresent(temporaryPath);
+                        using (FileStream output = new FileStream(temporaryPath,
+                                   FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                                   64 * 1024, FileOptions.SequentialScan))
+                        {
+                            createdTemporary = true;
+                            using (GZipStream gzip = new GZipStream(output,
+                                       CompressionLevel.Optimal, leaveOpen: true))
+                            {
+                                byte[] buffer = new byte[64 * 1024];
+                                int count;
+                                while ((count = source.Read(buffer, 0, buffer.Length)) != 0)
+                                {
+                                    ThrowIfArchivingCancelled();
+                                    gzip.Write(buffer, 0, count);
+                                }
+                            }
+                            output.Flush(flushToDisk: true);
+                        }
+                        source.Position = 0;
+                        VerifyArchive(temporaryPath, source);
+                        ThrowIfArchivingCancelled();
+                        File.SetLastWriteTimeUtc(temporaryPath, originalWriteTime);
+                        // Same-directory rename publishes only a complete archive;
+                        // File.Move deliberately refuses to replace an existing one.
+                        File.Move(temporaryPath, archivePath);
+                        createdTemporary = false;
+                    }
+                }
+
+                // Windows denies writers while source is open. Also detect a
+                // changed source before deleting it after closing that handle.
+                if (GetRegularFileLength(path) != originalLength ||
+                    File.GetLastWriteTimeUtc(path) != originalWriteTime)
+                    throw new IOException("The log changed during archiving.");
+                DeleteRegularFileIfPresent(path);
+            }
+            finally
+            {
+                if (createdTemporary) DeleteRegularFileIfPresent(temporaryPath);
+            }
+        }
+
+        private void ThrowIfArchivingCancelled()
+        {
+            if ((WriterState)Volatile.Read(ref _state) == WriterState.Stopping)
+                throw new OperationCanceledException();
+        }
+
+        private void VerifyArchive(string archivePath, Stream source)
+        {
+            EnsureRegularFileIfPresent(archivePath);
+            using FileStream archived = new FileStream(archivePath, FileMode.Open,
+                FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+            using GZipStream gzip = new GZipStream(archived, CompressionMode.Decompress);
+            byte[] expected = new byte[64 * 1024];
+            byte[] actual = new byte[64 * 1024];
+            int count;
+            while ((count = source.Read(expected, 0, expected.Length)) != 0)
+            {
+                ThrowIfArchivingCancelled();
+                int read = 0;
+                while (read < count)
+                {
+                    int chunk = gzip.Read(actual, read, count - read);
+                    if (chunk == 0) throw new InvalidDataException("The log archive is truncated.");
+                    read += chunk;
+                }
+                for (int index = 0; index < count; ++index)
+                    if (actual[index] != expected[index])
+                        throw new InvalidDataException("The log archive differs from its original.");
+            }
+            // Bound decompression to the source length plus one byte, including
+            // when recovering an existing untrusted/conflicting archive.
+            if (gzip.ReadByte() != -1)
+                throw new InvalidDataException("The log archive has extra content.");
+        }
+
         private static void EnforcePlayerFileRetention(
             string playerDirectory,
             int maximumFiles,
             HashSet<string> protectedActivePaths)
         {
             List<TelemetryFile> files = new List<TelemetryFile>();
+            HashSet<string> seen = new HashSet<string>(protectedActivePaths.Comparer);
             foreach (string candidate in Directory.EnumerateFiles(
                          playerDirectory,
                          "*",
@@ -840,7 +1074,11 @@ namespace ServerManager.PlayerLogging
                 }
 
                 EnsureRegularFileIfPresent(canonical);
-                files.Add(new TelemetryFile(canonical, localDate, generation));
+                string logicalPath = WithoutArchiveSuffix(canonical);
+                // A crash after archive publication can leave both copies.
+                // Count that pair once, not as two independent log segments.
+                if (seen.Add(logicalPath))
+                    files.Add(new TelemetryFile(logicalPath, localDate, generation));
             }
 
             if (files.Count <= maximumFiles)
@@ -886,6 +1124,7 @@ namespace ServerManager.PlayerLogging
                 }
 
                 DeleteRegularFileIfPresent(files[index].Path);
+                DeleteRegularFileIfPresent(files[index].Path + ArchiveExtension);
                 --remainingFiles;
             }
 
@@ -898,12 +1137,14 @@ namespace ServerManager.PlayerLogging
                  ++index)
             {
                 if (!protectedActivePaths.Contains(files[index].Path) ||
-                    !File.Exists(files[index].Path))
+                    (!File.Exists(files[index].Path) &&
+                     !File.Exists(files[index].Path + ArchiveExtension)))
                 {
                     continue;
                 }
 
                 DeleteRegularFileIfPresent(files[index].Path);
+                DeleteRegularFileIfPresent(files[index].Path + ArchiveExtension);
                 --remainingFiles;
             }
         }
@@ -919,6 +1160,8 @@ namespace ServerManager.PlayerLogging
             {
                 return false;
             }
+
+            fileName = WithoutArchiveSuffix(fileName);
 
             int extensionIndex = fileName.LastIndexOf(
                 LogFileExtension,
