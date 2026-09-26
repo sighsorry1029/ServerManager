@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Reflection.Emit;
 using System.Text;
 using HarmonyLib;
@@ -1277,7 +1278,8 @@ internal static class ManagedCharacterPlayerLoadPatch
             if (__state is { Guarded: true })
             {
                 if (__state.Failed) return null;
-                if (__exception != null) throw __exception;
+                // Preserve the original game/mod throw site in the failure log.
+                if (__exception != null) ExceptionDispatchInfo.Capture(__exception).Throw();
                 if (!__runOriginal) throw new InvalidDataException("Another patch skipped the managed character load.");
             }
             // The game and installed mods own content restoration. Missing

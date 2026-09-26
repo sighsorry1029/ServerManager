@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.6
+
+- Preserved the original exception stack when managed character loading fails, making the initial game or mod error easier to locate in the affected client's BepInEx log.
+- Kept existing load-failure safeguards: incomplete character loads still block saving and return the player to the lobby. Normal game-handled missing items remain allowed.
+- Added regression coverage for exception origins, early and late patch failures, fatal exceptions, and load-state cleanup.
+
 ## 1.1.5
 
 - Fixed periodic full character updates retaining an outdated rejoin position. Updates now refresh the logout point using Valheim's normal death and intro rules; inventory-only updates and save intervals are unchanged.
