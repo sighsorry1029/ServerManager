@@ -514,6 +514,12 @@ internal sealed class ZNet
 
 namespace ServerManager
 {
+    // This fixture isolates literal chat; localization is covered by the common-command harness.
+    internal static class PlayerLocalizer
+    {
+        internal static string TextForLanguage(string language, string key, params string[] args) => key;
+    }
+
     internal static class IntegrityCanonical
     {
         internal static bool IsFatal(Exception exception) => exception is OutOfMemoryException || exception is StackOverflowException || exception is AccessViolationException;
@@ -600,7 +606,7 @@ namespace ServerManager.Discord
         internal static int Calls;
         internal DiscordRconCapture(Action<string> log) { }
         internal bool IsAvailable => true;
-        internal DiscordCommands.Result Execute(string line, int maximum) { ++Calls; return DiscordCommands.Result.Ok("test"); }
+        internal DiscordCommands.Result Execute(string line, int maximum, string language = "English") { ++Calls; return DiscordCommands.Result.Ok("test"); }
         public void Dispose() { }
     }
 }

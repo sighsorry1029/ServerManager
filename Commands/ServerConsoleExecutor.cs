@@ -63,28 +63,28 @@ internal sealed class ServerConsoleExecutor : IDisposable
     {
         observedResult = false;
         if (!IsAvailable || _threadId != Thread.CurrentThread.ManagedThreadId)
-            return Result(false, "rcon_unavailable", "서버 콘솔을 사용할 수 없습니다.");
+            return Result(false, "rcon_unavailable", "The server console is unavailable.");
         global::Console? terminal = global::Console.instance;
         if (terminal == null || ZNet.instance == null || !ZNet.instance.IsServer() || ZNet.World == null)
-            return Result(false, "rcon_unavailable", "서버 콘솔을 사용할 수 없습니다.");
+            return Result(false, "rcon_unavailable", "The server console is unavailable.");
         string trimmed = line.Trim();
         string verb = trimmed.Split(new[] { ' ', '\t' }, 2)[0].ToLowerInvariant();
         if (!ValheimPrivateAccess.GetTerminalCommands().ContainsKey(verb))
-            return Result(false, "rcon_unknown", "등록되지 않은 서버 콘솔 명령입니다.");
+            return Result(false, "rcon_unknown", "Unknown server console command.");
         string[] arguments = Array.Empty<string>();
         if ((verb == "save" || verb == "kick") &&
             (!ServerCommands.TryTokenize(trimmed, out arguments, out _) ||
              (verb == "save" ? arguments.Length != 1 :
                  arguments.Length < 2 || arguments[1].Length > 128 ||
                  string.Join(" ", arguments.Skip(2)).Length > 300)))
-            return Result(false, "invalid_argument", "사용법: save 또는 kick <이름/Steam64> [사유]");
+            return Result(false, "invalid_argument", "Usage: save or kick <name/Steam64> [reason]");
         string previousSaveOperation = verb == "save"
             ? ServerEventRuntime.GetStatusSnapshot().LatestSave?.OperationId ?? string.Empty : string.Empty;
         Capture capture = new(terminal, maximumCharacters);
         lock (Gate)
         {
-            if (!IsAvailable) return Result(false, "rcon_unavailable", "서버 콘솔을 사용할 수 없습니다.");
-            if (_active != null) return Result(false, "rcon_busy", "다른 RCON 명령이 실행 중입니다.");
+            if (!IsAvailable) return Result(false, "rcon_unavailable", "The server console is unavailable.");
+            if (_active != null) return Result(false, "rcon_busy", "Another RCON command is running.");
             _active = capture;
         }
         try
@@ -122,11 +122,11 @@ internal sealed class ServerConsoleExecutor : IDisposable
                 output = output.Substring(0, Math.Min(output.Length, Math.Max(0, maximumCharacters - marker.Length))) + marker;
             }
             return Result(!capture.Failed, capture.Failed ? "rcon_failed" : "rcon_dispatched",
-                output.Length == 0 ? "명령을 전달했습니다. 동기식 콘솔 출력은 없습니다." : output);
+                output.Length == 0 ? "Command dispatched. No synchronous console output was returned." : output);
         }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
         {
-            return Result(false, "rcon_failed", "RCON 처리 실패: " + exception.GetType().Name);
+            return Result(false, "rcon_failed", "RCON failed: " + exception.GetType().Name);
         }
         finally
         {

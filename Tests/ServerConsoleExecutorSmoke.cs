@@ -40,6 +40,7 @@ internal static class ServerConsoleExecutorSmoke
         int calls = terminal.Calls;
         var worker = Task.Run(() => first.Execute("help", 1800)).GetAwaiter().GetResult();
         Check(worker.Code == "rcon_unavailable" && terminal.Calls == calls, "Worker rejected before game command execution.");
+        Check(worker.Message == "The server console is unavailable.", "Unavailable-console guidance uses English.");
         ZNet.instance.Server = false;
         Check(!first.Execute("help", 1800).Success, "Remote client cannot invoke console.");
         ZNet.instance.Server = true;
@@ -47,14 +48,21 @@ internal static class ServerConsoleExecutorSmoke
         Check(!first.Execute("help", 1800).Success, "World must exist.");
         ZNet.World = new object();
         Check(first.Execute("missing", 1800).Code == "rcon_unknown", "Unregistered command rejected.");
+        Check(first.Execute("missing", 1800).Message == "Unknown server console command.", "Unknown-command guidance uses English.");
         Check(first.Execute("save extra", 1800).Code == "invalid_argument", "Save requires exact shape.");
+        Check(first.Execute("save extra", 1800).Message == "Usage: save or kick <name/Steam64> [reason]", "Console usage uses English.");
         Check(first.Execute("kick", 1800).Code == "invalid_argument", "Kick needs target.");
         Check(first.Execute("kick " + new string('x', 129), 1800).Code == "invalid_argument", "Kick target bounded.");
         Check(first.Execute("kick halla " + new string('x', 301), 1800).Code == "invalid_argument", "Kick reason bounded.");
 
         terminal.OnExecute = line => { throw new InvalidOperationException("not logged"); };
         Check(first.Execute("help", 1800).Code == "rcon_failed", "Thrown commands fail without replay.");
+        Check(first.Execute("help", 1800).Message == "RCON failed: InvalidOperationException", "Failure guidance uses English without exposing exception details.");
         Check(!Terminal.m_cheat, "Throw restores cheat state.");
+        terminal.OnExecute = line => { };
+        Check(first.Execute("help", 1800).Message == "Command dispatched. No synchronous console output was returned.", "Silent command guidance uses English.");
+        terminal.OnExecute = line => terminal.AddString("다른 모드의 출력: 띠 오");
+        Check(first.Execute("help", 1800).Message == "다른 모드의 출력: 띠 오", "Raw other-mod console output is not translated.");
         terminal.OnExecute = line => terminal.AddString("Error executing command.");
         Check(!first.Execute("help", 1800).Success, "Console failure text is not success.");
         terminal.OnExecute = line => terminal.AddString(new string('x', 3000));
@@ -70,6 +78,7 @@ internal static class ServerConsoleExecutorSmoke
         terminal.OnExecute = line =>
         {
             Check(second.Execute("help", 1800).Code == "rcon_busy", "Cross-caller reentrancy is rejected.");
+            Check(second.Execute("help", 1800).Message == "Another RCON command is running.", "Busy-console guidance uses English.");
             terminal.AddString("outer");
         };
         Check(first.Execute("help", 1800).Message == "outer", "Reentrant rejection does not replace capture.");
@@ -234,7 +243,7 @@ namespace ServerManager.Discord
             internal string Code { get; }
             internal string Message { get; }
         }
-        internal static Result FormatIntegrationResult(ServerManagerCommandResult result) =>
+        internal static Result FormatIntegrationResult(ServerManagerCommandResult result, string language = "English") =>
             new(result.Success, result.Code, "observed:" + result.Code);
     }
 }

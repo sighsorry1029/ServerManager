@@ -216,6 +216,11 @@ periodically and during save/logout handling. The server keeps accepted updates
 in memory, so reconnecting to the same running server can restore progress not
 yet written to disk. Remaining poison is retained from the latest full update.
 
+Full updates refresh the rejoin position every five minutes and during normal
+save/logout handling, following the game's death and intro rules. Inventory-only
+updates do not update position. A lost connection can still return you to the
+last position accepted by the server, not necessarily where you disconnected.
+
 If a remote client's snapshot contains two items in the same inventory slot,
 ServerManager retries capture once per second for up to 10 seconds. Invalid
 snapshots are never submitted. The client log identifies the slot and both
@@ -529,6 +534,16 @@ and its webhook copy will both be visible.
 Try `/status`. Use `/discordstatus` for diagnostics. `/discordtest` sends a test
 to routes selecting `server.announcement`.
 
+Command and option descriptions, help, and the bot's own notices use Korean
+for Discord users with language `ko`, and English otherwise. Command and option
+identifiers stay English. Detailed command results and game/other-mod RCON
+output are relayed unchanged. Webhook `language` is independent and only
+affects event notifications.
+
+Both bot languages are embedded; no external translation file is required.
+Description overrides take effect at the next bot command registration, such
+as after a server restart, not immediately after a YAML edit.
+
 Keep the token on the server only. The environment variable
 `SERVERMANAGER_DISCORD_BOT_TOKEN` can override `bot.token`.
 No RCON IP, password or extra port is needed. The bot stops with the game server
@@ -676,7 +691,7 @@ English and Korean player messages are included.
 Put `ServerManager.<Language>.yml` anywhere under `BepInEx`; use the packaged
 `ServerManager.English.yml` as a template. A copy directly in `BepInEx/config`
 takes priority over a distributed copy. Avoid duplicate distributed files and
-restart after changes. For custom Discord languages, install the translation
+restart after changes. For custom webhook languages, install the translation
 on the server too.
 
 ## Logs

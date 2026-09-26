@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.5
+
+- Fixed periodic full character updates retaining an outdated rejoin position. Updates now refresh the logout point using Valheim's normal death and intro rules; inventory-only updates and save intervals are unchanged.
+- Added English and Korean Discord command descriptions, help and bot notices based on each user's Discord language. Command names stay English, while detailed command results and game/mod RCON output remain unchanged.
+- Reused the existing translation files for bot text and kept webhook language settings independent. Both bot languages are included in the DLL.
+- Added regression tests for rejoin-position capture, profile/inventory round trips, Discord localization, command registration and English fallback.
+
 ## 1.1.4
 
 - Moved world-aligned character checkpoint file writes, backup rotation and disk verification off the main thread, with one background write at a time.

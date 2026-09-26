@@ -1169,6 +1169,111 @@ $processSavePipeline = Get-PluginMethodDefinition `
 $processSavePipelineCalls = @(
     $processSavePipeline.Body.Instructions |
         Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] })
+
+# Inspect the compiled periodic/fallback and final capture paths. Updating the
+# inner player package alone leaves the outer per-world logout point stale.
+$finalCapture = Get-PluginMethodDefinition `
+    "ServerManager.ServerManagerRuntime" `
+    "CaptureDeferredClientExitSnapshot"
+foreach ($captureMethod in @($processSavePipeline, $finalCapture)) {
+    $capturePlayer = Get-CecilCall $captureMethod "PlayerProfile" "SavePlayerData"
+    $captureMap = Get-CecilCall $captureMethod "Minimap" "SaveMapData"
+    $captureLogout = Get-CecilCall $captureMethod "PlayerProfile" "SaveLogoutPoint"
+    $captureSerialize = Get-CecilCall `
+        $captureMethod "ServerManager.ValheimPlayerProfileCodec" "SerializeProfileToBytes"
+    Assert-True ($null -ne $capturePlayer -and $null -ne $captureMap -and
+        $null -ne $captureLogout -and $null -ne $captureSerialize -and
+        $capturePlayer.Offset -lt $captureMap.Offset -and
+        $captureMap.Offset -lt $captureLogout.Offset -and
+        $captureLogout.Offset -lt $captureSerialize.Offset -and
+        (Test-CecilReachable $capturePlayer.Next $captureMap) -and
+        (Test-CecilReachable $captureMap.Next $captureLogout) -and
+        (Test-CecilReachable $captureLogout.Next $captureSerialize) -and
+        -not (Test-CecilReachable $capturePlayer.Next $captureSerialize @($captureLogout)) -and
+        $null -eq (Get-CecilCall $captureMethod `
+            "ServerManager.ValheimPlayerProfileCodec" "CaptureProfileToBytes")) `
+        "$($captureMethod.Name) must refresh player, optional map, and logout point before serializing the full profile."
+}
+
+$periodicPlayer = Get-CecilCall $processSavePipeline "PlayerProfile" "SavePlayerData"
+$periodicLogout = Get-CecilCall $processSavePipeline "PlayerProfile" "SaveLogoutPoint"
+$periodicSerialize = Get-CecilCall `
+    $processSavePipeline "ServerManager.ValheimPlayerProfileCodec" "SerializeProfileToBytes"
+$periodicOffer = Get-CecilCall `
+    $processSavePipeline "ServerManager.ServerManagerRuntime" "OfferClientSave"
+$periodicReasonDefinition = $pluginDefinition.MainModule.Types |
+    Where-Object FullName -eq "ServerManager.ClientCharacterSaveReason" |
+    Select-Object -First 1
+$periodicReasonValue = [int]($periodicReasonDefinition.Fields |
+    Where-Object Name -eq "PeriodicFull" | Select-Object -First 1).Constant
+$periodicReasonArgument = $periodicOffer.Previous
+$periodicCaptureTry = $processSavePipeline.Body.ExceptionHandlers |
+    Where-Object {
+        Test-CecilInstructionInRange $periodicPlayer $_.TryStart $_.TryEnd
+    } | Select-Object -First 1
+Assert-True ($null -ne $periodicOffer -and
+    $periodicSerialize.Offset -lt $periodicOffer.Offset -and
+    (($periodicReasonArgument.OpCode.Name -eq "ldc.i4.$periodicReasonValue") -or
+        ($periodicReasonArgument.OpCode.Name -in @("ldc.i4", "ldc.i4.s") -and
+         [int]$periodicReasonArgument.Operand -eq $periodicReasonValue)) -and
+    $null -ne $periodicCaptureTry -and
+    (Test-CecilInstructionInRange $periodicOffer `
+        $periodicCaptureTry.TryStart $periodicCaptureTry.TryEnd) -and
+    (Test-CecilReachable $periodicSerialize.Next $periodicOffer) -and
+    -not (Test-CecilReachable $periodicCaptureTry.TryStart `
+        $periodicOffer @($periodicPlayer)) -and
+    -not (Test-CecilReachable $periodicPlayer.Next `
+        $periodicOffer @($periodicSerialize))) `
+    "The periodic full snapshot can be offered without refreshing and serializing the managed profile, or uses the wrong save reason."
+
+# Both scheduling causes must reach the same single full-profile capture. The
+# existing source gate check above also enforces fallback || heartbeat semantics.
+foreach ($scheduleGetter in @(
+    "get_FullProfileSafetySaveDueTimestamp", "get_NextFullProfileHeartbeatTimestamp")) {
+    $scheduleRead = Get-CecilCall $processSavePipeline `
+        "ServerManager.ServerManagerRuntime/ClientConnection" $scheduleGetter
+    Assert-True ($null -ne $scheduleRead -and
+        $scheduleRead.Offset -lt $periodicPlayer.Offset -and
+        (Test-CecilReachable $scheduleRead.Next $periodicPlayer)) `
+        "$scheduleGetter no longer reaches the common full-profile/logout-point capture."
+}
+foreach ($captureCallName in @("SavePlayerData", "SaveLogoutPoint", "SerializeProfileToBytes")) {
+    Assert-True (@($processSavePipelineCalls | Where-Object {
+        $_.Operand.Name -eq $captureCallName
+    }).Count -eq 1) `
+        "Periodic and fallback captures must share exactly one $captureCallName call."
+}
+
+# Keep vanilla's public current-world policy, including intro suppression and
+# death respawn selection, instead of directly writing private world data.
+$logoutIntro = Get-CecilCall $saveLogoutPointDefinition "Character" "InIntro"
+$logoutDead = Get-CecilCall $saveLogoutPointDefinition "Character" "IsDead"
+$logoutSet = Get-CecilCall $saveLogoutPointDefinition "PlayerProfile" "SetLogoutPoint"
+$logoutCustom = Get-CecilCall $saveLogoutPointDefinition "PlayerProfile" "GetCustomSpawnPoint"
+$logoutHome = Get-CecilCall $saveLogoutPointDefinition "PlayerProfile" "GetHomePoint"
+Assert-True ($saveLogoutPointDefinition.IsPublic -and
+    $null -ne $logoutIntro -and $null -ne $logoutDead -and
+    $null -ne $logoutSet -and $null -ne $logoutCustom -and $null -ne $logoutHome -and
+    $logoutIntro.Next.OpCode.Name -in @("brtrue", "brtrue.s") -and
+    -not (Test-CecilReachable $logoutIntro.Next.Operand $logoutSet) -and
+    (Test-CecilReachable $logoutIntro.Next.Next $logoutSet) -and
+    $logoutDead.Next.OpCode.Name -in @("brfalse", "brfalse.s") -and
+    (Test-CecilReachable $logoutDead.Next.Next $logoutCustom) -and
+    (Test-CecilReachable $logoutDead.Next.Next $logoutHome) -and
+    -not (Test-CecilReachable $logoutDead.Next.Operand $logoutCustom) -and
+    -not (Test-CecilReachable $logoutDead.Next.Operand $logoutHome)) `
+    "The original public SaveLogoutPoint intro/death policy changed; review it before relying on periodic capture."
+
+$genericCapture = Get-PluginMethodDefinition `
+    "ServerManager.ValheimPlayerProfileCodec" "CaptureProfileToBytes"
+Assert-True ($genericCapture.IsPublic -and
+    $null -ne (Get-CecilCall $genericCapture "PlayerProfile" "SavePlayerData") -and
+    $null -ne (Get-CecilCall $genericCapture `
+        "ServerManager.ValheimPlayerProfileCodec" "SerializeProfileToBytes") -and
+    $null -eq (Get-CecilCall $genericCapture "PlayerProfile" "SaveLogoutPoint") -and
+    $null -eq (Get-CecilCall $genericCapture "Minimap" "SaveMapData")) `
+    "The periodic logout-point fix must not add world/map side effects to the public generic capture helper."
+
 $acknowledgementOverdueCall = $processSavePipelineCalls |
     Where-Object {
         $_.Operand.DeclaringType.FullName -eq
@@ -2741,6 +2846,7 @@ Assert-True ($null -ne $gracefulTimeoutField -and
 
 Write-Output (
     "Character save single-flight, full-priority/latest-inventory coalescing, " +
+    "periodic/fallback full-profile logout-point refresh and final capture order, " +
     "unified-revision exact-ACK, reason-aware pacing, " +
     "timeout, drain, final gate, quit-veto recovery, flood-coalescing, " +
     "independent local saves with ACK RAM-only advancement, " +

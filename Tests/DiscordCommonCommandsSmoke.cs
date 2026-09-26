@@ -74,7 +74,8 @@ internal static class DiscordCommonCommandsSmoke
         {
             if (args.Length != 1) throw new ArgumentException("The built ServerManager DLL path is required.");
             ServerCommands.BindIdentifierPredicates(args[0]);
-            FixedExecutionLimits(); AdapterArguments(); SpacedCharacterTargets(); RegistrationAndAdmins(); MultiGuildIsolation(); SharedExecution(); TypedParsing();
+            ServerManager.PlayerLocalizer.Bind(args[0]);
+            FixedExecutionLimits(); EnglishDefaults(); LocalizedInteractions(); LocalizedFailures(); AdapterArguments(); SpacedCharacterTargets(); RegistrationAndAdmins(); EnglishRegistration(); LocalizationRegistration(); MultiGuildIsolation(); SharedExecution(); TypedParsing();
             Reauthorization(); RestoreRejectionAudit(); ItemPresetArguments(); ItemPresetRejectionAudit(); RconRouting(); DeferredRevocationAndTimeout();
             Console.WriteLine("PASS: Discord flat command adapter (" + _checks + " assertions)."); return 0;
         }
@@ -82,6 +83,190 @@ internal static class DiscordCommonCommandsSmoke
     }
     private static JObject Definition(string name) => (JObject)typeof(DiscordCommands).GetMethod("Definition", Static)!.Invoke(null, new object[] { name })!;
     private static string[] Names => (string[])typeof(DiscordCommands).GetField("Names", Static)!.GetValue(null)!;
+    private static bool IsAsciiEnglish(string text) => !string.IsNullOrWhiteSpace(text) &&
+        text.All(character => character <= 0x7f) && text.Any(character =>
+            (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z'));
+    private static bool HasKorean(string text) => text.Any(character => character >= '\uac00' && character <= '\ud7a3');
+    private static DiscordCommands.Result Completed(object pending) =>
+        ((TaskCompletionSource<DiscordCommands.Result>)Get(pending, "Completion")).Task.GetAwaiter().GetResult();
+    private static string Help(string language = "English") =>
+        (string)typeof(DiscordCommands).GetMethod("HelpText", Static)!.Invoke(null, new object[] { language })!;
+    private static void EnglishDefaults()
+    {
+        foreach (string name in Names)
+        {
+            JObject definition = Definition(name);
+            string description = (string?)definition["description"] ?? "";
+            Check(IsAsciiEnglish(description) && description.Length <= 100, "Bounded English command description /" + name);
+            string korean = (string?)definition["description_localizations"]?["ko"] ?? "";
+            Check(HasKorean(korean) && korean.Length <= 100 && !korean.Contains("sm_discord_"),
+                "Bounded Korean command description /" + name);
+            Check(definition["name_localizations"] == null, "Command identifiers are never translated /" + name);
+            foreach (JObject option in ((JArray)definition["options"]!).OfType<JObject>())
+            {
+                string optionDescription = (string?)option["description"] ?? "";
+                Check(IsAsciiEnglish(optionDescription) && optionDescription.Length <= 100,
+                    "Bounded English option description /" + name + "/" + option["name"]);
+                string koreanOption = (string?)option["description_localizations"]?["ko"] ?? "";
+                Check(HasKorean(koreanOption) && koreanOption.Length <= 100 && !koreanOption.Contains("sm_discord_"),
+                    "Bounded Korean option description /" + name + "/" + option["name"]);
+                Check(option["name_localizations"] == null, "Option identifiers are never translated /" + name + "/" + option["name"]);
+            }
+        }
+        Check((string?)Definition("giveitem")["description"] == "Give items to a player.", "Giveitem default description is English");
+
+        const string backendMessage = "원본 결과: 한글 플레이어에게 아이템을 지급했습니다.";
+        foreach (var example in new[]
+        {
+            (Success: true, Code: "ok", Prefix: "Success: "),
+            (Success: false, Code: "denied", Prefix: "Failed: "),
+            (Success: true, Code: "save_requested", Prefix: "Request accepted: "),
+            (Success: true, Code: "save_scheduled", Prefix: "Request accepted: "),
+            (Success: false, Code: "save_requested", Prefix: "Failed: ")
+        })
+        {
+            var result = new ServerManagerCommandResult(example.Success, example.Code, backendMessage, "op-123",
+                A("player", "한글 플레이어", "operation_id", "ignored-duplicate"));
+            DiscordCommands.Result formatted = DiscordCommands.FormatIntegrationResult(result);
+            bool savePending = example.Success && (example.Code == "save_requested" || example.Code == "save_scheduled");
+            Check(formatted.Message.StartsWith(example.Prefix + backendMessage + "\nresult_code: " + example.Code, StringComparison.Ordinal),
+                "English result prefix retains exact arbitrary backend message " + example.Code + "/" + example.Success);
+            Check(formatted.Success == example.Success && formatted.Code == example.Code &&
+                formatted.Message.Contains("\noperation_id: op-123") && formatted.Message.Contains("\nplayer: 한글 플레이어") &&
+                !formatted.Message.Contains("ignored-duplicate"), "Formatting preserves result metadata and non-English data");
+            string adapterText = formatted.Message.Replace(backendMessage, "Backend result").Replace("한글 플레이어", "Player");
+            Check(IsAsciiEnglish(adapterText), "Adapter-owned result text is English without translating backend content");
+            Check(formatted.Message.Contains("/status") == savePending &&
+                (!savePending || formatted.Message.Contains("does not mean the save is complete")),
+                "Only successful save acceptance warns that saving is not complete");
+        }
+
+        using var fixture = new Fixture();
+        JObject unauthorized = fixture.Payload("status", A()); unauthorized["member"]!["user"]!["id"] = "999";
+        int calls = ServerCommands.Calls.Count;
+        fixture.Commands.HandleDispatchAsync("INTERACTION_CREATE", unauthorized).Wait();
+        Wait(() => (int)Get(fixture.Commands, "_inFlight") == 0 && fixture.Http.Responses.Count == 1,
+            "Unauthorized interaction receives its response");
+        JObject response = fixture.Http.Responses.Single();
+        Check((int?)response["type"] == 4 && (int?)response["data"]?["flags"] == 64 &&
+            (string?)response["data"]?["content"] == "You do not have permission to run this command.",
+            "Unauthorized response is exact English and remains ephemeral");
+        Check(ServerCommands.Calls.Count == calls && ((System.Collections.ICollection)Get(fixture.Commands, "_queue")).Count == 0,
+            "English denial does not execute or queue unauthorized work");
+        ((DiscordRconCapture)Get(fixture.Commands, "_rcon")).Output = backendMessage;
+        object rawPending = fixture.Parse("rcon", A("command", "status")); fixture.Execute(rawPending).Wait();
+        DiscordCommands.Result raw = ((TaskCompletionSource<DiscordCommands.Result>)Get(rawPending, "Completion")).Task.Result;
+        Check(raw.Success && raw.Message == backendMessage, "Raw console output remains unchanged even when it is not English");
+    }
+    private static void LocalizedInteractions()
+    {
+        using (var fixture = new Fixture(multipleGuilds: true))
+        {
+            foreach (var entry in new[]
+            {
+                (Locale: (JToken?)null, Expected: "English"),
+                (Locale: (JToken?)new JValue("ko"), Expected: "Korean"),
+                (Locale: (JToken?)new JValue("en-US"), Expected: "English"),
+                (Locale: (JToken?)new JValue("en-GB"), Expected: "English"),
+                (Locale: (JToken?)new JValue("ja"), Expected: "English"),
+                (Locale: (JToken?)new JValue(""), Expected: "English"),
+                (Locale: (JToken?)new JValue(123), Expected: "English"),
+                (Locale: (JToken?)new JObject { ["language"] = "ko" }, Expected: "English")
+            })
+            {
+                JObject payload = fixture.Payload("help", A());
+                if (entry.Locale != null) payload["locale"] = entry.Locale;
+                payload["guild_locale"] = entry.Expected == "Korean" ? "en-US" : "ko";
+                object pending = fixture.ParsePayload(payload)!;
+                Check(pending != null && (string)Get(pending, "Language") == entry.Expected,
+                    "Interaction locale alone selects language; absent, unsupported and malformed locales use English");
+                fixture.Execute(pending!).Wait();
+                string help = Completed(pending!).Message;
+                Check(help == Help(entry.Expected) && (entry.Expected == "Korean" ? HasKorean(help) : IsAsciiEnglish(help)),
+                    "Help follows its own interaction, never the guild language");
+                Check(help.Length <= 1999 && !help.Contains("sm_discord_"), "Localized help fits a resolved single Discord message");
+                foreach (string name in Names) Check(help.Contains("/" + name), "Localized help retains /" + name);
+                foreach (string verb in new[] { "save", "kick", "ban", "unban" })
+                    Check(help.Contains("command:\"" + verb), "Localized help retains literal RCON example " + verb);
+            }
+
+            // Both requests are in flight at once; completing them in reverse order
+            // catches an accidental shared current-language field or guild setting.
+            const string backend = "원본 backend 결과 {0} / 플레이어 Player-One";
+            JObject koreanPayload = fixture.Payload("players", A("player", "한글 Player-One"));
+            koreanPayload["locale"] = "ko"; koreanPayload["guild_locale"] = "en-US";
+            JObject englishPayload = fixture.Payload("players", A("player", "한글 Player-One"), "112");
+            englishPayload["locale"] = "en-US"; englishPayload["guild_locale"] = "ko";
+            object koreanPending = fixture.ParsePayload(koreanPayload)!;
+            object englishPending = fixture.ParsePayload(englishPayload)!;
+            Task koreanExecution = fixture.Execute(koreanPending); var koreanCall = ServerCommands.Calls.Last();
+            Task englishExecution = fixture.Execute(englishPending); var englishCall = ServerCommands.Calls.Last();
+            Check(koreanCall.Line == "players \"한글 Player-One\"" && koreanCall.Line == englishCall.Line,
+                "Locale never translates player selectors or shared command syntax");
+            koreanPayload["locale"] = "en-US"; englishPayload["locale"] = "ko";
+            var result = new ServerManagerCommandResult(true, "ok", backend, "operation-123", A("player", "한글 Player-One"));
+            englishCall.Completion.SetResult(result); englishExecution.Wait();
+            koreanCall.Completion.SetResult(result); koreanExecution.Wait();
+            Check(Completed(koreanPending).Message == DiscordCommands.FormatIntegrationResult(result, "Korean").Message &&
+                Completed(englishPending).Message == DiscordCommands.FormatIntegrationResult(result).Message &&
+                Completed(koreanPending).Message != Completed(englishPending).Message,
+                "Concurrent cross-guild completion retains the copied per-interaction language");
+        }
+
+        const string rawBackend = "원본 backend 결과 {0}\nSuccess: 그대로 보존";
+        foreach (string code in new[] { "ok", "denied", "save_requested", "save_scheduled" })
+        {
+            var result = new ServerManagerCommandResult(code != "denied", code, rawBackend, "operation-123", A("player", "이름"));
+            string english = DiscordCommands.FormatIntegrationResult(result).Message;
+            string korean = DiscordCommands.FormatIntegrationResult(result, "Korean").Message;
+            Check(korean != english && korean.Contains(rawBackend + "\nresult_code: " + code) &&
+                korean.Contains("\noperation_id: operation-123") && korean.Contains("\nplayer: 이름"),
+                "Korean result text preserves verbatim backend message and stable metadata " + code);
+            Check(HasKorean(korean.Replace(rawBackend, "").Replace("이름", "")) && !korean.Contains("sm_discord_"),
+                "Adapter result prefix or save guidance resolves to Korean " + code);
+            Check(DiscordCommands.FormatIntegrationResult(result, "UnlistedLanguage").Message == english,
+                "Unsupported explicit result language falls back to English");
+            if (code.StartsWith("save_", StringComparison.Ordinal))
+                Check(korean.Contains("/status"), "Korean save acceptance retains the completion-status guidance");
+        }
+        Check(Help("UnlistedLanguage") == Help(), "Unsupported help language falls back to English");
+
+        foreach (string locale in new[] { "ko", "en-US", "ja" })
+        {
+            using var fixture = new Fixture();
+            JObject unauthorized = fixture.Payload("status", A());
+            unauthorized["locale"] = locale; unauthorized["guild_locale"] = locale == "ko" ? "en-US" : "ko";
+            unauthorized["member"]!["user"]!["id"] = "999";
+            int calls = ServerCommands.Calls.Count;
+            fixture.Commands.HandleDispatchAsync("INTERACTION_CREATE", unauthorized).Wait();
+            Wait(() => (int)Get(fixture.Commands, "_inFlight") == 0 && fixture.Http.Responses.Count == 1, "Localized denial completes");
+            JObject response = fixture.Http.Responses.Single();
+            string text = (string?)response["data"]?["content"] ?? "";
+            Check((int?)response["type"] == 4 && (int?)response["data"]?["flags"] == 64 &&
+                (locale == "ko" ? HasKorean(text) : text == "You do not have permission to run this command."),
+                "Unauthorized response is localized and remains ephemeral " + locale);
+            Check(ServerCommands.Calls.Count == calls && ((System.Collections.ICollection)Get(fixture.Commands, "_queue")).Count == 0,
+                "Localization never weakens authorization or admits denied work");
+        }
+        using (var fixture = new Fixture())
+        {
+            JObject payload = fixture.Payload("rcon", A("command", "status")); payload["locale"] = "ko";
+            ((DiscordRconCapture)Get(fixture.Commands, "_rcon")).Output = rawBackend;
+            object pending = fixture.ParsePayload(payload)!; fixture.Execute(pending).Wait();
+            Check(Completed(pending).Success && Completed(pending).Message == rawBackend,
+                "Korean interaction never translates or wraps raw RCON output");
+            object cooldown = fixture.ParsePayload(payload)!; fixture.Execute(cooldown).Wait();
+            Check(Completed(cooldown).Code == "rcon_cooldown" && HasKorean(Completed(cooldown).Message),
+                "Bot-owned RCON cooldown is Korean while raw output remains verbatim");
+        }
+        using (var fixture = new Fixture(captureAvailable: false))
+        {
+            JObject payload = fixture.Payload("rcon", A("command", "status")); payload["locale"] = "ko";
+            object pending = fixture.ParsePayload(payload)!; fixture.Execute(pending).Wait();
+            Check(Completed(pending).Code == "rcon_unavailable" && HasKorean(Completed(pending).Message),
+                "Bot-owned capture-unavailable error is Korean");
+        }
+    }
     private static void FixedExecutionLimits()
     {
         foreach (var limit in new Dictionary<string, int> { ["RconMinimumIntervalSeconds"] = 1,
@@ -95,6 +280,57 @@ internal static class DiscordCommonCommandsSmoke
         object pending = fixture.Parse("status", A());
         Check((long)Get(pending, "Deadline") - (long)Get(pending, "ReceivedAt") == 15L * Stopwatch.Frequency,
             "Every parsed command receives the fixed 15-second deadline");
+    }
+    private static void LocalizedFailures()
+    {
+        foreach (string failure in new[] { "registration", "rate", "not_ready", "invalid_arguments" })
+        {
+            using var fixture = new Fixture();
+            JObject payload = failure == "invalid_arguments"
+                ? fixture.Payload("teleport", A("player", "P", "to", "Q", "x", "1", "y", "2", "z", "3"))
+                : fixture.Payload("status", A());
+            payload["locale"] = "ko";
+            if (failure == "registration") payload["data"]!["id"] = "999";
+            if (failure == "rate") ((Dictionary<string, long>)Get(fixture.Commands, "_userRate"))["444"] = Stopwatch.GetTimestamp();
+            if (failure == "not_ready") Set(fixture.Commands, "_ready", false);
+            int calls = ServerCommands.Calls.Count;
+            fixture.Commands.HandleDispatchAsync("INTERACTION_CREATE", payload).Wait();
+            Wait(() => (int)Get(fixture.Commands, "_inFlight") == 0 && fixture.Http.Responses.Count == 1,
+                "Korean pre-admission failure receives one response " + failure);
+            JObject response = fixture.Http.Responses.Single();
+            string message = (string?)response["data"]?["content"] ?? "";
+            Check((int?)response["type"] == 4 && (int?)response["data"]?["flags"] == 64 &&
+                HasKorean(message) && !message.Contains("sm_discord_") && ServerCommands.Calls.Count == calls,
+                "Korean pre-admission failure is resolved, private, and never executes " + failure);
+        }
+        foreach (bool started in new[] { false, true })
+        {
+            using var fixture = new Fixture();
+            JObject payload = fixture.Payload("status", A()); payload["locale"] = "ko";
+            object pending = fixture.ProcessWithShortDeadline(payload);
+            Wait(() => ((System.Collections.ICollection)Get(fixture.Commands, "_queue")).Count == 1, "Korean timeout request deferred");
+            ServerCommands.Call? call = null;
+            if (started) { fixture.Commands.Tick(); call = ServerCommands.Calls.Last(); }
+            Wait(() => (int)Get(fixture.Commands, "_inFlight") == 0, "Korean timeout result delivered");
+            DiscordCommands.Result result = Completed(pending);
+            Check(result.Code == "timeout" && HasKorean(result.Message) && !result.Message.Contains("sm_discord_"),
+                "Waiting and possibly-executed timeout messages both use the interaction language");
+            Check((bool)Get(pending, "Started") == started && (!started || !call!.Caller.IsAuthorized()),
+                "Localized timeout preserves execution and revocation semantics");
+            if (call != null) call.Completion.SetResult(Result("committed"));
+        }
+        using (var fixture = new Fixture())
+        {
+            JObject payload = fixture.Payload("status", A()); payload["locale"] = "ko";
+            object pending = fixture.ParsePayload(payload)!;
+            Task execution = fixture.Execute(pending);
+            ServerCommands.Calls.Last().Completion.SetException(new InvalidOperationException("PRIVATE_BACKEND_EXCEPTION"));
+            execution.Wait();
+            DiscordCommands.Result result = Completed(pending);
+            Check(result.Code == "command_failed" && HasKorean(result.Message) && result.Message.Contains("InvalidOperationException") &&
+                !result.Message.Contains("PRIVATE_BACKEND_EXCEPTION"),
+                "Localized execution failure preserves exception type without leaking exception text");
+        }
     }
     private static void AdapterArguments()
     {
@@ -252,6 +488,107 @@ internal static class DiscordCommonCommandsSmoke
         fixture.Commands.HandleDispatchAsync("MESSAGE_CREATE", JObject.Parse("{\"content\":\"save\"}")).Wait();
         Check(ServerCommands.Calls.Count == calls, "Channel text not interpreted as admin commands");
     }
+    private static void EnglishRegistration()
+    {
+        using var fixture = new Fixture();
+        var expectedIds = new Dictionary<string, string>();
+        int nextId = 2000;
+        foreach (string name in Names)
+        {
+            JObject previous = Definition(name);
+            previous["id"] = expectedIds[name] = (++nextId).ToString();
+            previous["description"] = "기존 한국어 명령 설명";
+            foreach (JObject option in ((JArray)previous["options"]!).OfType<JObject>())
+                option["description"] = "기존 한국어 옵션 설명";
+            fixture.Http.Existing.Add(previous);
+        }
+        fixture.Http.Existing.Add(new JObject { ["id"] = "999", ["type"] = 1, ["name"] = "other-plugin", ["description"] = "다른 모드 설명" });
+        fixture.Http.Existing.Add(new JObject { ["id"] = "998", ["type"] = 2, ["name"] = "giveitem" });
+        fixture.Commands.HandleDispatchAsync("READY", JObject.Parse("{\"application\":{\"id\":\"777\"}}")).Wait();
+        Wait(() => (int)Get(fixture.Commands, "_registering") == 0 && fixture.Http.Definitions.Count == Names.Length,
+            "Existing Korean command descriptions reconcile to English");
+        Check(fixture.Http.RegistrationRequests.Count == Names.Length + 1 &&
+            fixture.Http.RegistrationRequests.Count(request => request.StartsWith("GET ", StringComparison.Ordinal)) == 1 &&
+            fixture.Http.RegistrationRequests.Count(request => request.StartsWith("PATCH ", StringComparison.Ordinal)) == Names.Length,
+            "Description migration only reads once and patches existing command IDs");
+        foreach (string name in Names)
+        {
+            JObject expected = Definition(name); expected.Remove("type");
+            Check(JToken.DeepEquals(expected, fixture.Http.Definitions.Single(item => (string?)item["name"] == name)),
+                "Korean registration is replaced with the complete English definition /" + name);
+            Check(fixture.Ids["111:" + name] == expectedIds[name] &&
+                fixture.Http.RegistrationRequests.Count(request => request.StartsWith("PATCH ", StringComparison.Ordinal) &&
+                    request.EndsWith("/applications/777/guilds/111/commands/" + expectedIds[name], StringComparison.Ordinal)) == 1,
+                "Description-only update preserves the existing command ID /" + name);
+        }
+        Check(!fixture.Http.BulkOverwrite && fixture.Http.Deleted.Count == 0 &&
+            !fixture.Http.RegistrationRequests.Any(request => request.EndsWith("/999", StringComparison.Ordinal) || request.EndsWith("/998", StringComparison.Ordinal)),
+            "English migration never mutates unrelated commands or same-name context menus");
+    }
+    private static void LocalizationRegistration()
+    {
+        using var fixture = new Fixture();
+        var expectedIds = new Dictionary<string, string>();
+        string[] changed = { "status", "players", "announce", "chat" };
+        int nextId = 3000;
+        foreach (string name in Names)
+        {
+            JObject previous = Definition(name);
+            previous["id"] = expectedIds[name] = (++nextId).ToString();
+            if (name == "status") previous.Remove("description_localizations");
+            if (name == "players") ((JObject)previous["options"]![0]!).Remove("description_localizations");
+            if (name == "announce") previous["description_localizations"]!["ko"] = "오래된 명령 번역";
+            if (name == "chat") previous["options"]![0]!["description_localizations"]!["ko"] = "오래된 옵션 번역";
+            // Discord response-only fields and omitted required:false values do
+            // not constitute registration drift; actual localization data does.
+            previous["name_localizations"] = JValue.CreateNull();
+            previous["description_localized"] = "Discord response rendering";
+            foreach (JObject option in ((JArray)previous["options"]!).OfType<JObject>())
+            {
+                option["name_localizations"] = JValue.CreateNull();
+                option["name_localized"] = (string)option["name"]!;
+                option["description_localized"] = "Discord option rendering";
+                if (!(bool)option["required"]!) option.Remove("required");
+                foreach (string bound in new[] { "min_value", "max_value" })
+                    if (option[bound] != null) option[bound] = (double)option[bound]!;
+            }
+            fixture.Http.Existing.Add(previous);
+        }
+        fixture.Http.Existing.Add(new JObject { ["id"] = "999", ["type"] = 1, ["name"] = "other-plugin" });
+        fixture.Http.Existing.Add(new JObject { ["id"] = "998", ["type"] = 2, ["name"] = "status" });
+        fixture.Commands.HandleDispatchAsync("READY", JObject.Parse("{\"application\":{\"id\":\"777\"}}")).Wait();
+        Wait(() => (int)Get(fixture.Commands, "_registering") == 0 && fixture.Http.Definitions.Count == changed.Length,
+            "Missing or stale Korean descriptions reconcile without English-text drift");
+        Check(fixture.Http.RegistrationRequests.Count == changed.Length + 1 &&
+            fixture.Http.RegistrationRequests.Count(request => request.StartsWith("PATCH ", StringComparison.Ordinal)) == changed.Length &&
+            fixture.Http.RegistrationRequests.Single(request => request.StartsWith("GET ", StringComparison.Ordinal))
+                .EndsWith("/commands?with_localizations=true", StringComparison.Ordinal),
+            "Localization-only reconciliation fetches complete dictionaries and patches only changed IDs");
+        foreach (string name in Names)
+        {
+            Check(fixture.Ids["111:" + name] == expectedIds[name], "Localized registration preserves command ID /" + name);
+            Check(fixture.Http.Definitions.Any(item => (string?)item["name"] == name) == changed.Contains(name),
+                "Unchanged bilingual commands are reused without mutation /" + name);
+        }
+        foreach (JObject actual in fixture.Http.Definitions)
+        {
+            JObject expected = Definition((string)actual["name"]!); expected.Remove("type");
+            Check(JToken.DeepEquals(actual, expected), "Localization-only PATCH contains the complete expected definition");
+        }
+        Check(!fixture.Http.BulkOverwrite && fixture.Http.Deleted.Count == 0 &&
+            !fixture.Http.RegistrationRequests.Any(request => request.EndsWith("/999", StringComparison.Ordinal) || request.EndsWith("/998", StringComparison.Ordinal)),
+            "Localization updates preserve unrelated commands and same-name context menus");
+        MethodInfo matches = typeof(DiscordCommands).GetMethod("DefinitionMatches", Static)!;
+        JObject expectedGiveItem = Definition("giveitem");
+        JObject numericResponse = (JObject)expectedGiveItem.DeepClone();
+        numericResponse["options"]![2]!["min_value"] = 1d;
+        numericResponse["options"]![2]!["max_value"] = 1000d;
+        Check((bool)matches.Invoke(null, new object[] { numericResponse, expectedGiveItem })!,
+            "Equivalent Discord integer/double numeric bounds do not cause a repeated PATCH");
+        numericResponse["options"]![2]!["min_value"] = 2d;
+        Check(!(bool)matches.Invoke(null, new object[] { numericResponse, expectedGiveItem })!,
+            "A genuinely changed Discord numeric bound still requires reconciliation");
+    }
     private static void MultiGuildIsolation()
     {
         using (var fixture = new Fixture(multipleGuilds: true))
@@ -371,6 +708,7 @@ internal static class DiscordCommonCommandsSmoke
         object helpPending = fixture.Parse("help", A()); fixture.Execute(helpPending).Wait();
         var help = ((TaskCompletionSource<DiscordCommands.Result>)Get(helpPending, "Completion")).Task.Result;
         Check(ServerCommands.Calls.Count == before && help.Success && help.Code == "help", "Slash help uses local flat catalog");
+        Check(IsAsciiEnglish(help.Message), "Slash help uses English default text");
         foreach (string name in Names) Check(help.Message.Contains("/" + name), "Help includes /" + name);
         Check(!help.Message.Contains("sm ") && !help.Message.Contains("/sm") && help.Message.Length <= 1999, "Help fits one message without legacy syntax");
         foreach (string verb in new[] { "save", "kick", "ban", "unban" })
@@ -597,7 +935,7 @@ internal static class DiscordCommonCommandsSmoke
             fixture.Commands.Tick(); var call = ServerCommands.Calls.Last(); int calls = ServerCommands.Calls.Count;
             Wait(() => (int)Get(fixture.Commands, "_inFlight") == 0, "Dispatched timeout responded");
             Check((bool)Get(pending, "Started") && !call.Caller.IsAuthorized(), "Started expired request loses further authority");
-            Check(fixture.Http.Responses.Any(item => ((string?)item["content"] ?? "").Contains("즉시 재시도하지")), "Timeout warns about possible execution");
+            Check(fixture.Http.Responses.Any(item => ((string?)item["content"] ?? "").Contains("Do not retry immediately")), "Timeout warns about possible execution in English");
             fixture.Commands.HandleDispatchAsync("INTERACTION_CREATE", payload).Wait(); fixture.Commands.Tick();
             Check(ServerCommands.Calls.Count == calls, "Duplicate timeout delivery never retries mutation");
             Check(!call.Completion.Task.IsCompleted, "Response timeout does not cancel or roll back an already dispatched backend operation");
@@ -683,6 +1021,28 @@ internal sealed class ZNet
 }
 namespace ServerManager
 {
+    internal static class PlayerLocalizer
+    {
+        private static Func<string, string, string[], string> _text = null!;
+        internal static void Bind(string assemblyPath)
+        {
+            // Use the actual embedded translations and formatter. Prime its cache
+            // with the runner's empty temporary directory, so no live game config,
+            // selected game language, or Unity singleton participates in this test.
+            Type production = Assembly.LoadFrom(assemblyPath).GetType("ServerManager.PlayerLocalizer", true)!;
+            const BindingFlags flags = BindingFlags.Static | BindingFlags.NonPublic;
+            MethodInfo reload = production.GetMethod("ReloadLanguage", flags)!;
+            string isolatedRoot = System.IO.Directory.GetCurrentDirectory();
+            foreach (string language in new[] { "English", "Korean", "UnlistedLanguage" })
+                if (!(bool)reload.Invoke(null, new object[] { language, isolatedRoot, isolatedRoot })!)
+                    throw new Exception("Cannot initialize isolated production localization for " + language);
+            _text = (Func<string, string, string[], string>)Delegate.CreateDelegate(typeof(Func<string, string, string[], string>),
+                production.GetMethod(nameof(TextForLanguage), flags)!);
+        }
+        internal static string TextForLanguage(string language, string key, params string[] args) => _text(language, key, args);
+        internal static string Text(string key, params string[] args) =>
+            throw new Exception("Discord must use explicit interaction language, never the selected game language.");
+    }
     internal static class IntegrityCanonical
     {
         internal static bool IsFatal(Exception exception) => exception is OutOfMemoryException || exception is StackOverflowException || exception is AccessViolationException;
@@ -799,7 +1159,8 @@ namespace ServerManager.Discord
                 if (method == HttpMethod.Delete) { lock (Deleted) Deleted.Add(uri.Substring(uri.LastIndexOf('/') + 1)); return Task.FromResult<JToken?>(null); }
                 if (method == HttpMethod.Put) BulkOverwrite = true;
                 lock (Definitions) Definitions.Add((JObject)body!.DeepClone());
-                return Task.FromResult<JToken?>(new JObject { ["id"] = guild == "111" ? "333" : "334" });
+                string id = method.Method == "PATCH" ? uri.Substring(uri.LastIndexOf('/') + 1) : guild == "111" ? "333" : "334";
+                return Task.FromResult<JToken?>(new JObject { ["id"] = id });
             }
             if (body != null) lock (Responses) Responses.Add((JObject)body.DeepClone());
             return Task.FromResult<JToken?>(new JObject());
@@ -814,8 +1175,9 @@ namespace ServerManager.Discord
         internal static bool NextAvailable = true;
         internal DiscordRconCapture(Action<string> log) { IsAvailable = NextAvailable; }
         internal bool IsAvailable { get; }
-        internal DiscordCommands.Result Execute(string line, int maximum)
-        { ++Executions; LastLine = line; LastMaximum = maximum; return DiscordCommands.Result.Ok("raw output"); }
+        internal string Output = "raw output";
+        internal DiscordCommands.Result Execute(string line, int maximum, string language = "English")
+        { ++Executions; LastLine = line; LastMaximum = maximum; return DiscordCommands.Result.Ok(Output); }
         public void Dispose() { }
     }
 }

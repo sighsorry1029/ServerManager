@@ -12,10 +12,10 @@ internal sealed class DiscordRconCapture : IDisposable
 
     internal DiscordRconCapture(Action<string> log) => _executor = new ServerConsoleExecutor(log);
 
-    internal DiscordCommands.Result Execute(string line, int maximumCharacters)
+    internal DiscordCommands.Result Execute(string line, int maximumCharacters, string language = "English")
     {
         ServerManagerCommandResult result = _executor.Execute(line, maximumCharacters, out bool observedResult);
-        return observedResult ? DiscordCommands.FormatIntegrationResult(result) :
+        return observedResult ? DiscordCommands.FormatIntegrationResult(result, language) :
             new DiscordCommands.Result(result.Success, result.Code, result.Message);
     }
 

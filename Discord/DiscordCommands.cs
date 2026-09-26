@@ -81,6 +81,10 @@ internal sealed class DiscordCommands : IDisposable
         _http = http ?? throw new ArgumentNullException(nameof(http));
         _log = log ?? throw new ArgumentNullException(nameof(log));
         _audit = audit ?? throw new ArgumentNullException(nameof(audit));
+        // Warm only supported languages before Gateway dispatch. Cached lookups
+        // never consult the game's language or scan files during an ACK deadline.
+        Localized("English", "unauthorized");
+        Localized("Korean", "unauthorized");
         _stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _token = _stop.Token;
         _rcon = new DiscordRconCapture(log);
@@ -143,16 +147,16 @@ internal sealed class DiscordCommands : IDisposable
             ++_inFlight;
             if (!IsAuthorized(pending.Name, pending.GuildId, pending.ChannelId,
                     pending.UserId))
-                pending.Rejection = "이 명령을 실행할 권한이 없습니다.";
+                pending.Rejection = Localized(pending.Language, "unauthorized");
             else if (!ValidateArguments(pending.Name, pending.Arguments))
-                pending.Rejection = "명령 인수가 올바르지 않습니다.";
+                pending.Rejection = Localized(pending.Language, "invalid_arguments");
             else if (!_commandIds.TryGetValue(CommandKey(pending.GuildId, pending.Name), out string commandId) ||
                      commandId != pending.CommandId)
-                pending.Rejection = "명령 등록이 완료되지 않았거나 이전 명령입니다.";
+                pending.Rejection = Localized(pending.Language, "registration_stale");
             else if (!AcceptRate(pending.UserId, now))
-                pending.Rejection = "명령 요청이 너무 많습니다. 잠시 후 다시 시도하세요.";
+                pending.Rejection = Localized(pending.Language, "rate_limited");
             else if (!_ready || _retired)
-                pending.Rejection = "게임 서버가 명령을 받을 준비가 되지 않았습니다.";
+                pending.Rejection = Localized(pending.Language, "not_ready");
         }
         // Never keep the receive loop waiting for REST, a Unity frame, or a game operation.
         _ = Task.Run(() => ProcessInteractionAsync(pending));
@@ -223,7 +227,7 @@ internal sealed class DiscordCommands : IDisposable
         {
             string endpoint = Api + "/applications/" + applicationId +
                 "/guilds/" + guildId + "/commands";
-            JArray? existing = await _http.SendAsync(HttpMethod.Get, endpoint, null,
+            JArray? existing = await _http.SendAsync(HttpMethod.Get, endpoint + "?with_localizations=true", null,
                 true, _token).ConfigureAwait(false) as JArray;
             if (existing == null) throw new InvalidOperationException("Invalid command list.");
             // Reconcile only this adapter's retired names, never bulk-overwrite
@@ -264,7 +268,7 @@ internal sealed class DiscordCommands : IDisposable
                     {
                         // A confirmed missing ID is not an ambiguous mutation. Re-read once to recover
                         // a concurrently deleted/recreated command without deleting unrelated commands.
-                        JArray? refreshed = await _http.SendAsync(HttpMethod.Get, endpoint, null,
+                        JArray? refreshed = await _http.SendAsync(HttpMethod.Get, endpoint + "?with_localizations=true", null,
                             true, _token).ConfigureAwait(false) as JArray;
                         if (refreshed == null) throw new InvalidOperationException("Invalid command list.");
                         JObject? replacement = refreshed.OfType<JObject>().FirstOrDefault(item =>
@@ -317,9 +321,9 @@ internal sealed class DiscordCommands : IDisposable
                 if (_token.IsCancellationRequested || !_ready || _retired ||
                     _disposed != 0 || Stopwatch.GetTimestamp() >= pending.Deadline)
                     pending.Completion.TrySetResult(Result.Fail("server_unavailable",
-                        "게임 서버가 종료 중이거나 명령 대기 시간이 초과됐습니다."));
+                        Localized(pending.Language, "server_unavailable")));
                 else if (_queue.Count >= Capacity)
-                    pending.Completion.TrySetResult(Result.Fail("queue_full", "명령 대기열이 가득 찼습니다."));
+                    pending.Completion.TrySetResult(Result.Fail("queue_full", Localized(pending.Language, "queue_full")));
                 else
                     _queue.Enqueue(pending);
             }
@@ -332,9 +336,8 @@ internal sealed class DiscordCommands : IDisposable
                 lock (_gate)
                 {
                     pending.Expired = true;
-                    pending.Completion.TrySetResult(Result.Fail("timeout", pending.Started
-                        ? "응답 시간이 초과됐지만 명령이 실행됐을 수 있습니다. 즉시 재시도하지 말고 서버 상태와 로그를 확인하세요."
-                        : "명령 대기 시간이 초과되어 실행하지 않았습니다."));
+                    pending.Completion.TrySetResult(Result.Fail("timeout", Localized(pending.Language,
+                        pending.Started ? "timeout_started" : "timeout_waiting")));
                 }
             }
             Result result = await pending.Completion.Task.ConfigureAwait(false);
@@ -410,7 +413,7 @@ internal sealed class DiscordCommands : IDisposable
                 if (_token.IsCancellationRequested || !_ready || _retired || pending.Expired ||
                     Stopwatch.GetTimestamp() >= pending.Deadline)
                 {
-                    pending.Completion.TrySetResult(Result.Fail("stale_command", "만료되었거나 종료된 서버의 명령은 실행하지 않습니다."));
+                    pending.Completion.TrySetResult(Result.Fail("stale_command", Localized(pending.Language, "stale_command")));
                     continue;
                 }
                 pending.Started = true;
@@ -472,7 +475,7 @@ internal sealed class DiscordCommands : IDisposable
         }
         catch (Exception exception)
         {
-            result = Result.Fail("command_failed", "명령 처리 실패: " + exception.GetType().Name);
+            result = Result.Fail("command_failed", Localized(pending.Language, "command_failed", exception.GetType().Name));
         }
         pending.Completion.TrySetResult(result);
         // The common executor writes its own identity-preserving execution audit.
@@ -482,10 +485,10 @@ internal sealed class DiscordCommands : IDisposable
     private Task<Result> ExecuteAsync(Pending pending)
     {
         if (!IsPendingAuthorized(pending))
-            return Task.FromResult(Result.Fail("unauthorized", "만료되었거나 권한이 변경된 명령은 실행하지 않습니다."));
+            return Task.FromResult(Result.Fail("unauthorized", Localized(pending.Language, "authorization_changed")));
         if (!ValidateArguments(pending.Name, pending.Arguments))
-            return Task.FromResult(Result.Fail("invalid_arguments", "명령 인수가 올바르지 않습니다."));
-        if (pending.Name == "help") return Task.FromResult(new Result(true, "help", HelpText()));
+            return Task.FromResult(Result.Fail("invalid_arguments", Localized(pending.Language, "invalid_arguments")));
+        if (pending.Name == "help") return Task.FromResult(new Result(true, "help", HelpText(pending.Language)));
         if (pending.Name == "rcon") return ExecuteRconAsync(pending);
         return ExecuteSharedAsync(pending, SharedLine(pending.Name, pending.Arguments));
     }
@@ -507,7 +510,7 @@ internal sealed class DiscordCommands : IDisposable
         pending.SharedExecution = true;
         return IntegrationResultAsync(ServerCommands.ExecuteAsync(line,
             new CommandCaller("discord", pending.UserId, pending.UserName,
-                () => IsPendingAuthorized(pending), _token)));
+                () => IsPendingAuthorized(pending), _token)), pending.Language);
     }
 
     internal static string SharedLine(string name, IDictionary<string, string> args)
@@ -537,23 +540,23 @@ internal sealed class DiscordCommands : IDisposable
     private async Task<Result> ExecuteRconAsync(Pending pending)
     {
         string line = pending.Arguments["command"];
-        if (!IsSharedRconLine(line)) return ExecuteRcon(line);
+        if (!IsSharedRconLine(line)) return ExecuteRcon(line, pending.Language);
         // Only ban/unban use the protected common moderation handler. All other
         // text retains its vanilla console meaning, including help/event/heal.
-        if (!TryBeginRcon()) return Result.Fail("rcon_cooldown", "RCON 실행 또는 재사용 대기 중입니다.");
+        if (!TryBeginRcon()) return Result.Fail("rcon_cooldown", Localized(pending.Language, "rcon_cooldown"));
         try { return await ExecuteSharedAsync(pending, line).ConfigureAwait(false); }
         finally { CompleteRcon(); }
     }
 
-    private Result ExecuteRcon(string line)
+    private Result ExecuteRcon(string line, string language = "English")
     {
         if (_rcon == null || !_rcon.IsAvailable)
-            return Result.Fail("rcon_unavailable", "서버 콘솔 출력 캡처를 사용할 수 없습니다.");
+            return Result.Fail("rcon_unavailable", Localized(language, "rcon_unavailable"));
         if (!TryBeginRcon())
-            return Result.Fail("rcon_cooldown", "RCON 실행 또는 재사용 대기 중입니다.");
+            return Result.Fail("rcon_cooldown", Localized(language, "rcon_cooldown"));
         try
         {
-            return _rcon.Execute(line, MaximumRconOutputCharacters);
+            return _rcon.Execute(line, MaximumRconOutputCharacters, language);
         }
         finally { CompleteRcon(); }
     }
@@ -580,18 +583,19 @@ internal sealed class DiscordCommands : IDisposable
         }
     }
 
-    private static async Task<Result> IntegrationResultAsync(Task<ServerManagerCommandResult> task)
+    private static async Task<Result> IntegrationResultAsync(Task<ServerManagerCommandResult> task, string language)
     {
         ServerManagerCommandResult result = await task.ConfigureAwait(false);
-        return FormatIntegrationResult(result);
+        return FormatIntegrationResult(result, language);
     }
 
-    internal static Result FormatIntegrationResult(ServerManagerCommandResult result)
+    internal static Result FormatIntegrationResult(ServerManagerCommandResult result, string language = "English")
     {
         bool savePending = result.Success && (result.Code == "save_requested" || result.Code == "save_scheduled");
-        string message = (result.Success ? (savePending ? "요청 접수: " : "성공: ") : "실패: ") +
-            result.Message + "\nresult_code: " + result.Code;
-        if (savePending) message += "\n저장 완료를 의미하지 않습니다. /status에서 저장 상태와 캐릭터 반영 범위를 확인하세요.";
+        // Shared/game/mod output stays literal. Only this adapter's wrapper is localized.
+        string message = Localized(language, result.Success ? (savePending ? "request_accepted" : "success") : "failed",
+            result.Message) + "\nresult_code: " + result.Code;
+        if (savePending) message += "\n" + Localized(language, "save_pending");
         if (!string.IsNullOrWhiteSpace(result.OperationId)) message += "\noperation_id: " + result.OperationId;
         foreach (KeyValuePair<string, string> pair in result.Data.Take(16))
             if (pair.Key != "operation_id") message += "\n" + pair.Key + ": " + pair.Value;
@@ -791,7 +795,8 @@ internal sealed class DiscordCommands : IDisposable
         if (userName.Length == 0) userName = "Discord user " + user;
         return new Pending(id, token, app, Text(data["data"]?["id"]), name,
             Text(data["guild_id"]), Text(data["channel_id"] ?? data["channel"]?["id"]), user,
-            userName, args, received, received + (long)CommandTimeoutSeconds * Stopwatch.Frequency);
+            userName, args, received, received + (long)CommandTimeoutSeconds * Stopwatch.Frequency,
+            Text(data["locale"]) == "ko" ? "Korean" : "English");
     }
 
     internal static bool ValidateArguments(string name, IDictionary<string, string> args)
@@ -825,69 +830,79 @@ internal sealed class DiscordCommands : IDisposable
     private static JObject Definition(string name)
     {
         CommandSpec spec = Catalog[name];
-        return new JObject { ["type"] = 1, ["name"] = name, ["description"] = spec.Description,
+        return new JObject { ["type"] = 1, ["name"] = name,
+            ["description"] = Description("English", "command_" + name),
+            ["description_localizations"] = new JObject { ["ko"] = Description("Korean", "command_" + name) },
             ["options"] = new JArray(spec.Options.Select(option => option.Definition())) };
     }
 
-    private static string HelpText()
+    private static string Localized(string language, string key, params string[] args) =>
+        PlayerLocalizer.TextForLanguage(language == "Korean" ? "Korean" : "English", "sm_discord_" + key, args);
+
+    private static string Description(string language, string key)
+    {
+        // External translation overrides must also respect Discord's 100-character limit.
+        string value = Localized(language, key).Trim();
+        return value.Length <= 100 ? value : value.Substring(0, char.IsHighSurrogate(value[99]) ? 99 : 100);
+    }
+
+    private static string HelpText(string language = "English")
     {
         IEnumerable<string> lines = Catalog.Values.Where(spec => spec.Name != "rcon").Select(spec =>
-            spec.Name == "teleport" ? "/teleport <player> (to:<player> 또는 x:<n> y:<n> z:<n>)" :
+            spec.Name == "teleport" ? Localized(language, "help_teleport") :
             "/" + spec.Name + string.Concat(spec.Options.Select(option =>
                 option.Required ? " <" + option.Name + ">" : " [" + option.Name + "]")));
-        return string.Join("\n", lines) + "\n/rcon command:<서버 콘솔 명령>\n" +
-            "예: /rcon command:\"save\", /rcon command:\"kick Player\",\n" +
-            "/rcon command:\"ban 76561198000000001\", /rcon command:\"unban 76561198000000001\"";
+        return string.Join("\n", lines) + "\n" + Localized(language, "help_rcon");
     }
 
     // One descriptor owns Discord registration, admission validation and the
     // ordered, quoted common-command arguments. No free-form feature dispatcher.
     private static Dictionary<string, CommandSpec> BuildCatalog()
     {
-        OptionSpec Player(bool required = true) => StringOption("player", "플레이어 이름 또는 ID", 128, required);
-        OptionSpec SteamId() => new("steam-id", "SteamID64 (17자리)", 3, true, 17, rule: "steam");
-        OptionSpec Skill(bool required = true) => TokenOption("skill", "스킬 이름", required);
-        OptionSpec Coordinate(string name, bool required = true) => NumberOption(name, name + " 좌표", -1000000, 1000000, required);
+        OptionSpec Player(bool required = true) => StringOption("player", "player", 128, required);
+        OptionSpec SteamId() => new("steam-id", "steam_id", 3, true, 17, rule: "steam");
+        OptionSpec Skill(bool required = true) => TokenOption("skill", "skill", required);
+        OptionSpec Coordinate(string name, bool required = true) => NumberOption(name, name, -1000000, 1000000, required);
         CommandSpec[] specs =
         {
-            new("status", "서버와 저장 상태를 조회합니다."),
-            new("players", "현재 접속자 목록 또는 한 플레이어의 위치를 조회합니다.", Player(false)),
-            new("announce", "게임 안에 공지를 표시합니다.", StringOption("message", "공지 내용", 500)),
-            new("chat", "게임 전체 채팅으로 메시지를 보냅니다.", StringOption("message", "채팅 내용", 500)),
-            new("banlist", "서버 차단 계정 목록을 조회합니다."),
-            new("adminlist", "게임 관리자 목록을 조회합니다."),
-            new("adminadd", "게임 관리자를 추가합니다.", SteamId()),
-            new("adminremove", "게임 관리자를 제거합니다.", SteamId()),
-            new("accesslist", "서버 접속 허용 목록을 조회합니다."),
-            new("accessadd", "서버 접속 허용 계정을 추가합니다.", SteamId()),
-            new("accessremove", "서버 접속 허용 계정을 제거합니다.", SteamId()),
-            new("keylist", "월드 전역 키를 조회합니다."),
-            new("keyadd", "월드 전역 키를 추가합니다.", TokenOption("key", "전역 키")),
-            new("keyremove", "월드 전역 키를 제거합니다.", TokenOption("key", "전역 키")),
-            new("eventstart", "지정 좌표에서 이벤트를 시작합니다.", TokenOption("event", "이벤트 이름"), Coordinate("x"), Coordinate("y"), Coordinate("z")),
-            new("eventstop", "진행 중인 이벤트를 중지합니다."),
-            new("characterlist", "서버 캐릭터 목록을 조회합니다."),
-            new("characterinfo", "서버 캐릭터 정보를 조회합니다.", Player()),
-            new("characterbackups", "서버 캐릭터 백업 목록을 조회합니다.", Player(), IntegerOption("page", "페이지", 1, 1000, false)),
-            new("characterrestore", "오프라인 캐릭터를 백업에서 복원합니다.", Player(),
-                new OptionSpec("backup_id", "백업 ID (32자리 소문자 16진수)", 3, true, 32, rule: "backup")),
-            new("giveitem", "플레이어에게 아이템을 지급합니다.", Player(), TokenOption("prefab", "아이템 프리팹"),
-                IntegerOption("amount", "수량", 1, 1000), IntegerOption("quality", "품질", 1, 100, false),
-                new OptionSpec("data_id", "서버 아이템 데이터 프리셋 ID (품질 생략 시 1)", 3, false, 64, rule: "item_data")),
-            new("teleport", "플레이어를 좌표 또는 다른 플레이어에게 이동합니다.", Player(),
-                StringOption("to", "목적지 플레이어 (좌표와 함께 사용할 수 없음)", 128, false), Coordinate("x", false), Coordinate("y", false), Coordinate("z", false)),
-            new("skillget", "플레이어의 스킬을 조회합니다.", Player(), Skill(false)),
-            new("skillset", "플레이어의 스킬 레벨을 설정합니다.", Player(), Skill(), NumberOption("value", "스킬 레벨", 0, 100)),
-            new("heal", "플레이어의 체력을 회복합니다.", Player(), NumberOption("amount", "회복량", 0.001, 100000)),
-            new("damage", "플레이어에게 피해를 줍니다.", Player(), NumberOption("amount", "피해량", 0.001, 100000)),
-            new("modsstatus", "모드 무결성 상태를 조회합니다."),
-            new("modsreload", "모드 무결성 설정을 다시 읽습니다."),
-            new("discordstatus", "Discord 연결 상태를 조회합니다."),
-            new("discordtest", "Discord 알림 전송을 테스트합니다."),
-            new("cronstatus", "예약 실행 상태와 확인이 필요한 작업을 조회합니다."),
-            new("cronack", "중단된 예약을 재실행하지 않고 확인 처리합니다.", StringOption("job", "cronstatus에 표시된 작업 ID", 64)),
-            new("help", "지원되는 관리 기능의 도움말을 조회합니다."),
-            new("rcon", "서버 콘솔 명령을 실행합니다.", StringOption("command", "서버 콘솔 명령 (예: save, kick, ban, unban)", 1000))
+            new("status"),
+            new("players", Player(false)),
+            new("announce", StringOption("message", "announcement", 500)),
+            new("chat", StringOption("message", "chat", 500)),
+            new("banlist"),
+            new("adminlist"),
+            new("adminadd", SteamId()),
+            new("adminremove", SteamId()),
+            new("accesslist"),
+            new("accessadd", SteamId()),
+            new("accessremove", SteamId()),
+            new("keylist"),
+            new("keyadd", TokenOption("key", "key")),
+            new("keyremove", TokenOption("key", "key")),
+            new("eventstart", TokenOption("event", "event"), Coordinate("x"), Coordinate("y"), Coordinate("z")),
+            new("eventstop"),
+            new("characterlist"),
+            new("characterinfo", Player()),
+            new("characterbackups", Player(), IntegerOption("page", "page", 1, 1000, false)),
+            new("characterrestore", Player(),
+                new OptionSpec("backup_id", "backup_id", 3, true, 32, rule: "backup")),
+            new("giveitem", Player(), TokenOption("prefab", "prefab"),
+                IntegerOption("amount", "amount", 1, 1000), IntegerOption("quality", "quality", 1, 100, false),
+                new OptionSpec("data_id", "data_id", 3, false, 64, rule: "item_data")),
+            new("teleport", Player(),
+                StringOption("to", "to", 128, false), Coordinate("x", false), Coordinate("y", false), Coordinate("z", false)),
+            new("skillget", Player(), Skill(false)),
+            new("skillset", Player(), Skill(), NumberOption("value", "value", 0, 100)),
+            new("heal", Player(), NumberOption("amount", "health", 0.001, 100000)),
+            new("damage", Player(), NumberOption("amount", "damage", 0.001, 100000)),
+            new("modsstatus"),
+            new("modsreload"),
+            new("discordstatus"),
+            new("discordtest"),
+            new("cronstatus"),
+            new("cronack", StringOption("job", "job", 64)),
+            new("help"),
+            new("rcon", StringOption("command", "command", 1000))
         };
         if (!new HashSet<string>(specs.Where(spec => spec.Name != "rcon").Select(spec => spec.Name),
                 StringComparer.Ordinal).SetEquals(ServerCommands.FlatCommandNames))
@@ -906,9 +921,9 @@ internal sealed class DiscordCommands : IDisposable
 
     private sealed class CommandSpec
     {
-        internal CommandSpec(string name, string description, params OptionSpec[] options)
-        { Name = name; Description = description; Options = options; }
-        internal readonly string Name, Description;
+        internal CommandSpec(string name, params OptionSpec[] options)
+        { Name = name; Options = options; }
+        internal readonly string Name;
         internal readonly OptionSpec[] Options;
     }
 
@@ -916,16 +931,18 @@ internal sealed class DiscordCommands : IDisposable
     {
         internal OptionSpec(string name, string description, int type, bool required,
             int maximumLength, double minimum = 0, double maximum = 0, string rule = "")
-        { Name = name; Description = description; Type = type; Required = required;
+        { Name = name; DescriptionKey = "option_" + description; Type = type; Required = required;
             MaximumLength = maximumLength; Minimum = minimum; Maximum = maximum; Rule = rule; }
-        internal readonly string Name, Description, Rule;
+        internal readonly string Name, DescriptionKey, Rule;
         internal readonly int Type, MaximumLength;
         internal readonly bool Required;
         internal readonly double Minimum, Maximum;
         internal JObject Definition()
         {
             JObject definition = new() { ["type"] = Type, ["name"] = Name,
-                ["description"] = Description, ["required"] = Required };
+                ["description"] = Description("English", DescriptionKey),
+                ["description_localizations"] = new JObject { ["ko"] = Description("Korean", DescriptionKey) },
+                ["required"] = Required };
             if (Type == 3) { definition["min_length"] = Rule == "backup" ? 32 : 1; definition["max_length"] = MaximumLength; }
             else { definition["min_value"] = Minimum; definition["max_value"] = Maximum; }
             return definition;
@@ -957,7 +974,27 @@ internal sealed class DiscordCommands : IDisposable
 
     private static bool DefinitionMatches(JObject existing, JObject expected) =>
         Text(existing["description"]) == Text(expected["description"]) &&
-        JToken.DeepEquals(existing["options"] ?? new JArray(), expected["options"]);
+        JToken.DeepEquals(existing["description_localizations"], expected["description_localizations"]) &&
+        JToken.DeepEquals(ComparableOptions(existing), ComparableOptions(expected));
+
+    private static JArray ComparableOptions(JObject definition)
+    {
+        // Discord may add null localization metadata and omit required:false.
+        // Keep option order and validation constraints significant, not response-only fields.
+        JArray options = (JArray?)definition["options"]?.DeepClone() ?? new JArray();
+        foreach (JObject option in options.OfType<JObject>())
+        {
+            option.Remove("name_localized");
+            option.Remove("description_localized");
+            if (option["name_localizations"]?.Type == JTokenType.Null) option.Remove("name_localizations");
+            option["required"] = (bool?)option["required"] ?? false;
+            // NUMBER bounds may return as integers even when sent as 0.0/100.0.
+            foreach (string bound in new[] { "min_value", "max_value" })
+                if (option[bound]?.Type == JTokenType.Integer || option[bound]?.Type == JTokenType.Float)
+                    option[bound] = (double)option[bound]!;
+        }
+        return options;
+    }
     private static string Text(JToken? token) => token?.Type == JTokenType.String ? (string)token! : string.Empty;
     private static bool IsSnowflake(string text) => text.Length >= 1 && text.Length <= 20 &&
         text[0] != '0' && text.All(character => character >= '0' && character <= '9') &&
@@ -973,7 +1010,10 @@ internal sealed class DiscordCommands : IDisposable
             _retired = true;
             _chatQueue.Clear();
             while (_queue.Count != 0)
-                _queue.Dequeue().Completion.TrySetResult(Result.Fail("shutdown", "봇이 종료 중입니다."));
+            {
+                Pending pending = _queue.Dequeue();
+                pending.Completion.TrySetResult(Result.Fail("shutdown", Localized(pending.Language, "shutdown")));
+            }
         }
         _rcon?.Dispose();
         DisposeSourceIfIdle();
@@ -1014,14 +1054,15 @@ internal sealed class DiscordCommands : IDisposable
     {
         internal Pending(string id, string token, string applicationId, string commandId,
             string name, string guildId, string channelId, string userId, string userName,
-            Dictionary<string, string> arguments, long receivedAt, long deadline)
+            Dictionary<string, string> arguments, long receivedAt, long deadline, string language = "English")
         {
             Id = id; Token = token; ApplicationId = applicationId; CommandId = commandId;
             Name = name; GuildId = guildId; ChannelId = channelId; UserId = userId;
             UserName = userName;
+            Language = language;
             Arguments = arguments; ReceivedAt = receivedAt; Deadline = deadline;
         }
-        internal readonly string Id, Token, ApplicationId, CommandId, Name, GuildId, ChannelId, UserId, UserName;
+        internal readonly string Id, Token, ApplicationId, CommandId, Name, GuildId, ChannelId, UserId, UserName, Language;
         internal readonly Dictionary<string, string> Arguments;
         internal readonly long ReceivedAt, Deadline;
         internal readonly TaskCompletionSource<Result> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);

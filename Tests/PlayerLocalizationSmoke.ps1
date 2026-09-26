@@ -190,7 +190,8 @@ try {
         Assert-True (($englishSlots -join '|') -ceq ($koreanSlots -join '|')) ('Translation placeholder mismatch: ' + $key)
         $expectedArguments = if ($englishSlots.Count) { ([int]($englishSlots | Measure-Object -Maximum).Maximum) + 1 } else { 0 }
         $expectedWireMessage = -not $key.StartsWith('sm_menu_', [StringComparison]::Ordinal) -and
-            -not $key.StartsWith('sm_event_', [StringComparison]::Ordinal)
+            -not $key.StartsWith('sm_event_', [StringComparison]::Ordinal) -and
+            -not $key.StartsWith('sm_discord_', [StringComparison]::Ordinal)
         Assert-True ([bool]$isKnownMessage.Invoke($null, [object[]]@($key, $expectedArguments)) -eq $expectedWireMessage -and
             -not $isKnownMessage.Invoke($null, [object[]]@($key, ($expectedArguments + 1)))) ('Typed argument count validation disagrees with the English template: ' + $key)
         $plainArguments = [string[]]@('VALUE_ZERO', 'VALUE_ONE', 'VALUE_TWO', 'VALUE_THREE')
@@ -201,6 +202,58 @@ try {
                 Assert-True ($rendered -ceq (Localized 'English' $key $plainArguments)) 'Unknown languages do not fall back to English deterministically.'
             }
         }
+    }
+    # Use the plugin's real embedded dictionaries, not copies of the bot text.
+    # Discord presentation must not enlarge the player-message wire allowlist.
+    $discordCommandNames = @('status', 'players', 'announce', 'chat', 'banlist', 'adminlist',
+        'adminadd', 'adminremove', 'accesslist', 'accessadd', 'accessremove', 'keylist', 'keyadd',
+        'keyremove', 'eventstart', 'eventstop', 'characterlist', 'characterinfo', 'characterbackups',
+        'characterrestore', 'giveitem', 'teleport', 'skillget', 'skillset', 'heal', 'damage',
+        'modsstatus', 'modsreload', 'discordstatus', 'discordtest', 'cronstatus', 'cronack', 'help', 'rcon')
+    $discordOptionNames = @('player', 'steam_id', 'skill', 'x', 'y', 'z', 'announcement', 'chat',
+        'key', 'event', 'page', 'backup_id', 'prefab', 'amount', 'quality', 'data_id', 'to', 'value',
+        'health', 'damage', 'job', 'command')
+    $discordNoticeArities = @{
+        unauthorized = 0; invalid_arguments = 0; registration_stale = 0; rate_limited = 0
+        not_ready = 0; server_unavailable = 0; queue_full = 0; timeout_started = 0; timeout_waiting = 0
+        stale_command = 0; command_failed = 1; authorization_changed = 0; rcon_cooldown = 0
+        rcon_unavailable = 0; shutdown = 0; request_accepted = 1; success = 1; failed = 1
+        save_pending = 0; help_teleport = 0; help_rcon = 0
+    }
+    $discordArities = @{}
+    foreach ($name in $discordCommandNames) { $discordArities['sm_discord_command_' + $name] = 0 }
+    foreach ($name in $discordOptionNames) { $discordArities['sm_discord_option_' + $name] = 0 }
+    foreach ($entry in $discordNoticeArities.GetEnumerator()) { $discordArities['sm_discord_' + $entry.Key] = [int]$entry.Value }
+    [string[]]$discordKeys = @($english.Keys | Where-Object { $_.StartsWith('sm_discord_', [StringComparison]::Ordinal) } | Sort-Object)
+    Assert-True ($discordCommandNames.Count -eq 34 -and $discordOptionNames.Count -eq 22 -and
+        $discordArities.Count -eq 77 -and ($discordKeys -join '|') -ceq (@($discordArities.Keys | Sort-Object) -join '|')) `
+        'The real Discord resources must contain exactly 34 command descriptions, 22 option descriptions and 21 adapter notices.'
+    foreach ($discordKey in $discordKeys) {
+        $arity = [int]$discordArities[$discordKey]
+        [string[]]$literalValues = if ($arity -eq 1) { @('RAW_{0}_sm_discord_success_@everyone_<player>') } else { @() }
+        foreach ($language in @('English', 'Korean')) {
+            $table = if ($language -eq 'Korean') { $korean } else { $english }
+            Assert-True ($table.ContainsKey($discordKey)) ('A Discord translation is absent from the real ' + $language + ' resource: ' + $discordKey)
+            $template = $table[$discordKey]
+            $slots = @([Regex]::Matches($template, '\{([0-9]+)\}'))
+            Assert-True ($slots.Count -eq $arity -and ($arity -eq 0 -or $slots[0].Groups[1].Value -ceq '0')) `
+                ('A Discord template changed its canonical simple-placeholder shape: ' + $discordKey)
+            $expected = if ($arity -eq 1) { $template.Replace('{0}', $literalValues[0]) } else { $template }
+            Assert-True ((Localized $language $discordKey $literalValues) -ceq $expected) `
+                ('Discord rendering changed a literal argument, failed to use the embedded resource, or recursively translated text: ' + $discordKey)
+        }
+        Assert-True ($english[$discordKey] -cne $korean[$discordKey] -and $korean[$discordKey] -match '[\uac00-\ud7a3]') `
+            ('A Discord Korean resource is untranslated: ' + $discordKey)
+        foreach ($testArity in 0..3) {
+            Assert-True (-not $isKnownMessage.Invoke($null, [object[]]@($discordKey, $testArity))) `
+                ('A Discord-only token expanded the player-message wire allowlist: ' + $discordKey)
+        }
+    }
+    foreach ($descriptionKey in @($discordCommandNames | ForEach-Object { 'sm_discord_command_' + $_ }) +
+        @($discordOptionNames | ForEach-Object { 'sm_discord_option_' + $_ })) {
+        Assert-True ($english[$descriptionKey].Length -ge 1 -and $english[$descriptionKey].Length -le 100 -and
+            $korean[$descriptionKey].Length -ge 1 -and $korean[$descriptionKey].Length -le 100) `
+            ('An embedded Discord command/option description exceeds its 1-100 character registration limit: ' + $descriptionKey)
     }
     [string[]]$eventKeys = @($english.Keys | Where-Object { $_.StartsWith('sm_event_', [StringComparison]::Ordinal) } | Sort-Object)
     Assert-True ($eventKeys.Count -eq 52) 'The event resource surface must contain 39 story keys, four auxiliary labels and nine webhook-only labels.'

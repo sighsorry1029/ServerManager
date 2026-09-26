@@ -43,6 +43,37 @@ Assert-True (@($catalogNames | Where-Object { $_.Contains('-') }).Count -eq 0) '
 Assert-True ((@($flatNames | Sort-Object) -join '|') -ceq (@($catalogNames | Where-Object { $_ -ne 'rcon' } | Sort-Object) -join '|')) 'Discord and F5 must expose exactly the same flat feature names, with RCON exclusive to Discord.'
 Assert-True ($flatNames -contains 'banlist' -and $flatNames -notcontains 'rcon') 'The shared catalog must include banlist but must not create sm:rcon.'
 
+# Exercise embedded translations through the real language-explicit helper,
+# without consulting live BepInEx files or the selected game language.
+[string]$localeFixture = Join-Path ([IO.Path]::GetTempPath()) ('ServerManager-DiscordLocale-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $localeFixture | Out-Null
+try {
+    $localizerType = $assembly.GetType('ServerManager.PlayerLocalizer', $true)
+    $reloadLocale = $localizerType.GetMethod('ReloadLanguage', $staticFlags)
+    foreach ($language in @('English', 'Korean', 'UnlistedLanguage')) {
+        Assert-True ($reloadLocale.Invoke($null, [object[]]@($language, $localeFixture, $localeFixture))) "Cannot initialize isolated locale: $language"
+    }
+} finally {
+    # This fixture only creates an empty directory; never recurse into arbitrary
+    # external/config paths during cleanup.
+    Remove-Item -LiteralPath $localeFixture
+}
+$definitionMethod = $commandsType.GetMethod('Definition', $staticFlags)
+foreach ($name in $catalogNames) {
+    $definition = $definitionMethod.Invoke($null, [object[]]@($name)).ToString() | ConvertFrom-Json
+    Assert-True ($definition.name -ceq $name -and $definition.type -eq 1 -and
+        [string]::IsNullOrEmpty($definition.name_localizations)) "Localization must preserve slash identifiers: $name"
+    Assert-True ($definition.description -cmatch '^[\x20-\x7e]{1,100}$' -and
+        $definition.description_localizations.ko -match '[\uac00-\ud7a3]' -and
+        $definition.description_localizations.ko.Length -le 100) "Command descriptions require English defaults and bounded Korean localization: $name"
+    foreach ($option in $definition.options) {
+        Assert-True ($option.description -cmatch '^[\x20-\x7e]{1,100}$' -and
+            $option.description_localizations.ko -match '[\uac00-\ud7a3]' -and
+            $option.description_localizations.ko.Length -le 100 -and
+            [string]::IsNullOrEmpty($option.name_localizations)) "Option descriptions require English/Korean while preserving identifiers: $name/$($option.name)"
+    }
+}
+
 $compileOptions = @{}
 if ($PSVersionTable.PSVersion.Major -lt 6) {
     Add-Type -AssemblyName System.Net.Http
@@ -59,6 +90,7 @@ using System.Threading.Tasks;
 public sealed class DiscordCommandSmokeHandler : HttpMessageHandler
 {
     public readonly ConcurrentQueue<string> Paths = new ConcurrentQueue<string>();
+    public readonly ConcurrentQueue<string> ReadUris = new ConcurrentQueue<string>();
     public readonly ConcurrentQueue<string> Bodies = new ConcurrentQueue<string>();
     public static readonly ConcurrentQueue<object> Audits = new ConcurrentQueue<object>();
     public bool FailAcknowledgement;
@@ -87,6 +119,7 @@ public sealed class DiscordCommandSmokeHandler : HttpMessageHandler
                 Content = new StringContent(FailAcknowledgement ? "{\"code\":40060}" : "") };
         }
         if (request.Method == HttpMethod.Get) {
+            ReadUris.Enqueue(request.RequestUri.PathAndQuery);
             int read = Interlocked.Increment(ref Reads);
             if (StaleEdit && read == 1)
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(
@@ -243,13 +276,23 @@ try {
         $result = $resultType.GetConstructors($instanceFlags)[0].Invoke([object[]]@(
             $true, $code, 'Completion has not yet been claimed.', 'op-123',
             [Collections.Generic.Dictionary[string,string]]::new()))
-        $formatted = $commandsType.GetMethod('FormatIntegrationResult', $staticFlags).Invoke($null, [object[]]@($result))
+        $formatted = $commandsType.GetMethod('FormatIntegrationResult', $staticFlags).Invoke($null, [object[]]@($result, 'English'))
         $text = $formatted.GetType().GetProperty('Message', $instanceFlags).GetValue($formatted)
-        Assert-True ($text.StartsWith(([string][char]0xC694)) -and $text.Contains('/status')) 'Save acceptance must not be reported as disk/checkpoint completion.'
+        Assert-True ($text.StartsWith('Request accepted: ') -and $text.Contains('/status') -and
+            $text.Contains('does not mean the save is complete')) 'English save acceptance must not be reported as disk/checkpoint completion.'
+        $korean = $commandsType.GetMethod('FormatIntegrationResult', $staticFlags).Invoke($null, [object[]]@($result, 'Korean'))
+        $koreanText = $korean.GetType().GetProperty('Message', $instanceFlags).GetValue($korean)
+        Assert-True ($koreanText -match '[\uac00-\ud7a3]' -and $koreanText.Contains('Completion has not yet been claimed.') -and
+            $koreanText.Contains('/status') -and $koreanText.Contains('result_code: ' + $code) -and
+            $koreanText.Contains('operation_id: op-123')) 'Korean save acceptance must retain the original backend message and stable result metadata.'
+        $fallback = $commandsType.GetMethod('FormatIntegrationResult', $staticFlags).Invoke($null, [object[]]@($result, 'UnlistedLanguage'))
+        Assert-True ($fallback.GetType().GetProperty('Message', $instanceFlags).GetValue($fallback) -ceq $text) 'Unsupported result language must fall back to English.'
     }
 
     Dispatch $fixture.Commands 'READY' '{"application":{"id":"777"}}'
     Wait-Until { (Field $fixture.Commands '_commandIds').Count -eq $catalogNames.Count } 'Slash registration did not finish.'
+    Assert-True ($fixture.Handler.ReadUris.Count -eq 1 -and
+        $fixture.Handler.ReadUris.ToArray()[0].EndsWith('/commands?with_localizations=true')) 'Registration must request full Discord localization dictionaries.'
     Assert-True (-not ($fixture.Handler.Paths.ToArray() -match 'DELETE|PUT')) 'Registration must not bulk replace/delete unrelated commands.'
     Assert-True (($fixture.Handler.Bodies.ToArray() -match '"name":"rcon"').Count -eq 1) 'RCON must be registered with the fixed command catalog.'
     Assert-True (-not ($fixture.Handler.Bodies.ToArray() -match '"name":"(save|kick|ban|unban|sm)"')) 'Removed duplicate and generic slash commands must not be registered.'
@@ -424,7 +467,7 @@ try {
     Set-Field $retiring.Commands '_lastRconCompleted' ([Diagnostics.Stopwatch]::GetTimestamp())
     $commandsType.GetMethod('InheritRecentState', $instanceFlags).Invoke($replacement.Commands,
         [object[]]@($retiring.Commands)) | Out-Null
-    $cooldownResult = $commandsType.GetMethod('ExecuteRcon', $instanceFlags).Invoke($replacement.Commands, [object[]]@('help'))
+    $cooldownResult = $commandsType.GetMethod('ExecuteRcon', $instanceFlags).Invoke($replacement.Commands, [object[]]@('help', 'English'))
     Assert-True ($cooldownResult.GetType().GetProperty('Code', $instanceFlags).GetValue($cooldownResult) -eq 'rcon_cooldown') 'Copied RCON cooldown must reject before touching the console.'
     $tryBeginRcon = $commandsType.GetMethod('TryBeginRcon', $instanceFlags)
     Set-Field $replacement.Commands '_lastRconCompleted' ([Diagnostics.Stopwatch]::GetTimestamp() - 2L * [Diagnostics.Stopwatch]::Frequency)
@@ -585,6 +628,8 @@ try {
     Dispatch $registration.Commands 'READY' '{"application":{"id":"777"}}'
     Wait-Until { (Field $registration.Commands '_commandIds').Count -eq $catalogNames.Count } 'Confirmed stale command ID must recover via one fresh read.'
     Assert-True ($registration.Handler.Reads -eq 2) 'Stale edit recovery must re-read authoritative command state.'
+    Assert-True ($registration.Handler.ReadUris.Count -eq 2 -and
+        @($registration.Handler.ReadUris.ToArray() | Where-Object { -not $_.EndsWith('/commands?with_localizations=true') }).Count -eq 0) 'Both initial registration and stale-ID recovery must request full localization dictionaries.'
     Assert-True (($registration.Handler.Paths.ToArray() -match '^PATCH .*\/123$').Count -eq 1) 'Stale command ID must not be retried blindly.'
     Assert-True (($registration.Handler.Paths.ToArray() -match '^POST ').Count -eq $catalogNames.Count) 'Each confirmed missing catalog command may be created only once.'
 } finally { $registration.Commands.Dispose(); $registration.Http.Dispose() }

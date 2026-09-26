@@ -7695,11 +7695,15 @@ internal static partial class ServerManagerRuntime
                         session.ManagedProfile))
                 {
                     EnsureCharacterCodecs();
+                    session.ManagedProfile.SavePlayerData(player);
                     Minimap? minimap = Minimap.instance;
                     minimap?.SaveMapData();
-                    byte[] profileBytes = _profileCodec!.CaptureProfileToBytes(
-                        session.ManagedProfile,
-                        player);
+                    // Periodic captures bypass Game.SavePlayerProfile. Refresh
+                    // its separate per-world logout point too, using vanilla's
+                    // intro/death rules rather than writing the transform directly.
+                    session.ManagedProfile.SaveLogoutPoint();
+                    byte[] profileBytes = _profileCodec!.SerializeProfileToBytes(
+                        session.ManagedProfile);
                     OfferClientSave(
                         session,
                         profileBytes,

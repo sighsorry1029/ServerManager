@@ -333,14 +333,29 @@ function New-PlayerProfilePayload {
         [string]$CharacterName,
         [long]$PlayerId,
         [byte[]]$PlayerData,
-        [bool]$HasPlayerData = $true
+        [bool]$HasPlayerData = $true,
+        [object[]]$WorldData = @()
     )
 
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
         $writer.Write([int]46); [Valheim107Fixture]::Statistics($writer)
-        $writer.Write($false); $writer.Write([int]0)
+        $writer.Write($false); $writer.Write([int]$WorldData.Count)
+        foreach ($world in $WorldData) {
+            $writer.Write([long]$world.WorldId)
+            $writer.Write([bool]$world.HaveCustomSpawnPoint)
+            foreach ($coordinate in $world.SpawnPoint) { $writer.Write([single]$coordinate) }
+            $writer.Write([bool]$world.HaveLogoutPoint)
+            foreach ($coordinate in $world.LogoutPoint) { $writer.Write([single]$coordinate) }
+            $writer.Write([bool]$world.HaveDeathPoint)
+            foreach ($coordinate in $world.DeathPoint) { $writer.Write([single]$coordinate) }
+            foreach ($coordinate in $world.HomePoint) { $writer.Write([single]$coordinate) }
+            $writer.Write($null -ne $world.MapData)
+            if ($null -ne $world.MapData) {
+                $writer.Write([int]$world.MapData.Length); $writer.Write([byte[]]$world.MapData)
+            }
+        }
         $writer.Write($CharacterName); $writer.Write($PlayerId)
         $writer.Write('fast-path-seed'); $writer.Write($false); $writer.Write([long]0)
         $writer.Write($HasPlayerData)
@@ -1357,6 +1372,132 @@ Invoke-TwoArguments `
     $profileCodec `
     $identity `
     ([byte[]]$decodedCheckpoint.GetPayloadCopy()) | Out-Null
+
+# Exercise actual outer world records, separate from item WorldLevel above.
+# Changing the original profile fields models the result of capture at B; this
+# standalone CLR test does not execute Unity transforms or SaveLogoutPoint.
+$worldFields = @{}
+foreach ($fieldName in @('m_haveCustomSpawnPoint', 'm_spawnPoint',
+    'm_haveLogoutPoint', 'm_logoutPoint', 'm_haveDeathPoint', 'm_deathPoint',
+    'm_homePoint', 'm_mapData')) {
+    $worldFields[$fieldName] = $worldValueType.GetField($fieldName,
+        [Reflection.BindingFlags]'Instance,NonPublic,Public')
+    Assert-True ($null -ne $worldFields[$fieldName]) "World profile field changed: $fieldName"
+}
+$vanillaFileCodec = $plugin.GetType('ServerManager.VanillaCharacterFileCodec', $true)
+$encodeNativeFile = $vanillaFileCodec.GetMethod('Encode', [Reflection.BindingFlags]'Static,NonPublic')
+$decodeNativeFile = $vanillaFileCodec.GetMethod('Decode',
+    [Reflection.BindingFlags]'Static,NonPublic', $null, [Type[]]@([byte[]], [int]), $null)
+Assert-True ($null -ne $encodeNativeFile -and $null -ne $decodeNativeFile) `
+    'The native .fch wrapper codec seam changed.'
+
+foreach ($capturedHaveLogoutPoint in @($true, $false)) {
+    # Reverse-sorted IDs also verify that canonical serialization keeps each
+    # world's coordinates associated with its ID when it reorders records.
+    $coordinateWorlds = @(
+        [pscustomobject]@{
+            WorldId = [long]2101; HaveCustomSpawnPoint = $true
+            SpawnPoint = @(11.25, 22.5, -33.75)
+            HaveLogoutPoint = -not $capturedHaveLogoutPoint
+            LogoutPoint = @(100.25, 40.5, -200.75) # A: previous full snapshot
+            HaveDeathPoint = $true; DeathPoint = @(-41.25, 52.5, 63.75)
+            HomePoint = @(71.25, 82.5, -93.75); MapData = [byte[]]@(1, 3, 5)
+        },
+        [pscustomobject]@{
+            WorldId = [long]-9002; HaveCustomSpawnPoint = $false
+            SpawnPoint = @(-111.25, 122.5, 133.75)
+            HaveLogoutPoint = $true; LogoutPoint = @(-301.25, 62.5, 403.75)
+            HaveDeathPoint = $false; DeathPoint = @(141.25, -152.5, 163.75)
+            HomePoint = @(-171.25, 182.5, 193.75); MapData = $null
+        })
+    [byte[]]$coordinateBase = New-PlayerProfilePayload -CharacterName 'FastPathHero' `
+        -PlayerId ([long]76561198000000001) -PlayerData $inner.Bytes -WorldData $coordinateWorlds
+    $previousCoordinateProfile = $deserializeProfile.Invoke($profileCodec,
+        [object[]]@($coordinateBase, $null, $localSource))
+    $capturedCoordinateProfile = $deserializeProfile.Invoke($profileCodec,
+        [object[]]@($coordinateBase, $null, $localSource))
+    $capturedWorld = $worldDataField.GetValue($capturedCoordinateProfile)[[long]2101]
+    $capturedPoint = [single[]]@(504.25, 86.5, -607.75) # B: next full snapshot
+    $worldFields['m_logoutPoint'].SetValue($capturedWorld,
+        [Activator]::CreateInstance($worldFields['m_logoutPoint'].FieldType,
+            [object[]]@($capturedPoint[0], $capturedPoint[1], $capturedPoint[2])))
+    $worldFields['m_haveLogoutPoint'].SetValue($capturedWorld, $capturedHaveLogoutPoint)
+    $capturedWorldExpected = $coordinateWorlds[0].PSObject.Copy()
+    $capturedWorldExpected.LogoutPoint = $capturedPoint
+    $capturedWorldExpected.HaveLogoutPoint = $capturedHaveLogoutPoint
+    $capturedWorldsExpected = @($capturedWorldExpected, $coordinateWorlds[1])
+
+    [byte[]]$coordinateSnapshot = $serializeProfile.Invoke($profileCodec,
+        [object[]]@($capturedCoordinateProfile))
+    [byte[]]$coordinateSnapshotBefore = $coordinateSnapshot.Clone()
+    $coordinateRoundTrip = $deserializeProfile.Invoke($profileCodec,
+        [object[]]@($coordinateSnapshot, $null, $localSource))
+    $coordinateReplaceArguments = [object[]]@($identity, $coordinateSnapshot, $replacementInventory, $null)
+    [byte[]]$coordinateSplice = $replaceInventory.Invoke($profileCodec, $coordinateReplaceArguments)
+    $coordinateSpliceProfile = $deserializeProfile.Invoke($profileCodec,
+        [object[]]@($coordinateSplice, $null, $localSource))
+    Assert-True ((Test-ByteArrayEqual $coordinateSnapshot $coordinateSnapshotBefore) -and
+        (Test-ByteRangeEqual $coordinateSnapshot 0 $coordinateSplice 0 `
+            ($coordinateSnapshot.Length - $inner.Bytes.Length - 4))) `
+        'Inventory-only materialization changed the captured world-data prefix or its input.'
+    [byte[]]$coordinatePlayerData = $playerDataField.GetValue($coordinateSpliceProfile)
+    Assert-True (Test-ByteRangeEqual $coordinatePlayerData $inner.InventoryOffset `
+        $replacementInventory 0 $replacementInventory.Length) `
+        'The coordinate fixture did not actually materialize the replacement inventory.'
+
+    # A reconnect Snapshot carries the full materialized profile, not a delta.
+    # This is an envelope/selected-payload round trip, not a live reconnect.
+    $coordinateCheckpoint = $createEnvelope.Invoke($null, [object[]]@(
+        $snapshotKind, [long]3, [long]2, $sessionId, $identity, $createdUtc, [int]46, $coordinateSplice))
+    [byte[]]$coordinateCheckpointWire = $encodeEnvelope.Invoke($envelopeCodec,
+        [object[]]@($coordinateCheckpoint))
+    $coordinateCheckpointDecoded = Invoke-OneArgument $decodeEnvelope $envelopeCodec $coordinateCheckpointWire
+    [byte[]]$reconnectPayload = $coordinateCheckpointDecoded.GetPayloadCopy()
+    Assert-True (Test-ByteArrayEqual $coordinateSplice $reconnectPayload) `
+        'The reconnect Snapshot did not select the full profile containing B.'
+    [byte[]]$coordinateNativeFile = $encodeNativeFile.Invoke($null,
+        [object[]]@($reconnectPayload, [int]$options.MaxPayloadBytes))
+    [byte[]]$coordinateNativePayload = $decodeNativeFile.Invoke($null,
+        [object[]]@($coordinateNativeFile, [int]$options.MaxPayloadBytes))
+    Assert-True (Test-ByteArrayEqual $reconnectPayload $coordinateNativePayload) `
+        'The native .fch wrapper changed the selected full profile.'
+    $coordinateNativeProfile = $deserializeProfile.Invoke($profileCodec,
+        [object[]]@($coordinateNativePayload, $null, $localSource))
+
+    foreach ($phase in @(
+        @{ Name = 'previous A'; Profile = $previousCoordinateProfile; Worlds = $coordinateWorlds },
+        @{ Name = 'serialized B'; Profile = $coordinateRoundTrip; Worlds = $capturedWorldsExpected },
+        @{ Name = 'inventory splice'; Profile = $coordinateSpliceProfile; Worlds = $capturedWorldsExpected },
+        @{ Name = 'reconnect/native .fch'; Profile = $coordinateNativeProfile; Worlds = $capturedWorldsExpected })) {
+        $actualWorlds = $worldDataField.GetValue($phase.Profile)
+        Assert-True ($actualWorlds.Count -eq 2) "$($phase.Name) lost a world profile."
+        foreach ($expectedWorld in $phase.Worlds) {
+            Assert-True ($actualWorlds.ContainsKey([long]$expectedWorld.WorldId)) `
+                "$($phase.Name) lost world ID $($expectedWorld.WorldId)."
+            $actualWorld = $actualWorlds[[long]$expectedWorld.WorldId]
+            foreach ($flagName in @('HaveCustomSpawnPoint', 'HaveLogoutPoint', 'HaveDeathPoint')) {
+                $fieldName = 'm_' + [char]::ToLowerInvariant($flagName[0]) + $flagName.Substring(1)
+                Assert-True ($worldFields[$fieldName].GetValue($actualWorld) -eq $expectedWorld.$flagName) `
+                    "$($phase.Name) changed $flagName for world $($expectedWorld.WorldId)."
+            }
+            foreach ($pointName in @('SpawnPoint', 'LogoutPoint', 'DeathPoint', 'HomePoint')) {
+                $fieldName = 'm_' + [char]::ToLowerInvariant($pointName[0]) + $pointName.Substring(1)
+                $actualPoint = $worldFields[$fieldName].GetValue($actualWorld)
+                $expectedPoint = $expectedWorld.$pointName
+                Assert-True ($actualPoint.x -eq [single]$expectedPoint[0] -and
+                    $actualPoint.y -eq [single]$expectedPoint[1] -and
+                    $actualPoint.z -eq [single]$expectedPoint[2]) `
+                    "$($phase.Name) changed $pointName for world $($expectedWorld.WorldId)."
+            }
+            $actualMapData = $worldFields['m_mapData'].GetValue($actualWorld)
+            Assert-True (($null -eq $actualMapData -and $null -eq $expectedWorld.MapData) -or
+                (Test-ByteArrayEqual $actualMapData $expectedWorld.MapData)) `
+                "$($phase.Name) changed map data for world $($expectedWorld.WorldId)."
+        }
+    }
+}
+Write-Output ('World-coordinate payloads: A-to-B capture result, true/false logout flags, two-world isolation, ' +
+    'inventory splice, Snapshot and native .fch round trips passed (no live Unity/reconnect execution).')
 
 Write-Output (
     "Exact 10 MiB full-envelope admission with 16 KiB overhead, 10 MiB + 1 rejection, " +
