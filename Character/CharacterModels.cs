@@ -1551,16 +1551,14 @@ namespace ServerManager
     }
 
     /// <summary>
-    /// A point-in-time immutable copy of every retained live character overlay.
-    /// Later client saves cannot mutate this batch.
+    /// Identifies a retained cutoff without retaining any of its payloads.
+    /// Per-character retries keep this handle and their own entry only.
     /// </summary>
-    internal sealed class CharacterCheckpointBatch
+    internal class CharacterCheckpointHandle
     {
-        internal CharacterCheckpointBatch(
+        internal CharacterCheckpointHandle(
             Guid ownerId,
-            Guid checkpointId,
-            DateTime capturedUtc,
-            IReadOnlyList<CharacterCheckpointEntry> entries)
+            Guid checkpointId)
         {
             if (ownerId == Guid.Empty)
             {
@@ -1576,6 +1574,29 @@ namespace ServerManager
                     nameof(checkpointId));
             }
 
+            OwnerId = ownerId;
+            CheckpointId = checkpointId;
+        }
+
+        internal Guid OwnerId { get; }
+
+        internal Guid CheckpointId { get; }
+    }
+
+    /// <summary>
+    /// A point-in-time immutable copy of every retained live character overlay.
+    /// Later client saves cannot mutate this batch. Long-lived per-character
+    /// retries must retain Handle rather than this aggregate.
+    /// </summary>
+    internal sealed class CharacterCheckpointBatch : CharacterCheckpointHandle
+    {
+        internal CharacterCheckpointBatch(
+            Guid ownerId,
+            Guid checkpointId,
+            DateTime capturedUtc,
+            IReadOnlyList<CharacterCheckpointEntry> entries)
+            : base(ownerId, checkpointId)
+        {
             if (capturedUtc.Kind != DateTimeKind.Utc)
             {
                 throw new ArgumentException(
@@ -1583,9 +1604,8 @@ namespace ServerManager
                     nameof(capturedUtc));
             }
 
-            OwnerId = ownerId;
-            CheckpointId = checkpointId;
             CapturedUtc = capturedUtc;
+            Handle = new CharacterCheckpointHandle(ownerId, checkpointId);
             if (entries == null)
             {
                 throw new ArgumentNullException(nameof(entries));
@@ -1604,9 +1624,7 @@ namespace ServerManager
             Entries = Array.AsReadOnly(immutableEntries);
         }
 
-        internal Guid OwnerId { get; }
-
-        internal Guid CheckpointId { get; }
+        internal CharacterCheckpointHandle Handle { get; }
 
         internal DateTime CapturedUtc { get; }
 

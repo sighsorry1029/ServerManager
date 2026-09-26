@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.4
+
+- Moved world-aligned character checkpoint file writes, backup rotation and disk verification off the main thread, with one background write at a time.
+- Fixed failed checkpoint retries retaining already-completed characters from the same batch after their memory accounting had been released.
+- Preserved newer in-memory progress during writes and report checkpoint completion only after disk results are confirmed. Failed characters keep their isolated retry path.
+- Added regression coverage for stalled storage, reconnects, partial failures, retry memory release and shutdown ownership. World-save intervals and character validation rules are unchanged.
+
 ## 1.1.3
 
 - Reduced player-log size by skipping unchanged full inventory snapshots at the five-minute check, while keeping the first snapshot after joining or on a new local date.

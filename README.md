@@ -224,8 +224,15 @@ overlap persists, the client disconnects with an explanation. Existing save
 acknowledgement and logout deadlines still apply. This grace does not repair
 items or relax the server's validation; the inventory mod may still need a fix.
 
-Character files are written after a successful world save. One failed character
-write does not stop the world or other characters from saving.
+Character checkpoints are written after a successful world save, one character
+at a time in the background. One failed write does not stop the world or other
+characters from saving. Accepted in-memory updates continue during these writes.
+Joins that need to read the character store and disk-based admin commands may
+briefly return a busy message; retry shortly. Settings reload waits for the write.
+
+ServerManager does not change the vanilla automatic world-save interval. Manual
+commands, cron jobs and supported Upgrade World maintenance can request extra
+saves. Background character writes do not remove the game's own world-save cost.
 
 For planned shutdown, run `save` and wait for this server-log confirmation for
 that save:

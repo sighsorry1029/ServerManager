@@ -455,7 +455,7 @@ try {
             $beforePrune = @(Get-ChildItem -LiteralPath $namingDirectory -File | Sort-Object Name | ForEach-Object {
                 $_.Name + ":" + [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName))
             }) -join "`n"
-            Assert-Throws { Invoke-Hidden $restoreRepository "PruneBackups" @($namingKey, $null) } "*unexpected file*"
+            Assert-Throws { Invoke-Hidden $restoreRepository "PruneBackups" @($namingKey, $null, $null) } "*unexpected file*"
             $afterPrune = @(Get-ChildItem -LiteralPath $namingDirectory -File | Sort-Object Name | ForEach-Object {
                 $_.Name + ":" + [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName))
             }) -join "`n"
@@ -488,11 +488,11 @@ try {
             (Get-Hidden $rotationListed[2] "BackupId") -ceq $rotationMiddle.Id -and
             (Get-Hidden $rotationListed[3] "BackupId") -ceq $rotationOld.Id) "Backup listing did not use local timestamp and numeric collision order."
         $restoreOptions.MaxBackups = 2
-        Invoke-Hidden $restoreRepository "PruneBackups" @($rotationKey, $null) | Out-Null
+        Invoke-Hidden $restoreRepository "PruneBackups" @($rotationKey, $null, $null) | Out-Null
         Assert-True ((Test-Path -LiteralPath $rotationNewest.Path) -and (Test-Path -LiteralPath $rotationMiddleCollision.Path) -and
             -not (Test-Path -LiteralPath $rotationOld.Path) -and -not (Test-Path -LiteralPath $rotationMiddle.Path)) "Retention did not keep the newest timestamp/collision backups."
         $preservedOld = Write-RestoreBackup (New-RestoreEnvelope $rotationIdentity 5000 $rotationPayload $false 46 $preciseUtc.AddDays(-3)) $rotationKey
-        Invoke-Hidden $restoreRepository "PruneBackups" @($rotationKey, $preservedOld.Path) | Out-Null
+        Invoke-Hidden $restoreRepository "PruneBackups" @($rotationKey, $preservedOld.Path, $null) | Out-Null
         Assert-True ((Test-Path -LiteralPath $preservedOld.Path) -and (Test-Path -LiteralPath $rotationNewest.Path) -and
             -not (Test-Path -LiteralPath $rotationMiddleCollision.Path)) "Retention removed the explicitly protected previous primary."
         Assert-True ((Invoke-Hidden $restoreRepository "GetAdminBackups" @($siblingRotationIdentity, $siblingRotationKey)).Count -eq 3 -and

@@ -258,20 +258,24 @@ $legacyCheckpointEntryProperties = @(
 $commitCheckpointEntry = Get-CecilMethod `
     "ServerManager.CharacterSnapshotService" `
     "CommitCheckpointEntry"
+$beginAsyncCheckpoint = Get-CecilMethod `
+    "ServerManager.CharacterSnapshotService" "BeginCheckpointCommit"
+$completeAsyncCheckpoint = Get-CecilMethod `
+    "ServerManager.CharacterSnapshotService" "TryCompleteCheckpointCommit"
 $persistFrozenEntry = Get-CecilCall `
     $commitCheckpointEntry `
-    "ServerManager.CharacterRepository" `
-    "PersistCheckpointEntry"
+    "ServerManager.CharacterSnapshotService" `
+    "BeginCheckpointCommit"
 $removeCaughtUpShadow = Get-CecilCall `
-    $commitCheckpointEntry `
+    $completeAsyncCheckpoint `
     "ServerManager.CharacterSnapshotService" `
     "RemoveLiveSnapshotLocked"
 $preserveNewerShadow = Get-CecilCall `
-    $commitCheckpointEntry `
+    $completeAsyncCheckpoint `
     "ServerManager.CharacterSnapshotService/CharacterLiveSnapshot" `
     "WithDurable"
 $replaceRebasedShadow = Get-CecilCall `
-    $commitCheckpointEntry `
+    $completeAsyncCheckpoint `
     "ServerManager.CharacterSnapshotService" `
     "SetLiveSnapshotLocked"
 $ordinarySetLive = Get-CecilMethod `
@@ -291,7 +295,7 @@ $beginCheckpointPayloadPin = Get-CecilCall `
     "ServerManager.CharacterSnapshotService" `
     "AddCheckpointEntryPayloadReferencesLocked"
 $commitCheckpointEntryRelease = Get-CecilCall `
-    $commitCheckpointEntry `
+    $completeAsyncCheckpoint `
     "ServerManager.CharacterSnapshotService" `
     "ReleaseCheckpointEntryLocked"
 $discardCheckpointEntryRelease = Get-CecilCall `
@@ -318,7 +322,7 @@ $referenceComparerDefinition = $serviceDefinition.NestedTypes |
     Where-Object Name -eq "ByteArrayReferenceComparer" |
     Select-Object -First 1
 $checkpointSemanticReparse = Get-CecilCall `
-    $commitCheckpointEntry `
+    $completeAsyncCheckpoint `
     "ServerManager.CharacterSnapshotService" `
     "ValidateSnapshotDetailed"
 $addCheckpointPayloads = Get-CecilMethod `
@@ -429,28 +433,72 @@ Assert-True (
         $ordinaryAddLive `
         "ServerManager.CharacterSnapshotService" `
         "EnsureLiveSnapshotCapacityLocked") -and
-    $persistFrozenEntry.Offset -lt $preserveNewerShadow.Offset -and
+    $null -ne (Get-CecilCall $commitCheckpointEntry `
+        "ServerManager.CharacterSnapshotService" "TryCompleteCheckpointCommit") -and
     $preserveNewerShadow.Offset -lt $replaceRebasedShadow.Offset -and
     [Text.RegularExpressions.Regex]::IsMatch(
         $snapshotServiceSource,
-        'if\s*\(durable\.Revision\s*>\s*entry\.Snapshot\.Revision\).*?' +
-        'ReleaseCheckpointEntryLocked\(checkpoint,\s*entry\);.*?' +
-        'if\s*\(durable\.Revision\s*==\s*entry\.Snapshot\.Revision\)',
+        'if\s*\(durable\.Revision\s*>=\s*entry\.Snapshot\.Revision\).*?' +
+        'if\s*\(durable\.Revision\s*==\s*entry\.Snapshot\.Revision\s*&&.*?' +
+        'ReleaseCheckpointEntryLocked\(checkpoint,\s*entry\);',
         [Text.RegularExpressions.RegexOptions]::Singleline) -and
     [Text.RegularExpressions.Regex]::IsMatch(
         $snapshotServiceSource,
-        '_repository\.PersistCheckpointEntry\(.*?' +
+        'write\.DiskTask\.GetAwaiter\(\)\.GetResult\(\);.*?' +
         'if\s*\(!current\.DurableEnvelope\.MatchesSnapshot\(\s*' +
-        'entry\.Snapshot\s*\)\).*?' +
+        'entry\.Snapshot\s*\)\s*&&.*?' +
         'SetLiveSnapshotLocked\(\s*' +
         'entry\.StorageKey,\s*' +
         'current\.WithDurable\(entry\.Snapshot\)\s*\);.*?' +
-        'ReleaseCheckpointEntryLocked\(checkpoint,\s*entry\);',
+        'ReleaseCheckpointEntryLocked\(write\.Checkpoint,\s*entry\);',
         [Text.RegularExpressions.RegexOptions]::Singleline)) `
     "Per-entry checkpoint persistence/rebase, independent payload release, multiple-generation registration, semantic reuse, or ordinary admission caps changed."
 
+# Runtime checkpoint writes use prepare / worker I/O / nonblocking completion.
+# The synchronous method above remains only an isolated-fixture compatibility path.
+$beginAsyncCheckpoint = Get-CecilMethod `
+    "ServerManager.CharacterSnapshotService" "BeginCheckpointCommit"
+$completeAsyncCheckpoint = Get-CecilMethod `
+    "ServerManager.CharacterSnapshotService" "TryCompleteCheckpointCommit"
+$workerPersistCheckpoint = Get-CecilMethod `
+    "ServerManager.CharacterRepository" "PersistCheckpointEntryOnWorker"
+$workerSourceStart = $repositorySource.IndexOf(
+    "internal string PersistCheckpointEntryOnWorker(", [StringComparison]::Ordinal)
+$workerSourceEnd = $repositorySource.IndexOf(
+    "private static void ValidateCheckpointRebase(", $workerSourceStart,
+    [StringComparison]::Ordinal)
+$workerSource = $repositorySource.Substring(
+    $workerSourceStart, $workerSourceEnd - $workerSourceStart)
+$completeSourceStart = $snapshotServiceSource.IndexOf(
+    "internal bool TryCompleteCheckpointCommit(", [StringComparison]::Ordinal)
+$completeSourceEnd = $snapshotServiceSource.IndexOf(
+    "internal string CommitCheckpointEntry(", $completeSourceStart,
+    [StringComparison]::Ordinal)
+$completeSource = $snapshotServiceSource.Substring(
+    $completeSourceStart, $completeSourceEnd - $completeSourceStart)
+Assert-True (
+    $null -ne (Get-CecilCall $beginAsyncCheckpoint "System.Threading.Tasks.Task" "Run") -and
+    $null -ne (Get-CecilCall $completeAsyncCheckpoint `
+        "ServerManager.CharacterSnapshotService" "ReleaseCheckpointEntryLocked") -and
+    $null -ne (Get-CecilCall $completeAsyncCheckpoint `
+        "ServerManager.CharacterSnapshotService/CharacterLiveSnapshot" "WithDurable") -and
+    $completeSource.IndexOf("if (!write.IsCompleted) return false;") -ge 0 -and
+    $completeSource.IndexOf("if (!write.IsCompleted) return false;") -lt
+        $completeSource.IndexOf("write.DiskTask.GetAwaiter().GetResult()") -and
+    $completeSource.Contains("finally { _checkpointWrite = null; }") -and
+    (Get-CallsByType $workerPersistCheckpoint `
+        "ServerManager.VanillaCharacterFileCodec" "Decode").Count -eq 2 -and
+    $null -ne (Get-CecilCall $workerPersistCheckpoint `
+        "ServerManager.VanillaCharacterFileCodec" "Encode") -and
+    $null -ne (Get-CecilCall $workerPersistCheckpoint `
+        "ServerManager.CharacterRepository" "ReplaceAtomicallyWithBackup") -and
+    -not $workerSource.Contains("ReadAndValidateSnapshot(") -and
+    -not $workerSource.Contains("_profileCodec") -and
+    -not $workerSource.Contains("_semanticValidator")) `
+    "Checkpoint I/O must remain worker-only native-byte verification, with nonblocking completion and exact durable advancement/pin release."
+
 # World save hooks: capture at PrepareSave, prove primary success inside the
-# worker, and consume/commit only on the main thread.
+# world worker, then prepare/complete character workers from the main thread.
 $worldSavePatchStart = $patchSource.IndexOf(
     'internal static class ServerEventWorldSavePatch', [StringComparison]::Ordinal)
 $worldSavePatchEnd = $patchSource.IndexOf(
@@ -630,7 +678,11 @@ $retrySeconds = Get-CecilMethod `
 $durableCheckpointCall = Get-CecilCall `
     $tryPendingCheckpoint `
     "ServerManager.CharacterSnapshotService" `
-    "CommitCheckpointEntry"
+    "BeginCheckpointCommit"
+$pollCheckpoint = Get-CecilMethod `
+    "ServerManager.ServerManagerRuntime" "PollCharacterCheckpointWrite"
+$completeCheckpointCall = Get-CecilCall `
+    $pollCheckpoint "ServerManager.CharacterSnapshotService" "TryCompleteCheckpointCommit"
 $discardSupersededEntry = Get-CecilCall `
     $adoptCheckpointEntry `
     "ServerManager.CharacterSnapshotService" `
@@ -638,7 +690,7 @@ $discardSupersededEntry = Get-CecilCall `
 $publishCheckpointResult = Get-CecilCall `
     $processResults `
     "ServerManager.ServerManagerRuntime" `
-    "PublishWorldCharacterCheckpointResult"
+    "PublishCharacterCheckpointProgress"
 $adoptFromResults = Get-CecilCall `
     $processResults `
     "ServerManager.ServerManagerRuntime" `
@@ -646,7 +698,7 @@ $adoptFromResults = Get-CecilCall `
 $commitFromResults = Get-CecilCall `
     $processResults `
     "ServerManager.ServerManagerRuntime" `
-    "TryCommitPendingCharacterCheckpoint"
+    "PollCharacterCheckpointWrite"
 $commitDueFromResults = Get-CecilCall `
     $processResults `
     "ServerManager.ServerManagerRuntime" `
@@ -661,6 +713,7 @@ Assert-True ($null -ne (Get-CecilCall `
     "The world snapshot boundary no longer freezes a character checkpoint."
 Assert-True (
     $null -ne $durableCheckpointCall -and
+    $null -ne $completeCheckpointCall -and
     $null -ne $adoptFromResults -and
     $null -ne $commitFromResults -and
     $null -ne $commitDueFromResults -and
@@ -669,7 +722,7 @@ Assert-True (
         $tick `
         "ServerManager.ServerManagerRuntime" `
         "ProcessCompletedWorldSaveCheckpoints")) `
-    "Verified worker results are no longer adopted and persisted per identity from the main-thread Tick path."
+    "Verified world results must adopt per-character work and poll asynchronous persistence from Tick."
 Assert-True (
     [Text.RegularExpressions.Regex]::IsMatch(
         $runtimeSource,
@@ -678,7 +731,7 @@ Assert-True (
         'try\s*\{.*?AdoptCharacterCheckpointEntry\(.*?' +
         'catch\s*\(Exception exception\)\s*when\s*\(' +
         '\s*!IntegrityCanonical\.IsFatal\(exception\)\).*?' +
-        'TryCommitPendingCharacterCheckpoint\(',
+        'TryCommitDueCharacterCheckpoints\(',
         [Text.RegularExpressions.RegexOptions]::Singleline)) `
     "A single character adoption failure can stop the remaining identities or the successful identities are not attempted independently."
 Assert-True (
@@ -769,6 +822,37 @@ Assert-True (
         'pending\.RecordFailure\(exception\);',
         [Text.RegularExpressions.RegexOptions]::Singleline)) `
     "Per-key head/tail retention, captured-service ownership, or retryable adoption no longer preserves and coalesces pending generations safely."
+
+$runtimeDefinition = $pluginDefinition.MainModule.Types |
+    Where-Object FullName -eq "ServerManager.ServerManagerRuntime" |
+    Select-Object -First 1
+$pendingEntryDefinition = $runtimeDefinition.NestedTypes |
+    Where-Object Name -eq "PendingCharacterCheckpointEntry" | Select-Object -First 1
+$progressDefinition = $runtimeDefinition.NestedTypes |
+    Where-Object Name -eq "CharacterCheckpointProgress" | Select-Object -First 1
+$pendingConstructor = $pendingEntryDefinition.Methods |
+    Where-Object Name -eq ".ctor" | Select-Object -First 1
+$runtimeSynchronousCommits = @($runtimeDefinition.Methods | ForEach-Object {
+    if ($_.HasBody) {
+        Get-CallsByType $_ "ServerManager.CharacterSnapshotService" "CommitCheckpointEntry"
+    }
+})
+Assert-True (
+    $runtimeSynchronousCommits.Count -eq 0 -and
+    $null -ne (Get-CecilCall $pendingConstructor "ServerManager.CharacterCheckpointBatch" "get_Handle") -and
+    @($pendingEntryDefinition.Fields | Where-Object {
+        $_.FieldType.FullName -eq "ServerManager.CharacterCheckpointBatch"
+    }).Count -eq 0 -and
+    @($progressDefinition.Fields | Where-Object {
+        $_.FieldType.FullName -in @("ServerManager.CharacterCheckpointBatch",
+            "ServerManager.CharacterCheckpointEntry", "ServerManager.CharacterEnvelope")
+    }).Count -eq 0 -and
+    $runtimeSource.Contains("if (_activeCharacterCheckpointWrite != null) return;") -and
+    $runtimeSource.Contains("if (!active.Head.Service.TryCompleteCheckpointCommit(active.Write, out backupWarning)) return;") -and
+    [Text.RegularExpressions.Regex]::IsMatch($runtimeSource,
+        'if \(TryCommitPendingCharacterCheckpoint\(storageKeys\[index\], force: false\)\) break;') -and
+    $runtimeSource.Contains("progress.Targets.Values.Any(target => !target.AttemptFinished)")) `
+    "Runtime must dispatch one worker, poll without synchronous disk commits, and retain only per-entry handles plus payload-free result metadata."
 
 $beforeWorldInvocation = Get-CecilMethod `
     "ServerManager.ServerManagerRuntime" `
@@ -895,7 +979,8 @@ Assert-True (
         '\s*PendingCharacterCheckpointAdoptions\.Count\s*!=\s*0\).*?' +
         'TryAdoptDueCharacterCheckpoints\(force:\s*true\);.*?' +
         'TryCommitPendingCharacterCheckpoint\(\s*storageKeys\[index\],\s*' +
-        'force:\s*true\);.*?CharacterCheckpointShutdownUnresolved.*?' +
+        'force:\s*true\)\) break;.*?Thread\.Sleep\(10\);.*?' +
+        'PollCharacterCheckpointWrite\(\);.*?CharacterCheckpointShutdownUnresolved.*?' +
         'Vanilla shutdown will continue',
         [Text.RegularExpressions.RegexOptions]::Singleline) -and
     $beforePrepareThrows.Count -eq 0 -and
@@ -932,14 +1017,14 @@ Assert-True (
         [Text.RegularExpressions.RegexOptions]::Singleline) -and
     ([Text.RegularExpressions.Regex]::Matches(
         $runtimeSource,
-        'force:\s*false')).Count -eq 3 -and
+        'force:\s*false')).Count -eq 2 -and
     ([Text.RegularExpressions.Regex]::Matches(
         $runtimeSource,
         'force:\s*true')).Count -eq 2 -and
     [Text.RegularExpressions.Regex]::IsMatch(
         $runtimeSource,
-        'TryCommitPendingCharacterCheckpoint\(\s*' +
-        'orderedStorageKeys\[index\],\s*force:\s*false\);',
+        'if\s*\(TryCommitPendingCharacterCheckpoint\(\s*' +
+        'storageKeys\[index\],\s*force:\s*false\)\) break;',
         [Text.RegularExpressions.RegexOptions]::Singleline)) `
     "Main-thread retry processing or the 5/15/30/60-second per-identity backoff changed."
 
@@ -1305,9 +1390,9 @@ Assert-True (
         [Text.RegularExpressions.RegexOptions]::Singleline)) `
     "Save command no longer returns save_blocked with the failed operation ID, or listen-host scheduling incorrectly claims an operation ID/failure."
 
-# Begin/per-entry commit and Dispose share one checkpoint gate. Dispose marks itself
-# first, then waits; callers recheck after entering so neither direction of the
-# race can clear live state during repository I/O or continue after disposal.
+# Lifecycle and fixture-only synchronous calls retain the double disposed check.
+# Runtime workers never own this RAM gate; disposal defers only the storage lease
+# release, not the caller, until an admitted disk task has actually finished.
 $disposeService = Get-CecilMethod `
     "ServerManager.CharacterSnapshotService" `
     "Dispose"
@@ -1335,7 +1420,7 @@ $beginDisposedChecks = Get-CallsByType `
     "ServerManager.CharacterSnapshotService" `
     "ThrowIfDisposed"
 $commitDisposedChecks = Get-CallsByType `
-    $commitCheckpointEntry `
+    $beginAsyncCheckpoint `
     "ServerManager.CharacterSnapshotService" `
     "ThrowIfDisposed"
 $disposeExchange = Get-CecilCall `
@@ -1359,7 +1444,7 @@ foreach ($method in @(
         $openSession,
         $finalizeInitialWrapper,
         $beginServiceCheckpoint,
-        $commitCheckpointEntry,
+        $beginAsyncCheckpoint,
         $disposeService)) {
     $checkpointGateLoads[$method.FullName] = @(
         $method.Body.Instructions |
@@ -1392,9 +1477,14 @@ Assert-True (
     $checkpointGateLoads[$openSession.FullName] -gt 0 -and
     $checkpointGateLoads[$finalizeInitialWrapper.FullName] -gt 0 -and
     $checkpointGateLoads[$beginServiceCheckpoint.FullName] -gt 0 -and
-    $checkpointGateLoads[$commitCheckpointEntry.FullName] -gt 0 -and
-    $checkpointGateLoads[$disposeService.FullName] -gt 0) `
-    "Session open/first-join finalization/checkpoint begin/commit and Dispose no longer close both sides of the service-disposal race with the shared commit gate."
+    $checkpointGateLoads[$beginAsyncCheckpoint.FullName] -gt 0 -and
+    $checkpointGateLoads[$disposeService.FullName] -gt 0 -and
+    $snapshotServiceSource.Contains("if (retiringWrite != null && !retiringWrite.IsCompleted)") -and
+    $snapshotServiceSource.Contains("retiringWrite.DiskTask.ContinueWith(task =>") -and
+    $snapshotServiceSource.Contains("retiringProvider.Dispose();") -and
+    -not $snapshotServiceSource.Contains("retiringWrite.DiskTask.Wait(") -and
+    -not $snapshotServiceSource.Contains("retiringWrite.DiskTask.GetAwaiter().GetResult(")) `
+    "Service lifecycle guards or nonblocking disposal with a worker-held storage lease changed."
 
 # Public event status must distinguish world-only from a completed retained-shadow checkpoint.
 $saveStateType = $plugin.GetType(
@@ -2067,6 +2157,14 @@ try {
         $liveDictionary.Count -eq 0) `
         "Live/checkpoint payload union accounting leaked after final release."
 
+    # Keep the actual runtime retry object for a failed character alive while
+    # collecting the completed peer from the same batch. The helper's no-inline
+    # setup scope prevents PowerShell/JIT temporary roots from masking a leak.
+    Add-Type -Path (Join-Path $PSScriptRoot 'CharacterCheckpointRetentionProbe.cs')
+    [CharacterCheckpointRetentionProbe]::Verify(
+        $service, $identityA, $identityB, $keyA, $keyB,
+        $snapshotA8, $fakeDurableB1, $semantic)
+
     for ($index = 0; $index -lt 4096; ++$index) {
         $addLive.Invoke(
             $liveDictionary,
@@ -2088,6 +2186,13 @@ try {
         [long]$retainedBytesField.GetValue($service) -eq 268435456 -and
         $liveDictionary.Count -eq 0) `
         "Byte-cap rejection mutated or evicted retained shadows."
+
+    # This probe intentionally disposes the fixture with a blocked worker, so
+    # run it last after removing the synthetic capacity-counter override.
+    $retainedBytesField.SetValue($service, [long]0)
+    Add-Type -Path (Join-Path $PSScriptRoot 'CharacterCheckpointWorkerProbe.cs')
+    [CharacterCheckpointWorkerProbe]::Verify(
+        $service, $identityA, $keyA, $snapshotA8, $semantic)
 }
 finally {
     if ($null -ne $service) {

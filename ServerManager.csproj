@@ -193,6 +193,10 @@
         <None Include="Tests\CharacterAdminSmoke.ps1"/>
         <None Include="Tests\CharacterInventoryFastPathSmoke.ps1"/>
         <None Include="Tests\CharacterShadowCheckpointSmoke.ps1"/>
+        <None Include="Tests\CharacterCheckpointRetentionProbe.cs"/>
+        <None Include="Tests\CharacterCheckpointWorkerProbe.cs"/>
+        <None Include="Tests\CharacterCheckpointCompletionProbe.cs"/>
+        <None Include="Tests\CharacterCheckpointWorkerSmoke.ps1"/>
         <None Include="Tests\LocalHostCharacterServiceSmoke.ps1"/>
         <None Include="Tests\LocalHostCharacterSmoke.ps1"/>
         <None Include="Tests\CharacterDirectStorageSmoke.ps1"/>

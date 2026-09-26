@@ -156,6 +156,9 @@ internal static partial class ServerManagerRuntime
 
     private static bool ApplyServerSettings(ServerSettings settings)
     {
+        // Retry the complete YAML edit after the immutable disk operation has
+        // finished; do not race its backup policy or block the game thread.
+        if (_serverCharacterService?.HasPendingCheckpointWrite == true) return false;
         if (!ValheimPlayerProfileCodec.IsStartItemsCatalogReady(settings)) return false;
         try { new ValheimPlayerProfileCodec(_serverCharacterOptions).ValidateStartItems(settings); }
         catch (InvalidDataException exception)

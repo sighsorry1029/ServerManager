@@ -64,6 +64,8 @@ internal static partial class ServerManagerRuntime
         PendingCharacterDiskWrites = new(CharacterStorageLayout.StorageKeyComparer);
     private static readonly List<PendingCharacterCheckpointAdoption>
         PendingCharacterCheckpointAdoptions = new();
+    private static readonly List<CharacterCheckpointProgress> CharacterCheckpointProgresses = new();
+    private static ActiveCharacterCheckpointWrite? _activeCharacterCheckpointWrite;
     [ThreadStatic]
     private static WorldSaveAttempt? _activeWorldSaveWorkerAttempt;
     private static int _queuedSteamAuthenticationCallbackCount;
@@ -437,8 +439,8 @@ internal static partial class ServerManagerRuntime
         {
             OperationId = operationId ?? string.Empty;
             Service = service ?? throw new ArgumentNullException(nameof(service));
-            Checkpoint = checkpoint ??
-                throw new ArgumentNullException(nameof(checkpoint));
+            Checkpoint = (checkpoint ??
+                throw new ArgumentNullException(nameof(checkpoint))).Handle;
             Entry = entry ?? throw new ArgumentNullException(nameof(entry));
         }
 
@@ -446,7 +448,7 @@ internal static partial class ServerManagerRuntime
 
         internal CharacterSnapshotService Service { get; }
 
-        internal CharacterCheckpointBatch Checkpoint { get; }
+        internal CharacterCheckpointHandle Checkpoint { get; }
 
         internal CharacterCheckpointEntry Entry { get; }
     }
@@ -470,6 +472,51 @@ internal static partial class ServerManagerRuntime
         internal int FailureCount { get; set; }
 
         internal string LastError { get; set; } = string.Empty;
+    }
+
+    private sealed class ActiveCharacterCheckpointWrite
+    {
+        internal ActiveCharacterCheckpointWrite(PendingCharacterDiskWrite pending,
+            CharacterCheckpointWrite write)
+        {
+            Pending = pending;
+            Head = pending.Head;
+            Write = write;
+        }
+
+        internal PendingCharacterDiskWrite Pending { get; }
+        internal PendingCharacterCheckpointEntry Head { get; }
+        internal CharacterCheckpointWrite Write { get; }
+    }
+
+    // Confirmation retains only identity/revision metadata, never a batch of
+    // character payloads. A failed key must not pin its successful siblings.
+    private sealed class CharacterCheckpointProgress
+    {
+        internal CharacterCheckpointProgress(WorldSaveAttempt attempt, CharacterCheckpointBatch checkpoint)
+        {
+            OperationId = attempt.OperationId;
+            Service = attempt.CharacterService!;
+            CheckpointId = checkpoint.CheckpointId;
+            Warning = attempt.CharacterCheckpointWarning;
+            foreach (CharacterCheckpointEntry entry in checkpoint.Entries)
+                Targets.Add(entry.StorageKey, new CharacterCheckpointTarget(entry.Snapshot.Revision));
+        }
+
+        internal string OperationId { get; }
+        internal CharacterSnapshotService Service { get; }
+        internal Guid CheckpointId { get; }
+        internal string Warning { get; }
+        internal Dictionary<string, CharacterCheckpointTarget> Targets { get; } =
+            new(CharacterStorageLayout.StorageKeyComparer);
+    }
+
+    private sealed class CharacterCheckpointTarget
+    {
+        internal CharacterCheckpointTarget(long revision) { Revision = revision; }
+        internal long Revision { get; }
+        internal bool AttemptFinished { get; set; }
+        internal bool Persisted { get; set; }
     }
 
     private sealed class PendingCharacterCheckpointAdoption
@@ -3527,6 +3574,7 @@ internal static partial class ServerManagerRuntime
     /// </summary>
     internal static void ProcessCompletedWorldSaveCheckpoints()
     {
+        PollCharacterCheckpointWrite();
         while (WorldSaveWorkerResults.TryDequeue(
                    out WorldSaveWorkerResult result))
         {
@@ -3602,8 +3650,12 @@ internal static partial class ServerManagerRuntime
                     continue;
                 }
 
-                HashSet<string> affectedStorageKeys =
-                    new HashSet<string>(CharacterStorageLayout.StorageKeyComparer);
+                // Only bounded, payload-free confirmation metadata survives
+                // adoption. Disk workers run after this main-thread pass.
+                if (CharacterCheckpointProgresses.Count >= MaximumQueuedWorldSaveWorkerResults)
+                    PublishCharacterCheckpointProgress(CharacterCheckpointProgresses[0], forcePartial: true);
+                CharacterCheckpointProgress progress = new(attempt, checkpoint);
+                CharacterCheckpointProgresses.Add(progress);
                 for (int index = 0; index < checkpoint.Entries.Count; ++index)
                 {
                     CharacterCheckpointEntry entry = checkpoint.Entries[index];
@@ -3616,7 +3668,9 @@ internal static partial class ServerManagerRuntime
                     try
                     {
                         AdoptCharacterCheckpointEntry(incoming);
-                        affectedStorageKeys.Add(entry.StorageKey);
+                        if (PendingCharacterDiskWrites.TryGetValue(entry.StorageKey,
+                                out PendingCharacterDiskWrite existing) && existing.FailureCount > 0)
+                            progress.Targets[entry.StorageKey].AttemptFinished = true;
                     }
                     catch (Exception exception) when (
                         !IntegrityCanonical.IsFatal(exception))
@@ -3625,6 +3679,7 @@ internal static partial class ServerManagerRuntime
                             new PendingCharacterCheckpointAdoption(
                                 incoming,
                                 exception));
+                        progress.Targets[entry.StorageKey].AttemptFinished = true;
                         TryWriteCheckpointLog(
                             () => ServerManagerPlugin.Log.LogError(
                                 "Could not adopt one character checkpoint entry " +
@@ -3634,45 +3689,9 @@ internal static partial class ServerManagerRuntime
                     }
                 }
 
-                string[] orderedStorageKeys = affectedStorageKeys.ToArray();
-                Array.Sort(orderedStorageKeys, StringComparer.Ordinal);
-                for (int index = 0; index < orderedStorageKeys.Length; ++index)
-                {
-                    TryCommitPendingCharacterCheckpoint(
-                        orderedStorageKeys[index],
-                        force: false);
-                }
-
-                int pendingCount = 0;
-                for (int index = 0; index < checkpoint.Entries.Count; ++index)
-                {
-                    CharacterCheckpointEntry entry = checkpoint.Entries[index];
-                    if (IsCheckpointEntryPending(entry))
-                    {
-                        ++pendingCount;
-                    }
-                }
-
-                pendingCount = Math.Min(checkpoint.Count, pendingCount);
-                int persistedCount = checkpoint.Count - pendingCount;
-                ServerManagerCharacterCommitScope completionScope =
-                    pendingCount == 0
-                        ? ServerManagerCharacterCommitScope
-                            .AllRetainedShadowsAtCutoff
-                        : ServerManagerCharacterCommitScope
-                            .PartialRetainedShadowsAtCutoff;
-                string warningText = pendingCount == 0
-                    ? attempt.CharacterCheckpointWarning
-                    : pendingCount.ToString(CultureInfo.InvariantCulture) +
-                      " character snapshot(s) remain pending for isolated " +
-                      "disk retry.";
-                PublishWorldCharacterCheckpointResult(
-                    attempt.OperationId,
-                    checkpoint,
-                    completionScope,
-                    persistedCount,
-                    pendingCount,
-                    warningText);
+                attempt.CharacterCheckpoint = null;
+                attempt.CharacterService = null;
+                PublishCharacterCheckpointProgress(progress, forcePartial: false);
             }
             catch (Exception exception) when (
                 !IntegrityCanonical.IsFatal(exception))
@@ -3705,7 +3724,7 @@ internal static partial class ServerManagerRuntime
         PendingCharacterCheckpointEntry incoming)
     {
         CharacterSnapshotService service = incoming.Service;
-        CharacterCheckpointBatch checkpoint = incoming.Checkpoint;
+        CharacterCheckpointHandle checkpoint = incoming.Checkpoint;
         CharacterCheckpointEntry entry = incoming.Entry;
         if (!PendingCharacterDiskWrites.TryGetValue(
                 entry.StorageKey,
@@ -3804,33 +3823,6 @@ internal static partial class ServerManagerRuntime
         return revisionComparison;
     }
 
-    private static bool IsCheckpointEntryPending(
-        CharacterCheckpointEntry entry)
-    {
-        for (int index = 0;
-             index < PendingCharacterCheckpointAdoptions.Count;
-             ++index)
-        {
-            if (ReferenceEquals(
-                    PendingCharacterCheckpointAdoptions[index].Entry.Entry,
-                    entry))
-            {
-                return true;
-            }
-        }
-
-        if (!PendingCharacterDiskWrites.TryGetValue(
-                entry.StorageKey,
-                out PendingCharacterDiskWrite pending))
-        {
-            return false;
-        }
-
-        long newestPendingRevision = pending.Tail?.Entry.Snapshot.Revision ??
-                                     pending.Head.Entry.Snapshot.Revision;
-        return entry.Snapshot.Revision <= newestPendingRevision;
-    }
-
     private static void TryAdoptDueCharacterCheckpoints(bool force)
     {
         PendingCharacterCheckpointAdoption[] due =
@@ -3881,11 +3873,14 @@ internal static partial class ServerManagerRuntime
 
     private static void TryCommitDueCharacterCheckpoints()
     {
+        if (_activeCharacterCheckpointWrite != null) return;
         string[] storageKeys = PendingCharacterDiskWrites.Keys.ToArray();
         Array.Sort(storageKeys, StringComparer.Ordinal);
         for (int index = 0; index < storageKeys.Length; ++index)
         {
-            TryCommitPendingCharacterCheckpoint(storageKeys[index], force: false);
+            // At most one disk operation is dispatched in a frame; no task
+            // queue grows behind slow storage and no worker touches Unity.
+            if (TryCommitPendingCharacterCheckpoint(storageKeys[index], force: false)) break;
         }
     }
 
@@ -3893,7 +3888,8 @@ internal static partial class ServerManagerRuntime
         string storageKey,
         bool force)
     {
-        if (!PendingCharacterDiskWrites.TryGetValue(
+        if (_activeCharacterCheckpointWrite != null ||
+            !PendingCharacterDiskWrites.TryGetValue(
                 storageKey,
                 out PendingCharacterDiskWrite pending) ||
             (!force && Stopwatch.GetTimestamp() <
@@ -3902,70 +3898,105 @@ internal static partial class ServerManagerRuntime
             return false;
         }
 
-        while (true)
+        PendingCharacterCheckpointEntry head = pending.Head;
+        if (!head.Service.CanStartCheckpointWrite) return false;
+        try
         {
-            PendingCharacterCheckpointEntry head = pending.Head;
-            CharacterSnapshotService service = head.Service;
-            string backupWarning;
-            try
-            {
-                backupWarning = service.CommitCheckpointEntry(
-                    head.Checkpoint,
-                    head.Entry);
-            }
-            catch (Exception exception) when (
-                !IntegrityCanonical.IsFatal(exception))
-            {
-                RegisterCharacterCheckpointFailure(pending, exception);
-                return false;
-            }
-
-            int recoveredFailureCount = pending.FailureCount;
-            PendingCharacterCheckpointEntry? tail = pending.Tail;
-            if (tail == null)
-            {
-                PendingCharacterDiskWrites.Remove(storageKey);
-            }
-            else
-            {
-                pending.Head = tail;
-                pending.Tail = null;
-                pending.FailureCount = 0;
-                pending.LastError = string.Empty;
-                pending.NextAttemptTimestamp = Stopwatch.GetTimestamp();
-            }
-
-            // Persistence and payload-pin consumption are complete before any
-            // observability work. A logger failure must never resurrect a
-            // consumed checkpoint handle.
-            TryWriteCheckpointLog(
-                () =>
-                {
-                    if (!string.IsNullOrEmpty(backupWarning))
-                    {
-                        ServerManagerPlugin.Log.LogWarning(
-                            "Character checkpoint backup warning: key=" +
-                            storageKey + ", " + backupWarning);
-                    }
-
-                    if (recoveredFailureCount > 0)
-                    {
-                        ServerManagerPlugin.Log.LogInfo(
-                            "CharacterCheckpointRecovered key=" + storageKey +
-                            ", revision=" +
-                            head.Entry.Snapshot.Revision.ToString(
-                                CultureInfo.InvariantCulture) +
-                            ", failures=" +
-                            recoveredFailureCount.ToString(
-                                CultureInfo.InvariantCulture));
-                    }
-                });
-
-            if (tail == null)
-            {
-                return true;
-            }
+            CharacterCheckpointWrite write =
+                head.Service.BeginCheckpointCommit(head.Checkpoint, head.Entry);
+            _activeCharacterCheckpointWrite = new ActiveCharacterCheckpointWrite(pending, write);
+            PollCharacterCheckpointWrite();
+            return true;
         }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        {
+            RegisterCharacterCheckpointFailure(pending, exception);
+            RecordCharacterCheckpointOutcome(head, persisted: false);
+            return false;
+        }
+    }
+
+    private static void PollCharacterCheckpointWrite()
+    {
+        ActiveCharacterCheckpointWrite? active = _activeCharacterCheckpointWrite;
+        if (active == null) return;
+        string backupWarning;
+        try
+        {
+            if (!active.Head.Service.TryCompleteCheckpointCommit(active.Write, out backupWarning)) return;
+        }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        {
+            _activeCharacterCheckpointWrite = null;
+            RegisterCharacterCheckpointFailure(active.Pending, exception);
+            RecordCharacterCheckpointOutcome(active.Head, persisted: false);
+            return;
+        }
+
+        // Service completion has advanced the durable revision and released
+        // its pin. Only then advance the coordinator and publish observations.
+        _activeCharacterCheckpointWrite = null;
+        PendingCharacterDiskWrite pending = active.Pending;
+        PendingCharacterCheckpointEntry head = active.Head;
+        string storageKey = head.Entry.StorageKey;
+        int recoveredFailureCount = pending.FailureCount;
+        PendingCharacterCheckpointEntry? tail = pending.Tail;
+        if (tail == null) PendingCharacterDiskWrites.Remove(storageKey);
+        else
+        {
+            pending.Head = tail;
+            pending.Tail = null;
+            pending.FailureCount = 0;
+            pending.LastError = string.Empty;
+            pending.NextAttemptTimestamp = Stopwatch.GetTimestamp();
+        }
+
+        RecordCharacterCheckpointOutcome(head, persisted: true);
+        TryWriteCheckpointLog(() =>
+        {
+            if (!string.IsNullOrEmpty(backupWarning))
+                ServerManagerPlugin.Log.LogWarning("Character checkpoint backup warning: key=" +
+                    storageKey + ", " + backupWarning);
+            if (recoveredFailureCount > 0)
+                ServerManagerPlugin.Log.LogInfo("CharacterCheckpointRecovered key=" + storageKey +
+                    ", revision=" + head.Entry.Snapshot.Revision.ToString(CultureInfo.InvariantCulture) +
+                    ", failures=" + recoveredFailureCount.ToString(CultureInfo.InvariantCulture));
+        });
+    }
+
+    private static void RecordCharacterCheckpointOutcome(PendingCharacterCheckpointEntry entry, bool persisted)
+    {
+        for (int index = CharacterCheckpointProgresses.Count - 1; index >= 0; --index)
+        {
+            CharacterCheckpointProgress progress = CharacterCheckpointProgresses[index];
+            if (!ReferenceEquals(progress.Service, entry.Service) ||
+                !progress.Targets.TryGetValue(entry.Entry.StorageKey, out CharacterCheckpointTarget target)) continue;
+            if (persisted && entry.Entry.Snapshot.Revision >= target.Revision)
+            {
+                target.AttemptFinished = true;
+                target.Persisted = true;
+            }
+            else if (!persisted)
+            {
+                // A failed head also blocks a newer tail for this character.
+                // Confirm only partial completion, never success for queued I/O.
+                target.AttemptFinished = true;
+            }
+            PublishCharacterCheckpointProgress(progress, forcePartial: false);
+        }
+    }
+
+    private static void PublishCharacterCheckpointProgress(CharacterCheckpointProgress progress, bool forcePartial)
+    {
+        if (!forcePartial && progress.Targets.Values.Any(target => !target.AttemptFinished)) return;
+        int persisted = progress.Targets.Values.Count(target => target.Persisted);
+        int pending = progress.Targets.Count - persisted;
+        CharacterCheckpointProgresses.Remove(progress);
+        PublishWorldCharacterCheckpointResult(progress.OperationId, progress.CheckpointId, progress.Targets.Count,
+            pending == 0 ? ServerManagerCharacterCommitScope.AllRetainedShadowsAtCutoff :
+                ServerManagerCharacterCommitScope.PartialRetainedShadowsAtCutoff,
+            persisted, pending, pending == 0 ? progress.Warning :
+                pending.ToString(CultureInfo.InvariantCulture) + " character snapshot(s) remain pending for isolated disk retry.");
     }
 
     private static void RegisterCharacterCheckpointFailure(
@@ -4041,6 +4072,7 @@ internal static partial class ServerManagerRuntime
                (firstPass || Stopwatch.GetTimestamp() < deadline))
         {
             firstPass = false;
+            PollCharacterCheckpointWrite();
             TryAdoptDueCharacterCheckpoints(force: true);
             string[] storageKeys = PendingCharacterDiskWrites.Keys.ToArray();
             Array.Sort(storageKeys, StringComparer.Ordinal);
@@ -4051,9 +4083,9 @@ internal static partial class ServerManagerRuntime
                     break;
                 }
 
-                TryCommitPendingCharacterCheckpoint(
+                if (TryCommitPendingCharacterCheckpoint(
                     storageKeys[index],
-                    force: true);
+                    force: true)) break;
             }
 
             if ((PendingCharacterDiskWrites.Count == 0 &&
@@ -4063,8 +4095,14 @@ internal static partial class ServerManagerRuntime
                 break;
             }
 
-            Thread.Sleep(250);
+            Thread.Sleep(10);
         }
+
+        PollCharacterCheckpointWrite();
+        // Report unresolved work truthfully before shutdown; never label a
+        // still-running disk operation as a completed character checkpoint.
+        while (CharacterCheckpointProgresses.Count != 0)
+            PublishCharacterCheckpointProgress(CharacterCheckpointProgresses[0], forcePartial: true);
 
         int unresolvedCount = checked(
             PendingCharacterDiskWrites.Count +
@@ -4103,7 +4141,8 @@ internal static partial class ServerManagerRuntime
 
     private static void PublishWorldCharacterCheckpointResult(
         string operationId,
-        CharacterCheckpointBatch checkpoint,
+        Guid checkpointId,
+        int capturedCount,
         ServerManagerCharacterCommitScope scope,
         int persistedCount,
         int pendingCount,
@@ -4117,8 +4156,8 @@ internal static partial class ServerManagerRuntime
             () => ServerManagerPlugin.Log.LogInfo(
                 "WorldCharacterCheckpoint" + token + " operation=" +
                 operationId + ", checkpoint=" +
-                checkpoint.CheckpointId.ToString("N") + ", captured=" +
-                checkpoint.Count.ToString(CultureInfo.InvariantCulture) +
+                checkpointId.ToString("N") + ", captured=" +
+                capturedCount.ToString(CultureInfo.InvariantCulture) +
                 ", persisted=" +
                 persistedCount.ToString(CultureInfo.InvariantCulture) +
                 ", pending=" +
@@ -4126,7 +4165,7 @@ internal static partial class ServerManagerRuntime
         TryPublishWorldSaveCheckpointCompleted(
             operationId,
             scope,
-            checkpoint.Count,
+            capturedCount,
             persistedCount,
             pendingCount,
             warning);
@@ -4198,6 +4237,8 @@ internal static partial class ServerManagerRuntime
 
         PendingCharacterDiskWrites.Clear();
         PendingCharacterCheckpointAdoptions.Clear();
+        CharacterCheckpointProgresses.Clear();
+        _activeCharacterCheckpointWrite = null;
         _activeWorldSaveWorkerAttempt = null;
         while (WorldSaveWorkerResults.TryDequeue(out _))
         {

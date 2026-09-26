@@ -1556,6 +1556,45 @@ More details: README, character backup and restore sections.
             }
         }
 
+        // The caller has already admitted these immutable profiles on Unity's
+        // thread. This worker path verifies native bytes against those exact
+        // profiles; it must not invoke the game/profile codec or semantic APIs.
+        internal string PersistCheckpointEntryOnWorker(
+            CharacterCheckpointEntry entry, CharacterEnvelope expectedDurableBase,
+            int maximumBackups)
+        {
+            ValidateAdminStorageTarget(entry.Identity, entry.StorageKey);
+            ValidateCheckpointEntry(entry);
+            ValidateCheckpointRebase(entry, expectedDurableBase);
+            lock (GetAccountLock(entry.Identity.AccountId))
+            {
+                lock (_profileLocks.GetOrAdd(entry.StorageKey, _ => new object()))
+                {
+                    string path = _layout.GetProfilePath(entry.StorageKey);
+                    EnsureStorageFileAncestors(path);
+                    EnsureRegularNonReparseFile(path, "checkpoint character primary");
+                    byte[] current = VanillaCharacterFileCodec.Decode(
+                        ReadBoundedFile(path), _options.MaxPayloadBytes);
+                    if (CharacterCrypto.FixedTimeEquals(current, entry.Snapshot.PayloadUnsafe))
+                        return string.Empty;
+                    if (!CharacterCrypto.FixedTimeEquals(current, expectedDurableBase.PayloadUnsafe))
+                        throw new CharacterStorageException("The durable character base changed before checkpoint commit.");
+                    if (entry.Snapshot.RequiresFreshLocalCharacter || expectedDurableBase.RequiresFreshLocalCharacter ||
+                        entry.Snapshot.Revision <= expectedDurableBase.Revision)
+                        throw new CharacterStorageException("A checkpoint cannot promote an initial profile or write a stale revision.");
+                    byte[] encoded = VanillaCharacterFileCodec.Encode(
+                        entry.Snapshot.PayloadUnsafe, _options.MaxPayloadBytes);
+                    string warning = ReplaceAtomicallyWithBackup(path, entry.StorageKey,
+                        encoded, out _, maximumBackups);
+                    byte[] verified = VanillaCharacterFileCodec.Decode(
+                        ReadBoundedFile(path), _options.MaxPayloadBytes);
+                    if (!CharacterCrypto.FixedTimeEquals(verified, entry.Snapshot.PayloadUnsafe))
+                        throw new CharacterStorageException("The checkpoint character failed disk readback.");
+                    return warning;
+                }
+            }
+        }
+
         private static void ValidateCheckpointRebase(
             CharacterCheckpointEntry entry,
             CharacterEnvelope expectedDurableBase)
@@ -2271,8 +2310,10 @@ More details: README, character backup and restore sections.
             string profilePath,
             string storageKey,
             byte[] encoded,
-            out bool replacementAttempted)
+            out bool replacementAttempted,
+            int? maximumBackups = null)
         {
+            int backupLimit = maximumBackups ?? _options.MaxBackups;
             replacementAttempted = false;
             EnsureAccountDirectoryForWrite(profilePath);
             if (!StoragePathsEqual(profilePath, _layout.GetProfilePath(storageKey)))
@@ -2280,15 +2321,15 @@ More details: README, character backup and restore sections.
             string backupDirectory = _layout.GetAccountDirectory(storageKey);
             CharacterBackupRecord[] existingBackups =
                 GetAdminBackupsCore(storageKey);
-            if (existingBackups.Length > _options.MaxBackups)
+            if (existingBackups.Length > backupLimit)
             {
                 // A crash or a post-commit prune failure can leave exactly one
                 // excess rollback copy. Repair that bounded residue before
                 // creating another backup so repeated commits do not make the
                 // directory permanently exceed its inspection limit.
-                PruneBackups(storageKey);
+                PruneBackups(storageKey, maximumBackups: backupLimit);
                 existingBackups = GetAdminBackupsCore(storageKey);
-                if (existingBackups.Length > _options.MaxBackups)
+                if (existingBackups.Length > backupLimit)
                 {
                     throw new CharacterStorageException(
                         "The character backup overflow could not be pruned safely.");
@@ -2328,7 +2369,7 @@ More details: README, character backup and restore sections.
             try
             {
                 // Never delete the rollback copy created by this replacement.
-                PruneBackups(storageKey, backupPath);
+                PruneBackups(storageKey, backupPath, backupLimit);
                 return string.Empty;
             }
             catch (Exception exception) when (
@@ -2414,14 +2455,15 @@ More details: README, character backup and restore sections.
                 "No unique character backup filename was available for the current second.");
         }
 
-        private void PruneBackups(string storageKey, string? preservedBackupPath = null)
+        private void PruneBackups(string storageKey, string? preservedBackupPath = null,
+            int? maximumBackups = null)
         {
             string accountDirectory = _layout.GetAccountDirectory(storageKey);
             // Listing validates the complete account directory before deletion,
             // but returns only this exact character's native backup filenames.
             CharacterBackupRecord[] backups = GetAdminBackupsCore(storageKey);
             Array.Sort(backups, Comparer<CharacterBackupRecord>.Create(CompareBackupRecords));
-            int deleteCount = backups.Length - _options.MaxBackups;
+            int deleteCount = backups.Length - (maximumBackups ?? _options.MaxBackups);
             foreach (CharacterBackupRecord backup in backups)
             {
                 if (deleteCount <= 0) break;

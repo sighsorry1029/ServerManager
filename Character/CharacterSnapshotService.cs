@@ -5,9 +5,23 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace ServerManager
 {
+    internal sealed class CharacterCheckpointWrite
+    {
+        internal CharacterCheckpointWrite(CharacterCheckpointHandle checkpoint,
+            CharacterCheckpointEntry entry, CharacterEnvelope expectedBase)
+        { Checkpoint = checkpoint; Entry = entry; ExpectedBase = expectedBase; }
+        internal CharacterCheckpointHandle Checkpoint { get; }
+        internal CharacterCheckpointEntry Entry { get; }
+        internal CharacterEnvelope ExpectedBase { get; }
+        internal Task<string> DiskTask { get; set; } = Task.FromResult(string.Empty);
+        internal bool EntryReleased { get; set; }
+        internal bool IsCompleted => DiskTask.IsCompleted;
+    }
+
     /// <summary>
     /// Coordinates character sessions and persistence but deliberately does not register,
     /// invoke, or disconnect any RPC. Plugin integration owns network lifecycle ordering.
@@ -51,6 +65,7 @@ namespace ServerManager
                 new Dictionary<Guid, Dictionary<string, CharacterCheckpointEntry>>();
         private readonly Guid _checkpointOwnerId = Guid.NewGuid();
         private readonly object _checkpointCommitGate = new object();
+        private CharacterCheckpointWrite? _checkpointWrite;
         // Only ambiguous administrative disk writes enter this set. Never let a
         // connection or another edit guess which state won; restart revalidates disk.
         private readonly HashSet<string> _unconfirmedAdminRestores =
@@ -103,6 +118,7 @@ namespace ServerManager
             lock (_checkpointCommitGate)
             {
                 ThrowIfDisposed();
+                ThrowIfCheckpointDiskBusy();
                 _repository.ApplyServerSettings(settings, incoming);
                 if (_semanticValidator is CharacterSemanticRevisionValidator validator)
                     validator.ApplyEvaluator(stored);
@@ -124,6 +140,7 @@ namespace ServerManager
             lock (_checkpointCommitGate)
             {
                 ThrowIfDisposed();
+                ThrowIfCheckpointDiskBusy();
                 Dictionary<string, CharacterAdminRecord> records = new Dictionary<string, CharacterAdminRecord>(CharacterStorageLayout.StorageKeyComparer);
                 foreach (CharacterIdentity identity in _repository.GetAdminStoredIdentities(_storageKeyProvider))
                 {
@@ -193,6 +210,7 @@ namespace ServerManager
                     }
                     if (live == null)
                     {
+                        ThrowIfCheckpointDiskBusy();
                         CharacterStoredSnapshot? stored = _repository.Load(identity, storageKey);
                         if (stored == null)
                             return CharacterAdminActions.Result(false, "character_not_found", "No stored character exists; administration never creates a profile.");
@@ -246,6 +264,7 @@ namespace ServerManager
                 {
                     ThrowIfDisposed();
                     string key = _storageKeyProvider.DeriveStorageKey(identity);
+                    ThrowIfCheckpointDiskBusy();
                     if (_repository.Load(identity, key) == null)
                         return CharacterAdminActions.Result(false, "character_not_found", "No existing primary was found. Backup recovery of missing primaries is not supported by this command.");
                     CharacterBackupRecord[] backups = _repository.GetAdminBackups(identity, key);
@@ -315,6 +334,7 @@ namespace ServerManager
                         if (_liveSnapshots.ContainsKey(key))
                             return Result(false, "shadow_pending", "RAM state remains. Run server save after logout and wait for its complete character checkpoint before restoring.");
                     }
+                    ThrowIfCheckpointDiskBusy();
                     CharacterStoredSnapshot? stored = _repository.Load(identity, key);
                     if (stored == null)
                         return Result(false, "character_not_found", "A valid existing primary is required. This command does not recover missing or corrupt primaries.");
@@ -471,6 +491,8 @@ namespace ServerManager
         private CharacterSessionOpenResult OpenBackupSessionCore(
             CharacterIdentity identity, ZRpc? rpc, byte[] localProfile)
         {
+            // Backup capture scans disk identities, including other accounts.
+            ThrowIfCheckpointDiskBusy();
             if (localProfile == null || localProfile.Length == 0 ||
                 localProfile.Length > _options.MaxPayloadBytes)
                 throw new CharacterProtocolException("The local backup profile exceeds the payload limits.");
@@ -702,6 +724,7 @@ namespace ServerManager
                 }
                 else
                 {
+                    ThrowIfCheckpointDiskBusy();
                     CharacterInitialSnapshotPreparation prepared =
                         _repository.PrepareInitialSnapshot(
                             identity,
@@ -918,6 +941,8 @@ namespace ServerManager
                 {
                     return false;
                 }
+
+                ThrowIfCheckpointDiskBusy();
 
                 if (session.PendingBackupCapture)
                     return FinalizeBackupCapture(session, pending);
@@ -1274,6 +1299,8 @@ namespace ServerManager
                         liveBase.LatestEnvelope.RequiresFreshLocalCharacter &&
                         !outcome.Current.RequiresFreshLocalCharacter;
 
+                    if (firstFullPromotionRequired) ThrowIfCheckpointDiskBusy();
+
                     lock (_liveSnapshotGate)
                     {
                         if (!_liveSnapshots.TryGetValue(
@@ -1530,133 +1557,159 @@ namespace ServerManager
             }
         }
 
+        internal bool HasPendingCheckpointWrite => Volatile.Read(ref _checkpointWrite) != null;
+
+        internal bool CanStartCheckpointWrite
+        {
+            get
+            {
+                if (Volatile.Read(ref _disposeState) != 0 || HasPendingCheckpointWrite) return false;
+                // Initial ReadyAck/first-full promotion is still an atomic
+                // synchronous admission boundary. Never start a background
+                // writer that would make an already-connecting player fail it.
+                if (!_preparedBackupCaptures.IsEmpty) return false;
+                foreach (CharacterSession session in EnumerateOpenSessions())
+                    if (!session.IsClosed && session.PendingInitialCommit) return false;
+                lock (_liveSnapshotGate)
+                    foreach (KeyValuePair<string, CharacterLiveSnapshot> pair in _liveSnapshots)
+                        if (pair.Value.LatestEnvelope.RequiresFreshLocalCharacter &&
+                            _activeStorageLeases.ContainsKey(pair.Key)) return false;
+                return true;
+            }
+        }
+
+        private void ThrowIfCheckpointDiskBusy()
+        {
+            if (HasPendingCheckpointWrite)
+                throw new CharacterStorageException("A character checkpoint disk write is in progress; retry shortly.")
+                    .WithPlayerMessage("sm_character_server_busy");
+        }
+
+        // Prepare and completion own only short RAM-state critical sections.
+        // The worker never acquires these gates or accesses game objects.
+        internal CharacterCheckpointWrite BeginCheckpointCommit(
+            CharacterCheckpointHandle checkpoint, CharacterCheckpointEntry entry)
+        {
+            ThrowIfDisposed();
+            ValidateCheckpointOwner(checkpoint);
+            if (checkpoint is CharacterCheckpointBatch batch) checkpoint = batch.Handle;
+            if (entry == null) throw new ArgumentNullException(nameof(entry));
+            lock (_checkpointCommitGate)
+            {
+                ThrowIfDisposed();
+                ThrowIfCheckpointDiskBusy();
+                if (!CanStartCheckpointWrite)
+                    throw new CharacterStorageException("An initial character admission must complete before checkpoint I/O starts.")
+                        .WithPlayerMessage("sm_character_server_busy");
+                CharacterEnvelope expectedBase;
+                bool completed = false;
+                lock (_liveSnapshotGate)
+                {
+                    RequireRegisteredCheckpointEntryLocked(checkpoint, entry);
+                    expectedBase = entry.DurableBase;
+                    if (_liveSnapshots.TryGetValue(entry.StorageKey, out CharacterLiveSnapshot current))
+                    {
+                        CharacterEnvelope durable = current.DurableEnvelope;
+                        if (durable.Revision >= entry.Snapshot.Revision)
+                        {
+                            if (durable.Revision == entry.Snapshot.Revision && !durable.MatchesSnapshot(entry.Snapshot))
+                                throw new CharacterStorageException("The live durable character revision conflicts with the retained checkpoint target.");
+                            if (current.LatestEnvelope.MatchesSnapshot(entry.Snapshot) &&
+                                !_activeStorageLeases.ContainsKey(entry.StorageKey))
+                                RemoveLiveSnapshotLocked(entry.StorageKey);
+                            ReleaseCheckpointEntryLocked(checkpoint, entry);
+                            completed = true;
+                        }
+                        else
+                        {
+                            if (durable.Revision < entry.DurableBase.Revision ||
+                                (durable.Revision == entry.DurableBase.Revision && !durable.MatchesSnapshot(entry.DurableBase)))
+                                throw new CharacterStorageException("The live character durable base moved outside the retained checkpoint chain.");
+                            expectedBase = durable;
+                        }
+                    }
+                }
+                CharacterCheckpointWrite write = new CharacterCheckpointWrite(checkpoint, entry, expectedBase)
+                    { EntryReleased = completed };
+                _checkpointWrite = write;
+                if (completed) return write;
+                int maximumBackups = _options.MaxBackups;
+                CharacterRepository repository = _repository;
+                try
+                {
+                    write.DiskTask = Task.Run(() => repository.PersistCheckpointEntryOnWorker(
+                        entry, expectedBase, maximumBackups));
+                    return write;
+                }
+                catch
+                {
+                    _checkpointWrite = null;
+                    throw;
+                }
+            }
+        }
+
+        internal bool TryCompleteCheckpointCommit(CharacterCheckpointWrite write, out string warning)
+        {
+            warning = string.Empty;
+            if (write == null) throw new ArgumentNullException(nameof(write));
+            if (!write.IsCompleted) return false;
+            lock (_checkpointCommitGate)
+            {
+                ThrowIfDisposed();
+                if (!ReferenceEquals(_checkpointWrite, write))
+                    throw new CharacterStorageException("The checkpoint worker no longer belongs to this service.");
+                try
+                {
+                    // IsCompleted above makes this result retrieval nonblocking.
+                    warning = write.DiskTask.GetAwaiter().GetResult();
+                    if (write.EntryReleased) return true;
+                    CharacterCheckpointEntry entry = write.Entry;
+                    lock (_liveSnapshotGate)
+                    {
+                        RequireRegisteredCheckpointEntryLocked(write.Checkpoint, entry);
+                        if (_liveSnapshots.TryGetValue(entry.StorageKey, out CharacterLiveSnapshot current))
+                        {
+                            if (current.DurableEnvelope.Revision > entry.Snapshot.Revision)
+                            {
+                                ReleaseCheckpointEntryLocked(write.Checkpoint, entry);
+                                return true;
+                            }
+                            if (!current.DurableEnvelope.MatchesSnapshot(entry.Snapshot) &&
+                                !current.DurableEnvelope.MatchesSnapshot(write.ExpectedBase))
+                                throw new CharacterStorageException("The live character durable base changed during checkpoint commit.");
+                            if (current.LatestEnvelope.MatchesSnapshot(entry.Snapshot) &&
+                                !_activeStorageLeases.ContainsKey(entry.StorageKey))
+                                RemoveLiveSnapshotLocked(entry.StorageKey);
+                            else if (!current.DurableEnvelope.MatchesSnapshot(entry.Snapshot))
+                                SetLiveSnapshotLocked(entry.StorageKey, current.WithDurable(entry.Snapshot));
+                        }
+                        ReleaseCheckpointEntryLocked(write.Checkpoint, entry);
+                        write.EntryReleased = true;
+                    }
+                    return true;
+                }
+                finally { _checkpointWrite = null; }
+            }
+        }
+
         /// <summary>
+        /// Synchronous compatibility entrypoint for isolated fixtures. Runtime
+        /// code uses Begin/TryComplete and never waits for worker I/O here.
         /// Commits one retained checkpoint entry. The repository base is
         /// safely rebased to this service's latest trusted durable revision so
         /// a later world cutoff can follow an older retry without weakening
         /// on-disk tamper checks.
         /// </summary>
         internal string CommitCheckpointEntry(
-            CharacterCheckpointBatch checkpoint,
+            CharacterCheckpointHandle checkpoint,
             CharacterCheckpointEntry entry)
         {
-            ThrowIfDisposed();
-            ValidateCheckpointOwner(checkpoint);
-            if (entry == null)
-            {
-                throw new ArgumentNullException(nameof(entry));
-            }
-
-            lock (_checkpointCommitGate)
-            {
-                ThrowIfDisposed();
-                CharacterEnvelope expectedDurableBase;
-                lock (_liveSnapshotGate)
-                {
-                    RequireRegisteredCheckpointEntryLocked(checkpoint, entry);
-                    if (!_liveSnapshots.TryGetValue(
-                            entry.StorageKey,
-                            out CharacterLiveSnapshot current))
-                    {
-                        expectedDurableBase = entry.DurableBase;
-                    }
-                    else
-                    {
-                        CharacterEnvelope durable = current.DurableEnvelope;
-                        if (durable.Revision > entry.Snapshot.Revision)
-                        {
-                            ReleaseCheckpointEntryLocked(checkpoint, entry);
-                            return string.Empty;
-                        }
-
-                        if (durable.Revision == entry.Snapshot.Revision)
-                        {
-                            if (!durable.MatchesSnapshot(entry.Snapshot))
-                            {
-                                throw new CharacterStorageException(
-                                    "The live durable character revision conflicts " +
-                                    "with the retained checkpoint target.");
-                            }
-
-                            if (current.LatestEnvelope.MatchesSnapshot(
-                                    entry.Snapshot) &&
-                                !_activeStorageLeases.ContainsKey(entry.StorageKey))
-                            {
-                                RemoveLiveSnapshotLocked(entry.StorageKey);
-                            }
-
-                            ReleaseCheckpointEntryLocked(checkpoint, entry);
-                            return string.Empty;
-                        }
-
-                        if (durable.Revision < entry.DurableBase.Revision ||
-                            (durable.Revision == entry.DurableBase.Revision &&
-                             !durable.MatchesSnapshot(entry.DurableBase)))
-                        {
-                            throw new CharacterStorageException(
-                                "The live character durable base moved outside " +
-                                "the retained checkpoint chain.");
-                        }
-
-                        expectedDurableBase = durable;
-                    }
-                }
-
-                string warning = _repository.PersistCheckpointEntry(
-                    entry,
-                    expectedDurableBase);
-                lock (_liveSnapshotGate)
-                {
-                    RequireRegisteredCheckpointEntryLocked(checkpoint, entry);
-                    if (_liveSnapshots.TryGetValue(
-                            entry.StorageKey,
-                            out CharacterLiveSnapshot current))
-                    {
-                        if (current.DurableEnvelope.Revision >
-                            entry.Snapshot.Revision)
-                        {
-                            ReleaseCheckpointEntryLocked(checkpoint, entry);
-                            return warning;
-                        }
-
-                        if (!current.DurableEnvelope.MatchesSnapshot(
-                                entry.Snapshot))
-                        {
-                            if (!current.DurableEnvelope.MatchesSnapshot(
-                                    expectedDurableBase))
-                            {
-                                throw new CharacterStorageException(
-                                    "The live character durable base changed during " +
-                                    "checkpoint commit.");
-                            }
-
-                            if (current.LatestEnvelope.MatchesSnapshot(
-                                    entry.Snapshot) &&
-                                !_activeStorageLeases.ContainsKey(entry.StorageKey))
-                            {
-                                RemoveLiveSnapshotLocked(entry.StorageKey);
-                            }
-                            else
-                            {
-                                SetLiveSnapshotLocked(
-                                    entry.StorageKey,
-                                    current.WithDurable(entry.Snapshot));
-                            }
-                        }
-
-                        else if (current.LatestEnvelope.MatchesSnapshot(
-                                     entry.Snapshot) &&
-                                 !_activeStorageLeases.ContainsKey(entry.StorageKey))
-                        {
-                            RemoveLiveSnapshotLocked(entry.StorageKey);
-                        }
-                    }
-
-                    ReleaseCheckpointEntryLocked(checkpoint, entry);
-                }
-
-                return warning;
-            }
+            CharacterCheckpointWrite write = BeginCheckpointCommit(checkpoint, entry);
+            string warning = string.Empty;
+            try { write.DiskTask.GetAwaiter().GetResult(); }
+            finally { TryCompleteCheckpointCommit(write, out warning); }
+            return warning;
         }
 
         /// <summary>
@@ -1675,13 +1728,16 @@ namespace ServerManager
                 ThrowIfDisposed();
                 lock (_liveSnapshotGate)
                 {
+                    if (_checkpointWrite != null &&
+                        _checkpointWrite.Checkpoint.CheckpointId == checkpoint.CheckpointId)
+                        throw new CharacterStorageException("An in-flight checkpoint cannot be discarded.");
                     ReleaseCheckpointPayloadsLocked(checkpoint);
                 }
             }
         }
 
         internal void DiscardCheckpointEntry(
-            CharacterCheckpointBatch checkpoint,
+            CharacterCheckpointHandle checkpoint,
             CharacterCheckpointEntry entry)
         {
             ThrowIfDisposed();
@@ -1696,6 +1752,8 @@ namespace ServerManager
                 ThrowIfDisposed();
                 lock (_liveSnapshotGate)
                 {
+                    if (_checkpointWrite != null && ReferenceEquals(_checkpointWrite.Entry, entry))
+                        throw new CharacterStorageException("An in-flight checkpoint entry cannot be discarded.");
                     RequireRegisteredCheckpointEntryLocked(checkpoint, entry);
                     ReleaseCheckpointEntryLocked(checkpoint, entry);
                 }
@@ -2259,7 +2317,7 @@ namespace ServerManager
         }
 
         private void RequireRegisteredCheckpointEntryLocked(
-            CharacterCheckpointBatch checkpoint,
+            CharacterCheckpointHandle checkpoint,
             CharacterCheckpointEntry entry)
         {
             if (!_registeredCheckpoints.TryGetValue(
@@ -2277,7 +2335,7 @@ namespace ServerManager
         }
 
         private void ReleaseCheckpointEntryLocked(
-            CharacterCheckpointBatch checkpoint,
+            CharacterCheckpointHandle checkpoint,
             CharacterCheckpointEntry entry)
         {
             if (!_registeredCheckpoints.TryGetValue(
@@ -2301,7 +2359,7 @@ namespace ServerManager
             }
         }
 
-        private void ValidateCheckpointOwner(CharacterCheckpointBatch checkpoint)
+        private void ValidateCheckpointOwner(CharacterCheckpointHandle checkpoint)
         {
             if (checkpoint == null)
             {
@@ -2363,14 +2421,13 @@ namespace ServerManager
                 return;
             }
 
-            // A checkpoint that already acquired this gate owns it until its
-            // repository writes and live-base advancement are both complete.
-            // Waiting here prevents disposal from clearing retained envelopes
-            // underneath that final bookkeeping step. Callers recheck the
-            // disposed marker after acquiring the gate to close the inverse
-            // race where Dispose arrived first.
+            // Worker I/O never owns this gate. Retire RAM immediately, but keep
+            // the exclusive directory writer lease until any admitted write
+            // has actually stopped. A replacement service must not race it.
             lock (_checkpointCommitGate)
             {
+                CharacterCheckpointWrite? retiringWrite = _checkpointWrite;
+                _checkpointWrite = null;
                 foreach (KeyValuePair<ZRpc, CharacterSession> pair in _serverSessions)
                 {
                     CharacterSession session;
@@ -2407,7 +2464,23 @@ namespace ServerManager
                     _skillObservationWindows.Clear();
                 }
 
-                _storageKeyProvider.Dispose();
+                if (retiringWrite != null && !retiringWrite.IsCompleted)
+                {
+                    CharacterStorageKeyProvider retiringProvider = _storageKeyProvider;
+                    _ = retiringWrite.DiskTask.ContinueWith(task =>
+                    {
+                        // Observe failure even when the retired runtime no
+                        // longer polls; never publish or advance its RAM state.
+                        _ = task.Exception;
+                        retiringProvider.Dispose();
+                    }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
+                else
+                {
+                    if (retiringWrite != null) _ = retiringWrite.DiskTask.Exception;
+                    _storageKeyProvider.Dispose();
+                }
             }
 
             GC.SuppressFinalize(this);
