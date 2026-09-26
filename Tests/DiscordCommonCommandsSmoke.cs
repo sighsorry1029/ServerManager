@@ -74,7 +74,7 @@ internal static class DiscordCommonCommandsSmoke
         {
             if (args.Length != 1) throw new ArgumentException("The built ServerManager DLL path is required.");
             ServerCommands.BindIdentifierPredicates(args[0]);
-            FixedExecutionLimits(); AdapterArguments(); RegistrationAndAdmins(); MultiGuildIsolation(); SharedExecution(); TypedParsing();
+            FixedExecutionLimits(); AdapterArguments(); SpacedCharacterTargets(); RegistrationAndAdmins(); MultiGuildIsolation(); SharedExecution(); TypedParsing();
             Reauthorization(); RestoreRejectionAudit(); ItemPresetArguments(); ItemPresetRejectionAudit(); RconRouting(); DeferredRevocationAndTimeout();
             Console.WriteLine("PASS: Discord flat command adapter (" + _checks + " assertions)."); return 0;
         }
@@ -178,6 +178,29 @@ internal static class DiscordCommonCommandsSmoke
         Check(DiscordCommands.ValidateArguments("rcon", A("command", new string('a', 1000))), "RCON bound accepted");
         Check(!DiscordCommands.ValidateArguments("rcon", A("command", new string('a', 1001))), "RCON overlong rejected");
         Check(!DiscordCommands.ValidateArguments("rcon", A("command", "save\nkick P")), "RCON multiple lines rejected");
+    }
+    private static void SpacedCharacterTargets()
+    {
+        using var fixture = new Fixture();
+        foreach (string name in new[] { "Varg Red Tooth", "Varg Red Tooth ", " Varg Red Tooth", "Varg  Red Tooth", " Varg  Red Tooth ",
+            "띠 오", "띠 오 ", " 띠 오", "띠  오", " 띠  오 " })
+        foreach (string selector in new[] { name, "76561198000000001/" + name })
+        {
+            // Discord's player option is literal text: the user does not add
+            // command-line quotes. The adapter alone quotes it for shared parsing.
+            var args = A("player", selector, "prefab", "Wood", "amount", "2", "quality", "3");
+            string line = "giveitem \"" + selector + "\" \"Wood\" \"2\" \"3\"";
+            Check(DiscordCommands.ValidateArguments("giveitem", args), "Spaced character selector validates unchanged");
+            Check(DiscordCommands.SharedLine("giveitem", args) == line, "Adapter preserves all character-name spaces");
+            string[] parsed = ServerCommands.ParseProductionCommand(line);
+            Check(parsed.SequenceEqual(new[] { "item", "give", selector, "Wood", "2", "3" }),
+                "Actual shared parser retains exact Discord selector and item argument boundaries");
+            Task executing = fixture.Execute(fixture.Parse("giveitem", args));
+            var call = ServerCommands.Calls.Last();
+            Check(call.Line == line && call.Caller.IsAuthorized(), "Typed interaction reaches shared executor without trimming its target");
+            call.Completion.SetResult(Result("ok")); executing.GetAwaiter().GetResult();
+        }
+        Check(fixture.Audits.Count == 0, "Spaced-name commands leave auditing to the shared executor");
     }
     private static void RegistrationAndAdmins()
     {
@@ -701,6 +724,7 @@ namespace ServerManager.Commands
     {
         private static Func<string, bool> _isBackupId = null!;
         private static Func<string, bool> _isItemDataId = null!;
+        private static MethodInfo _parseCommand = null!;
         internal static void BindIdentifierPredicates(string assemblyPath)
         {
             // Run the production predicates while retaining the fixture's inert
@@ -711,9 +735,16 @@ namespace ServerManager.Commands
                 production.GetMethod(nameof(IsBackupId), flags)!);
             _isItemDataId = (Func<string, bool>)Delegate.CreateDelegate(typeof(Func<string, bool>),
                 production.GetMethod(nameof(IsItemDataId), flags)!);
+            _parseCommand = production.GetMethod("TryParseCommand", flags)!;
         }
         internal static bool IsBackupId(string value) => _isBackupId(value);
         internal static bool IsItemDataId(string value) => _isItemDataId(value);
+        internal static string[] ParseProductionCommand(string line)
+        {
+            object?[] args = { line, null, null };
+            if (!(bool)_parseCommand.Invoke(null, args)!) throw new Exception("Shared parse rejected adapter output: " + args[2]);
+            return (string[])args[1]!;
+        }
 
         // This inert shared-boundary catalog is deliberately independent of the
         // Discord descriptors: adapter initialization fails on naming drift.

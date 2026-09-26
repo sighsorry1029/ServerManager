@@ -20,10 +20,13 @@ namespace ServerManager
             }
 
             string normalized = value.Normalize(NormalizationForm.FormKC);
-            if (!string.Equals(normalized, normalized.Trim(), StringComparison.Ordinal))
+            // Ordinary spaces are part of a Valheim character's identity,
+            // including leading/trailing spaces. Never trim or collapse them:
+            // that could alias two different native profiles to one storage key.
+            if (string.IsNullOrWhiteSpace(normalized))
             {
                 throw new CharacterProtocolException(
-                    "Character names may not start or end with whitespace.");
+                    "Character names may not be empty or contain only whitespace.");
             }
 
             if (normalized.Length < MinimumLength || normalized.Length > MaximumLength)

@@ -19,7 +19,21 @@ function Get-AllCecilTypes {
 function Test-ExternallyVisibleType {
     param($Type)
 
-    return $Type.IsPublic -or $Type.IsNestedPublic
+    while ($null -ne $Type) {
+        if ($Type.IsNested) {
+            if (-not $Type.IsNestedPublic) { return $false }
+        }
+        elseif (-not $Type.IsPublic) { return $false }
+        $Type = $Type.DeclaringType
+    }
+    return $true
+}
+
+function Test-RuntimeReference {
+    param($Type)
+
+    return $Type.Scope -is [Mono.Cecil.AssemblyNameReference] -and
+        $script:runtimeAssemblyNames -contains $Type.Scope.Name
 }
 
 function Assert-RuntimeFieldExists {
@@ -81,11 +95,9 @@ if (-not (Test-Path -LiteralPath $cecilPath)) {
 [Reflection.Assembly]::LoadFrom($cecilPath) | Out-Null
 
 $runtimeTypes = @{}
-foreach ($assemblyName in @(
-    "assembly_valheim.dll",
-    "assembly_utils.dll",
-    "assembly_guiutils.dll")) {
-    $assemblyPath = Join-Path $managedRoot $assemblyName
+$runtimeAssemblyNames = @('assembly_valheim', 'assembly_utils', 'assembly_guiutils')
+foreach ($assemblyName in $runtimeAssemblyNames) {
+    $assemblyPath = Join-Path $managedRoot ($assemblyName + '.dll')
     if (-not (Test-Path -LiteralPath $assemblyPath)) {
         throw "The actual Valheim runtime assembly is missing: $assemblyPath"
     }
@@ -151,6 +163,16 @@ foreach ($requiredMethod in @(
         Type = "ZDOMan"
         Name = "SendDestroyed"
         Parameters = @()
+    },
+    [pscustomobject]@{
+        Type = "Inventory"
+        Name = "AddItem"
+        Parameters = @("ItemDrop/ItemData", "System.Int32", "System.Int32", "System.Int32", "System.Boolean")
+    },
+    [pscustomobject]@{
+        Type = "Inventory"
+        Name = "Changed"
+        Parameters = @("System.Boolean", "System.Boolean")
     })) {
     Assert-RuntimeMethodExists `
         $runtimeTypes `
@@ -170,24 +192,35 @@ foreach ($type in @(Get-AllCecilTypes $plugin.MainModule.Types)) {
 
         foreach ($instruction in $method.Body.Instructions) {
             $member = $instruction.Operand
-            if ($member -is [Mono.Cecil.FieldReference] -and
-                $runtimeTypes.ContainsKey($member.DeclaringType.FullName)) {
-                $runtimeType = $runtimeTypes[$member.DeclaringType.FullName]
+            if ($member -isnot [Mono.Cecil.FieldReference] -and
+                $member -isnot [Mono.Cecil.MethodReference]) { continue }
+            if (-not (Test-RuntimeReference $member.DeclaringType)) { continue }
+            if (-not $runtimeTypes.ContainsKey($member.DeclaringType.FullName)) {
+                $violations.Add("$($method.FullName) references missing type $($member.DeclaringType.FullName)")
+                continue
+            }
+            $runtimeType = $runtimeTypes[$member.DeclaringType.FullName]
+            if ($member -is [Mono.Cecil.FieldReference]) {
                 $runtimeField = $runtimeType.Fields |
-                    Where-Object FullName -eq $member.FullName |
+                    Where-Object FullName -ceq $member.FullName |
                     Select-Object -First 1
-                if ($null -ne $runtimeField -and -not $runtimeField.IsPublic) {
+                if ($null -eq $runtimeField) {
+                    $violations.Add("$($method.FullName) references missing field $($member.FullName)")
+                }
+                elseif (-not $runtimeField.IsPublic) {
                     $violations.Add(
                         "$($method.FullName) directly references non-public field $($member.FullName)")
                 }
             }
-            elseif ($member -is [Mono.Cecil.MethodReference] -and
-                    $runtimeTypes.ContainsKey($member.DeclaringType.FullName)) {
-                $runtimeType = $runtimeTypes[$member.DeclaringType.FullName]
+            else {
+                $lookup = if ($member -is [Mono.Cecil.GenericInstanceMethod]) { $member.ElementMethod } else { $member }
                 $runtimeMethod = $runtimeType.Methods |
-                    Where-Object FullName -eq $member.FullName |
+                    Where-Object FullName -ceq $lookup.FullName |
                     Select-Object -First 1
-                if ($null -ne $runtimeMethod -and -not $runtimeMethod.IsPublic) {
+                if ($null -eq $runtimeMethod) {
+                    $violations.Add("$($method.FullName) calls missing method $($lookup.FullName)")
+                }
+                elseif (-not $runtimeMethod.IsPublic) {
                     $violations.Add(
                         "$($method.FullName) directly calls non-public method $($member.FullName)")
                 }
@@ -197,7 +230,9 @@ foreach ($type in @(Get-AllCecilTypes $plugin.MainModule.Types)) {
 }
 
 foreach ($reference in $plugin.MainModule.GetTypeReferences()) {
+    if (-not (Test-RuntimeReference $reference)) { continue }
     if (-not $runtimeTypes.ContainsKey($reference.FullName)) {
+        $violations.Add("ServerManager references missing runtime type $($reference.FullName)")
         continue
     }
 
@@ -211,10 +246,10 @@ foreach ($reference in $plugin.MainModule.GetTypeReferences()) {
 if ($violations.Count -ne 0) {
     $details = $violations | Sort-Object -Unique
     throw (
-        "ServerManager contains runtime-inaccessible Valheim references:`n" +
+        "ServerManager contains unresolved or runtime-inaccessible Valheim references:`n" +
         ($details -join "`n"))
 }
 
 Write-Output (
     "Runtime member access smoke test passed: required reflection schema " +
-    "exists and there are no direct non-public Valheim member or type references.")
+    "exists and there are no missing or non-public direct Valheim member or type references.")

@@ -184,6 +184,34 @@ foreach ($prefix in @('', 'sm:', 'SM:')) {
 }
 $hyphenArgs = Read-Command 'sm:giveitem "Some-Name" Sword-Custom 1'
 Assert-True (($hyphenArgs -join '|') -ceq 'item|give|Some-Name|Sword-Custom|1') 'Hyphens in player names and prefab arguments must remain unchanged.'
+# Spaces belong to the character identity, not to a forgiving selector grammar.
+# The command quotes delimit that identity; omitting them must not guess a target.
+$hangulName = '띠 오'
+$spaceNames = @('Varg Red Tooth', 'Varg Red Tooth ', ' Varg Red Tooth', 'Varg  Red Tooth', ' Varg  Red Tooth ',
+    $hangulName, ($hangulName + ' '), (' ' + $hangulName), $hangulName.Replace(' ', '  '),
+    (' ' + $hangulName.Replace(' ', '  ') + ' '), $hangulName.Replace(' ', ''))
+$matchesTarget = $assembly.GetType('ServerManager.ServerManagerRuntime', $true).GetMethod('MatchesAdminTarget', $flags)
+foreach ($name in $spaceNames) {
+    foreach ($selector in @($name, ('76561198000000001/' + $name))) {
+        foreach ($prefix in @('', 'sm:')) {
+            $parsed = Read-Command ($prefix + 'giveitem ' + $quote.Invoke($null, @($selector)) + ' Wood 2 3')
+            Assert-True ($parsed.Length -eq 6 -and $parsed[2] -ceq $selector -and
+                $parsed[3] -ceq 'Wood' -and $parsed[4] -ceq '2' -and $parsed[5] -ceq '3') `
+                'Quoted giveitem target must preserve interior, repeated, leading and trailing spaces without shifting item arguments.'
+        }
+        foreach ($otherName in $spaceNames) {
+            $matches = $matchesTarget.Invoke($null, [object[]]@($selector, 'steamworks:76561198000000001', $otherName, [long]42))
+            Assert-True ($matches -eq ($name -ceq $otherName)) 'Name selectors must not merge characters differing only in spaces.'
+        }
+    }
+    Assert-True (-not $matchesTarget.Invoke($null, [object[]]@(('76561198000000002/' + $name), 'steamworks:76561198000000001', $name, [long]42))) `
+        'An account-qualified spaced name must not match another Steam account.'
+    foreach ($selector in @('76561198000000001', '42')) {
+        Assert-True ($matchesTarget.Invoke($null, [object[]]@($selector, 'steamworks:76561198000000001', $name, [long]42))) `
+            'Exact account/player IDs remain available without reproducing name whitespace.'
+    }
+}
+Assert-Syntax 'sm:giveitem Varg Red Tooth Wood 2' $false
 Assert-True (((Read-Command 'sm:giveitem player Wood 2 3') -join '|') -ceq 'item|give|player|Wood|2|3') 'Existing explicit quality must retain the six-token internal shape.'
 Assert-True ($syntax.Invoke($null, @('giveitem')) -ceq 'sm:giveitem <target> <prefab> <amount> [quality] [dataId]') 'Giveitem help must document the preset ID after quality.'
 $commandItemDataId = $commands.GetMethod('IsItemDataId', $flags)

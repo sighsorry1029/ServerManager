@@ -258,6 +258,7 @@ checkpoint completed.
 3. Copy the native `.fch` into `characters/<Steam64>/`.
 4. Name it `Steam_<Steam64>_<lowercase-character-name>.fch`.
    Use the name stored inside the character; do not change its internal name or Player ID.
+   Keep every space, including leading/trailing spaces in the name before `.fch`.
 5. Keep `loadServerCharacterOnJoin: true`, restart, check the log, and join with
    the matching character.
 
@@ -271,6 +272,11 @@ There is no import folder or conversion step. Do not copy `.old`, `.signature`
 or `.serverbackup` files into active storage. To use an older native backup,
 copy its `.fch` and rename the copy as above. The required game/mod versions
 must still be compatible.
+
+Names may contain leading, trailing or repeated spaces. These are kept as part of
+the character's identity: `MyHero` and `MyHero ` are different names. Blank names,
+control characters and unsafe path characters are not allowed. In text commands,
+wrap the full name in double quotes, for example `sm:characterbackups "Two Words"`.
 
 ### Restore a backup
 
@@ -335,7 +341,9 @@ An empty access list allows all accounts.
 
 Use exact names or Steam64 IDs; ambiguous targets are rejected. Character
 commands also accept `Steam64/CharacterName`. Quote names containing spaces.
-F5 Tab completion covers command names and the first online-player argument.
+Use `Steam64/CharacterName` for numeric names or otherwise ambiguous targets.
+F5 Tab completion covers command names and single-word online-player names;
+type multiword names in double quotes.
 
 ```text
 sm:giveitem "Some Player" SwordIron 1 4
@@ -357,9 +365,14 @@ Discord uses named options:
 /rcon command:"kick 76561198000000001"
 ```
 
+For a name such as `띠 오`, enter it directly in Discord's `player` option,
+without surrounding quotes. F5 uses `sm:giveitem "띠 오" Wood 1`.
+Keep any leading/trailing spaces inside F5 quotes or inside the Discord option.
+
 Use vanilla `save`, `kick`, `ban` and `unban` in the server console or through
 Discord `/rcon`. There are no `sm:save` or `sm:kick` aliases. Use the dedicated
-slash commands for ServerManager features, not `sm:...` inside `/rcon`.
+slash commands for ServerManager features: `/giveitem`, not
+`/rcon command:giveitem ...` or `sm:...` inside `/rcon`.
 
 Item grants need an online target with enough inventory space. Excess items are
 not dropped. A timeout does not prove that an action failed: check the result

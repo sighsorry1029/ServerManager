@@ -273,7 +273,8 @@ try {
     try {
         foreach ($culture in @('en-US', 'tr-TR', 'ko-KR')) {
             [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo($culture)
-            foreach ($name in @('IHero', 'Viking_Name', ([string][char]0xd55c + [char]0xae00 + 'Hero'))) {
+            foreach ($name in @('IHero', 'Viking_Name', ' Hero', 'Hero ', '  Two  Words  ',
+                ([string][char]0xd55c + [char]0xae00 + 'Hero'))) {
                 $named = New-Instance 'CharacterIdentity' @($identity.AccountId, $name)
                 Assert-True ($fixture.Keys.DeriveStorageKey($named) -ceq
                     ('Steam_76561198000000001_' + $name.ToLowerInvariant()) -and
@@ -282,6 +283,81 @@ try {
         }
     }
     finally { [Threading.Thread]::CurrentThread.CurrentCulture = $priorCulture }
+
+    # Ordinary spaces are part of native character identity, including at the
+    # edges. Relaxing that one rule must not enable blank names or path/control
+    # characters, or silently merge an existing character with its space alias.
+    $normalizeName = $plugin.GetType('ServerManager.CharacterNamePolicy').GetMethod('NormalizeAndValidate', $allStatic)
+    foreach ($invalidName in @('', ' ', '   ', "`tHero", "Hero`t", "Hero`r`n", "Hero`0",
+        'Hero/Child', 'Hero\Child', '../Hero', 'Hero:Child', 'Hero*', 'Hero?', 'Hero.',
+        ('Hero' + [char]0x200b), ([string][char]0x200b + 'Hero'))) {
+        Assert-Throws { $normalizeName.Invoke($null, [object[]]@($invalidName)) }
+    }
+    $spaceFixture = New-DirectFixture 'ordinary-name-spaces'
+    $spaceNames = @('Hero', 'Hero ', ' Hero', '  Two  Words  ')
+    $spaceCharacters = @()
+    for ($nameIndex = 0; $nameIndex -lt $spaceNames.Count; ++$nameIndex) {
+        $name = $spaceNames[$nameIndex]
+        Assert-True ($normalizeName.Invoke($null, [object[]]@($name)) -ceq $name) 'Name policy trimmed or collapsed ordinary spaces.'
+        $spaceIdentity = New-Instance 'CharacterIdentity' @($identity.AccountId, $name)
+        $spaceRaw = New-ProfilePayload $name (8000 + $nameIndex) 'native-name-spaces'
+        $spaceDirect = Write-DirectCharacter $spaceFixture $spaceIdentity $spaceRaw
+        Assert-True ([IO.Path]::GetFileName($spaceDirect.Path) -ceq
+            ('Steam_76561198000000001_' + $name.ToLowerInvariant() + '.fch')) 'Primary filename trimmed or collapsed character spaces.'
+        $spaceCharacters += $spaceDirect
+    }
+    Assert-True (-not $spaceCharacters[0].Identity.EqualsIdentity($spaceCharacters[1].Identity) -and
+        $spaceCharacters[0].Key -cne $spaceCharacters[1].Key -and
+        $spaceCharacters[0].Path -cne $spaceCharacters[1].Path) 'Hero and Hero-space collided in identity or storage.'
+    Validate-DirectStorage $spaceFixture
+    $spaceIdentities = Invoke-Hidden $spaceFixture.Repository 'GetAdminStoredIdentities' @($spaceFixture.Keys)
+    Assert-True ($spaceIdentities.Count -eq $spaceNames.Count) 'Startup or offline enumeration merged space-distinct native characters.'
+    foreach ($spaceDirect in $spaceCharacters) {
+        $name = $spaceDirect.Identity.CharacterName
+        Assert-True (@($spaceIdentities | Where-Object { $_.CharacterName -ceq $name }).Count -eq 1) 'Offline enumeration lost exact name spacing.'
+        $spaceStored = Invoke-Hidden $spaceFixture.Repository 'Load' @($spaceDirect.Identity, $spaceDirect.Key)
+        Assert-True ($spaceStored.Envelope.CharacterName -ceq $name -and
+            (Test-Bytes $spaceStored.Envelope.GetPayloadCopy() $spaceDirect.Payload)) 'Native profile loading changed name spacing or bytes.'
+    }
+    Assert-Throws { Invoke-Hidden $spaceFixture.Repository 'Load' @($spaceCharacters[0].Identity, $spaceCharacters[1].Key) }
+    Assert-Throws { Invoke-Hidden $spaceFixture.Repository 'Load' @($spaceCharacters[1].Identity, $spaceCharacters[0].Key) }
+
+    $trailingDirect = $spaceCharacters[1]
+    $trailingIdentity = $trailingDirect.Identity
+    $spaceOpened = Invoke-Hidden $spaceFixture.Service 'OpenOrCreateLocalHostSession' @($trailingIdentity)
+    Assert-True (-not $spaceOpened.PendingInitialCommit -and $spaceOpened.Snapshot.CharacterName -ceq 'Hero ' -and
+        (Test-Bytes $spaceOpened.Snapshot.GetPayloadCopy() $trailingDirect.Payload)) 'Session admission discarded a trailing space or created a replacement profile.'
+    [byte[]]$spaceSavedRaw = New-ProfilePayload 'Hero ' 8001 'saved-name-spaces'
+    $spaceSave = New-Request $trailingIdentity $spaceOpened.Snapshot.SessionId 2 1 $spaceSavedRaw
+    Assert-True (Invoke-Hidden $spaceFixture.Service 'HandleLocalHostSaveRequest' @($spaceOpened.Snapshot.SessionId, $spaceSave)).Accepted 'Saving a trailing-space character failed.'
+    Invoke-Hidden $spaceFixture.Service 'CloseLocalHostSession' @($spaceOpened.Snapshot.SessionId) | Out-Null
+    $spaceReopened = Invoke-Hidden $spaceFixture.Service 'OpenOrCreateLocalHostSession' @($trailingIdentity)
+    Assert-True ($spaceReopened.Snapshot.Revision -eq 2 -and $spaceReopened.Snapshot.CharacterName -ceq 'Hero ' -and
+        (Test-Bytes $spaceReopened.Snapshot.GetPayloadCopy() $spaceSavedRaw)) 'Retained RAM reconnect lost the exact trailing-space identity or latest bytes.'
+    Invoke-Hidden $spaceFixture.Service 'CloseLocalHostSession' @($spaceReopened.Snapshot.SessionId) | Out-Null
+    $spaceCheckpoint = Invoke-Hidden $spaceFixture.Service 'BeginCheckpoint'
+    foreach ($entry in (Get-Hidden $spaceCheckpoint 'Entries')) {
+        Invoke-Hidden $spaceFixture.Service 'CommitCheckpointEntry' @($spaceCheckpoint, $entry) | Out-Null
+    }
+    Assert-True (Test-Bytes ([IO.File]::ReadAllBytes($trailingDirect.Path)) (New-NativeFch $spaceSavedRaw)) 'Checkpoint did not persist the exact trailing-space native profile.'
+    $spaceBackups = Invoke-Hidden $spaceFixture.Repository 'GetAdminBackups' @($trailingIdentity, $trailingDirect.Key)
+    Assert-True ($spaceBackups.Count -eq 1) 'Trailing-space primary did not produce exactly one recovery backup.'
+    $spaceBackupId = Get-Hidden $spaceBackups[0] 'BackupId'
+    $spaceBackup = Invoke-Hidden $spaceFixture.Repository 'ReadAdminBackup' @($trailingIdentity, $trailingDirect.Key, $spaceBackupId)
+    Assert-True ($spaceBackup.CharacterName -ceq 'Hero ' -and
+        (Test-Bytes $spaceBackup.GetPayloadCopy() $trailingDirect.Payload)) 'Backup reader changed a trailing-space identity or profile.'
+    $spaceRestore = Invoke-Hidden $spaceFixture.Service 'RestoreAdminBackup' @($trailingIdentity.AccountId, $trailingIdentity.CharacterName, $spaceBackupId)
+    Assert-True ($spaceRestore.Success -and
+        (Test-Bytes ([IO.File]::ReadAllBytes($trailingDirect.Path)) (New-NativeFch $trailingDirect.Payload))) 'Backup restore failed to select the exact trailing-space character.'
+    $spaceRestoredOpen = Invoke-Hidden $spaceFixture.Service 'OpenOrCreateLocalHostSession' @($trailingIdentity)
+    Assert-True ($spaceRestoredOpen.Snapshot.CharacterName -ceq 'Hero ' -and
+        (Test-Bytes $spaceRestoredOpen.Snapshot.GetPayloadCopy() $trailingDirect.Payload)) 'Reconnect after restore used stale RAM or a trimmed identity.'
+    Invoke-Hidden $spaceFixture.Service 'CloseLocalHostSession' @($spaceRestoredOpen.Snapshot.SessionId) | Out-Null
+    foreach ($spaceDirect in $spaceCharacters) {
+        Assert-True (Test-Bytes ([IO.File]::ReadAllBytes($spaceDirect.Path)) (New-NativeFch $spaceDirect.Payload)) 'Save or restore changed a space-distinct sibling profile.'
+    }
+    Validate-DirectStorage $spaceFixture
+
     $markerFixture = New-DirectFixture 'literal-old-backup-marker'
     $markerIdentity = New-Instance 'CharacterIdentity' @($identity.AccountId, 'Hero_backup_auto-Label')
     [byte[]]$markerRaw = New-ProfilePayload 'Hero_backup_auto-Label' 102 'literal-name-marker'

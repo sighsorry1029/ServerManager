@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2
+
+- Allowed leading and trailing spaces in character names, preserving every space so distinct native profiles keep separate storage identities.
+- Fixed custom-data item grants and failed-grant inventory rollback to use the current Valheim inventory method signatures.
+- Clarified how to target names containing spaces in F5 and Discord commands, with additional storage and command regression tests.
+- Updated the required BepInExPack Valheim version to 5.4.2351.
+
 ## 1.1.1
 
 - Added inventory overlap diagnostics identifying the slot and both conflicting items, with local prefab names when available.

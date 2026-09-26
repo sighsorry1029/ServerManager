@@ -1,3 +1,4 @@
+#nullable enable annotations
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -80,7 +81,8 @@ public sealed class Inventory
     readonly object background;
     readonly int width, height;
     readonly List<ItemDrop.ItemData> items = new List<ItemDrop.ItemData>();
-    public int AddCalls, ChangedCalls;
+    public int AddCalls, ChangedCalls, PositionCheckBypasses;
+    public bool LastChangeSuccess, LastChangeCheatedStateChanged;
     public Func<Inventory, ItemDrop.ItemData, bool> BeforeAdd;
     public Action<Inventory, ItemDrop.ItemData> AfterPlacement;
     public Action<Inventory> OnChanged;
@@ -93,11 +95,12 @@ public sealed class Inventory
     public List<ItemDrop.ItemData> GetAllItems() { return items; }
     public ItemDrop.ItemData GetItemAt(int x, int y)
     { return items.FirstOrDefault(item => item.m_gridPos.x == x && item.m_gridPos.y == y); }
-    private bool AddItem(ItemDrop.ItemData source, int amount, int x, int y)
+    private bool AddItem(ItemDrop.ItemData source, int amount, int x, int y, bool skipValidPositionCheck = false)
     {
         ++AddCalls;
+        if (skipValidPositionCheck) ++PositionCheckBypasses;
         if (BeforeAdd != null && !BeforeAdd(this, source)) return false;
-        if (amount <= 0 || amount > source.m_stack || x < 0 || y < 0 || x >= width || y >= height) return false;
+        if (amount <= 0 || amount > source.m_stack || x < 0 || y < 0 || x >= width || (y >= height && !skipValidPositionCheck)) return false;
         ItemDrop.ItemData existing = GetItemAt(x, y);
         if (existing == null)
         {
@@ -107,7 +110,7 @@ public sealed class Inventory
             added.m_gridPos = new Vector2i(x, y); added.m_stack = amount;
             items.Add(added); source.m_stack -= amount;
             AfterPlacement?.Invoke(this, added);
-            Changed();
+            Changed(true, false);
             return true;
         }
         // Vanilla may merge matching item/quality without comparing custom data.
@@ -115,9 +118,14 @@ public sealed class Inventory
         if (existing.m_shared.m_name != source.m_shared.m_name || existing.m_quality != source.m_quality) return false;
         int accepted = Math.Min(amount, existing.m_shared.m_maxStackSize - existing.m_stack);
         existing.m_stack += accepted; source.m_stack -= accepted;
-        Changed(); return accepted == amount;
+        Changed(true, false); return accepted == amount;
     }
-    void Changed() { ++ChangedCalls; OnChanged?.Invoke(this); }
+    void Changed(bool success = false, bool cheatedStateChanged = false)
+    {
+        ++ChangedCalls;
+        LastChangeSuccess = success; LastChangeCheatedStateChanged = cheatedStateChanged;
+        OnChanged?.Invoke(this);
+    }
 }
 namespace ServerManager.Events
 {
@@ -228,6 +236,7 @@ public static class CharacterItemDataGrantSmoke
         };
         var result = fixture.Grant(25);
         Check(result.Success && result.Code == "applied", "Multi-stack preset grant applies");
+        Check(fixture.Inventory.PositionCheckBypasses == 0, "Preset grants retain vanilla position validation");
         Check(firstAccesses >= 4 && PresetGrantHooks.AccessKinds[0] == "GetMaxDurability", "Metadata-aware durability is the first observable access");
         Check(fixture.Inventory.GetAllItems().Select(item => item.m_stack).SequenceEqual(new[] { 10, 10, 5 }), "Amount splits into bounded stacks");
         var granted = fixture.Inventory.GetAllItems();
@@ -311,7 +320,30 @@ public static class CharacterItemDataGrantSmoke
         Reject(() => fixture.Grant(11), "Injected second AddItem failure must reject the entire grant");
         OriginalInventory(fixture.Inventory, new[] { first, second }, new[] { 3, 7 }, "Second placement failure rollback");
         Check(fixture.Inventory.AddCalls == 2 && fixture.Inventory.ChangedCalls == 2, "One successful placement and rollback each signal Changed");
+        Check(!fixture.Inventory.LastChangeSuccess && !fixture.Inventory.LastChangeCheatedStateChanged,
+            "Rollback notifies with vanilla false/false defaults, without a new acquisition signal");
         Check(first.m_equipped && second.m_equipped, "Rollback retains equipped item identity/state");
+        fixture.Inventory.BeforeAdd = null;
+        Check(fixture.Grant(11).Success, "A grant can be retried after rollback");
+        Check(fixture.Inventory.GetAllItems().Count == 4 && first.m_stack == 3 && second.m_stack == 7 &&
+            fixture.Inventory.GetAllItems().Skip(2).Select(item => item.m_stack).SequenceEqual(new[] { 10, 1 }),
+            "Retry adds exactly the requested amount without retaining failed placements");
+        fixture.SourceUnchanged();
+    }
+    static void RollbackNotificationCanThrow()
+    {
+        var fixture = new Fixture(3, 1);
+        var original = fixture.Existing(0, 0, 4);
+        fixture.Inventory.BeforeAdd = (inventory, item) => inventory.AddCalls != 2;
+        fixture.Inventory.OnChanged = inventory =>
+        {
+            if (inventory.GetAllItems().Count == 1)
+                throw new InvalidOperationException("ROLLBACK_CALLBACK_FAILURE");
+        };
+        Reject(() => fixture.Grant(11), "A throwing rollback callback remains an action failure");
+        OriginalInventory(fixture.Inventory, new[] { original }, new[] { 4 }, "Rollback callback failure");
+        Check(!fixture.Inventory.LastChangeSuccess && !fixture.Inventory.LastChangeCheatedStateChanged,
+            "Items are restored before the false/false rollback notification can throw");
         fixture.SourceUnchanged();
     }
     static void LiveMetadataMutationRollsBack()
@@ -373,7 +405,7 @@ public static class CharacterItemDataGrantSmoke
         assertions = 0;
         MetadataBeforeCacheAndDetachedStacks(); DefaultsAndEmptyData(); NoMetadataMergeAndCapacity();
         CloneAndDurabilityMutationRejected(); LiveFailureRollsBackOriginalReferences();
-        LiveMetadataMutationRollsBack(); PlacementShapeMutationRollsBack();
+        LiveMetadataMutationRollsBack(); PlacementShapeMutationRollsBack(); RollbackNotificationCanThrow();
         PresetGrantHooks.Reset();
         Console.WriteLine("PASS: source-linked custom-data item grant (" + assertions + " assertions; inert inventory and metadata callbacks).");
     }

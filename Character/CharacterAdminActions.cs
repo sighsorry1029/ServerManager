@@ -16,7 +16,10 @@ namespace ServerManager
             "MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!;
         private static readonly MethodInfo AddItemAt = typeof(Inventory).GetMethod(
             "AddItem", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-            null, new[] { typeof(ItemDrop.ItemData), typeof(int), typeof(int), typeof(int) }, null)!;
+            null, new[] { typeof(ItemDrop.ItemData), typeof(int), typeof(int), typeof(int), typeof(bool) }, null)!;
+        private static readonly MethodInfo? InventoryChanged = typeof(Inventory).GetMethod(
+            "Changed", BindingFlags.Instance | BindingFlags.NonPublic,
+            null, new[] { typeof(bool), typeof(bool) }, null);
 
         internal static ServerManagerCommandResult Apply(Player player, string[] action)
         {
@@ -134,8 +137,7 @@ namespace ServerManager
                     originals[index].m_stack = originalStacks[index];
                     inventory.GetAllItems().Add(originals[index]);
                 }
-                System.Reflection.MethodInfo changed = typeof(Inventory).GetMethod("Changed", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                changed?.Invoke(inventory, null);
+                InventoryChanged?.Invoke(inventory, new object[] { false, false });
                 throw;
             }
             return Result(true, "applied", "Added " + amount + " " + action[2] + " at quality " + quality + ".");
@@ -200,7 +202,7 @@ namespace ServerManager
                     originals[index].m_stack = originalStacks[index];
                     inventory.GetAllItems().Add(originals[index]);
                 }
-                typeof(Inventory).GetMethod("Changed", BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(inventory, null);
+                InventoryChanged?.Invoke(inventory, new object[] { false, false });
                 throw;
             }
             return Result(true, "applied", "Added " + amount + " " + prefab.name + " at quality " + quality + " with custom data.");
@@ -226,7 +228,7 @@ namespace ServerManager
             // The generic AddItem overload merges stacks without comparing data.
             // Use a verified empty coordinate and recheck the newly inserted clone.
             if (inventory.GetItemAt(slot.x, slot.y) != null ||
-                AddItemAt == null || !(bool)AddItemAt.Invoke(inventory, new object[] { item, amount, slot.x, slot.y }))
+                AddItemAt == null || !(bool)AddItemAt.Invoke(inventory, new object[] { item, amount, slot.x, slot.y, false }))
                 throw new InvalidOperationException("Preset inventory placement failed.");
             ItemDrop.ItemData added = inventory.GetItemAt(slot.x, slot.y);
             if (added == null || added.m_stack != amount || item.m_stack != 0)

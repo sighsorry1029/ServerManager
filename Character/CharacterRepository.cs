@@ -96,6 +96,8 @@ Use Steam_<Steam64>_<lowercase-character-name>.fch; there is no import folder.
 Example for the character MyHero, owned by 76561198000000001:
    characters/76561198000000001/Steam_76561198000000001_myhero.fch
 Match the name inside the file, using language-independent lowercase for the filename.
+Keep all spaces, including leading/trailing spaces before .fch; never trim the name.
+For commands, wrap names containing spaces in double quotes, e.g. sm:characterbackups ""Two Words"".
 Do not change the internal name or Player ID. Start the server and check for storage errors.
 
 If restore fails

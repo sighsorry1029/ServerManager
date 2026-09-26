@@ -147,6 +147,15 @@ try {
     $dictionaryType = [Collections.Generic.Dictionary``2].MakeGenericType($skillType, $skillStateType)
     $skillsType.GetField("m_skillData", $allInstance).SetValue($localSkills, [Activator]::CreateInstance($dictionaryType))
     $actionsType = $plugin.GetType("ServerManager.CharacterAdminActions")
+    # Resolve the built plugin's actual caches against the original game types.
+    # Full Inventory invocation also initializes Unity-bound Player/Animator state;
+    # callback/rollback behavior is covered separately by the source-linked fixture.
+    $adminStaticFlags = [Reflection.BindingFlags]'Static,NonPublic'
+    $addItemAt = $actionsType.GetField('AddItemAt', $adminStaticFlags).GetValue($null)
+    $inventoryChanged = $actionsType.GetField('InventoryChanged', $adminStaticFlags).GetValue($null)
+    Assert-True ($null -ne $addItemAt -and $null -ne $inventoryChanged) 'Admin Inventory reflection bindings must resolve in the original game.'
+    Assert-True ($addItemAt.DeclaringType -eq $game.GetType('Inventory') -and
+        $inventoryChanged.DeclaringType -eq $game.GetType('Inventory')) 'Admin reflection bindings did not resolve to the original Inventory type.'
     $applySkill = $actionsType.GetMethod("ApplySkill", [Reflection.BindingFlags]"Static,NonPublic")
     $editSkills = $actionsType.GetMethod("EditSkills", [Reflection.BindingFlags]"Static,NonPublic")
     $encodeSkills = $actionsType.GetMethod("EncodeSkills", [Reflection.BindingFlags]"Static,NonPublic")
