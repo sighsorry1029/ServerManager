@@ -163,9 +163,11 @@ try {
     Assert-True ($queue.ToArray()[1].Actor.Kind -eq 'unverified_peer') 'Pre-authentication identity was represented as authenticated.'
     Invoke-ConnectionAudit -IdentityStatus 'unavailable'
     Assert-True ($null -eq $queue.ToArray()[2].Actor -and $queue.ToArray()[2].Fields['account_id'] -eq '' -and
-        $queue.ToArray()[2].Fields['character'] -eq '') 'An unidentified connection retained a fabricated identity.'
+        $queue.ToArray()[2].Fields['character'] -eq 'Audit Viking') 'A selected display name must survive without manufacturing an authenticated actor/account.'
     Invoke-ConnectionAudit -IdentityStatus 'unverified' -Account 'attacker-chosen'
-    Assert-True ($queue.ToArray()[3].Fields['identity_status'] -eq 'unavailable') 'Malformed unverified identity was not downgraded.'
+    Assert-True ($queue.ToArray()[3].Fields['identity_status'] -eq 'unavailable' -and
+        $queue.ToArray()[3].Fields['account_id'] -eq '' -and $queue.ToArray()[3].Fields['character'] -eq '' -and
+        $null -eq $queue.ToArray()[3].Actor) 'Malformed unverified identity was not cleared and downgraded.'
     Invoke-ConnectionAudit -Category 'character' -Stage 'CharacterSent' -Reason 'fresh_local_character_required' -Source 'client_reported'
     Assert-True ($queue.ToArray()[4].Reliability -eq 'client_reported' -and
         $queue.ToArray()[4].Fields['outcome'] -eq 'client_aborted') 'A client-reported guard was falsely labelled as a server-verified finding.'
@@ -188,6 +190,12 @@ try {
         Assert-True ($queue.Count -eq 7) 'Inactive connection diagnostics were admitted.'
         $field.SetValue($null, $inactive -ne '_shutdownStarted')
     }
+    Invoke-ConnectionAudit -IdentityStatus 'unavailable' -Account '' -Character ("Selected`nName`"" + [char]0x202e + ('x' * 150))
+    $displayOnly = $queue.ToArray()[7]
+    Assert-True ($null -eq $displayOnly.Actor -and $displayOnly.Fields['account_id'] -eq '' -and
+        $displayOnly.Fields['character'].StartsWith("Selected Name'") -and
+        $displayOnly.Fields['character'].Length -le 96 -and
+        $displayOnly.Fields['character'] -notmatch '[\r\n\t\u202e]') 'Unavailable selected-name metadata bypassed audit sanitization or invented account authority.'
     Reset-TestQueue
     Invoke-Observations @(
         '[item_gain:Wood] Wood increased by 201',
@@ -495,7 +503,8 @@ try {
     $routeEvents = $routeType.GetProperty('Events').GetValue($route)
     $eventFilter = $settingsType.GetMethod('GetWebhookEventFilter', $staticFlags)
     $selectableEvents = $settingsType.GetField('PublicEvents', $staticFlags).GetValue($null)
-    Assert-True ($null -ne $eventFilter -and $selectableEvents.Count -eq 17) 'Grouped webhook selector catalog is missing.'
+    Assert-True ($null -ne $eventFilter -and $selectableEvents.Count -eq 18 -and
+        $selectableEvents.Contains('discord.shout')) 'Grouped webhook selector catalog is missing.'
     foreach ($kind in @('security.detection', 'security.response', 'security.admin_bypass', 'character.save_rejected',
         'character.shadow_stalled', 'character.validation_observed', 'character.revision_observed', 'connection.rejected')) {
         $expectedFilter = switch ($kind) {

@@ -91,6 +91,7 @@ namespace ServerManager
         public long CreatedTimestamp { get; private set; }
         public long DeadlineTimestamp { get; private set; }
         public ProtocolRejection Rejection { get; private set; }
+        internal string ReportedCharacterName { get; set; } = string.Empty;
     }
 
     /// <summary>
@@ -154,6 +155,7 @@ namespace ServerManager
             internal bool OperationInProgress;
             internal bool CharacterTransferPrepared;
             internal byte[] CharacterMessageId;
+            internal string ReportedCharacterName = string.Empty;
         }
 
         private readonly object sync = new object();
@@ -357,6 +359,10 @@ namespace ServerManager
                     return ProtocolOperationResult.Reject(duplicate, Snapshot(session));
                 }
 
+                // Only keep the bounded display hint after this RPC/session,
+                // nonce, sequence and phase have passed admission checks.
+                session.ReportedCharacterName = ProtocolPacketCodec.NormalizeReportedCharacterName(
+                    packet.ReportedCharacterName);
                 session.OperationInProgress = true;
             }
 
@@ -1329,7 +1335,8 @@ namespace ServerManager
                 session.Rejection)
             {
                 StateBeforeRejection = session.State == ConnectionSessionState.Rejected
-                    ? session.StateBeforeRejection : session.State
+                    ? session.StateBeforeRejection : session.State,
+                ReportedCharacterName = session.ReportedCharacterName
             };
         }
 
@@ -1348,6 +1355,7 @@ namespace ServerManager
             ClearBytes(session.Nonce);
             ClearBytes(session.CharacterMessageId);
             session.Rejection = null;
+            session.ReportedCharacterName = string.Empty;
         }
 
         private static void ClearBytes(byte[] value)

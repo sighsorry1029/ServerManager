@@ -80,6 +80,7 @@ internal static class DiscordTransportSmoke
         await AnonymousSafeSummaryAndCapacity();
         await RaidCoordinatePrivacy();
         await OperatorSummariesAndLimits();
+        await ConnectionRejectionIdentityDisplay();
         await ExplicitWebhookTestRouting();
         await QueueAndStop();
         await ReloadRoutesAndQueue();
@@ -2195,8 +2196,9 @@ internal static class DiscordTransportSmoke
                     Check(((JArray)payload["allowed_mentions"]!["parse"]!).Count == 0,
                         "Operator mentions remain disabled: " + kind);
                     CheckCompactEmbed(embed, null, "*", kind);
-                    Check(body.Contains("Player") && !body.Contains("steamworks:") && !body.Contains("76561198000000001"),
-                        "Concise named summary keeps the authenticated player name without redundant raw account IDs: " + kind);
+                    Check(body.Contains("Player") && !body.Contains("steamworks:") &&
+                        body.Contains("76561198000000001") == (kind == "connection.rejected"),
+                        "Only connection rejection adds its validated socket account to the named operator summary: " + kind);
                     Check(body.Contains("Example Mod") == (kind == "connection.rejected"),
                         "Only connection rejection includes actionable plugin mismatch details: " + kind);
                     Check(fields.Count == 0, "Operator metadata is projected into concise text instead of mechanically expanded fields.");
@@ -2225,8 +2227,9 @@ internal static class DiscordTransportSmoke
             Task running = webhooks.RunAsync(CancellationToken.None);
             await webhooks.StopAsync(TimeSpan.FromSeconds(3)); await running;
             string unverifiedBody = JObject.Parse(handler.Requests[0].Body!).ToString();
-            Check(!unverifiedBody.Contains("76561198000000001") && !unverifiedBody.Contains("@everyone") &&
-                !unverifiedBody.Contains("Player @"), "Unverified identities are never displayed as authenticated actors.");
+            Check(unverifiedBody.Contains("Steam ID: 76561198000000001 (unverified)") &&
+                unverifiedBody.Contains("(unverified)") && !unverifiedBody.Contains("@everyone"),
+                "Unverified identities remain explicitly labelled, mention-safe display claims without changing repeat limits.");
             string body = handler.Requests[1].Body!;
             Check(!body.Contains("PRIVATE") && !body.Contains("192.0.2.42"),
                 "Invalid token/account/reliability fields cannot copy arbitrary diagnostic text.");
@@ -2277,6 +2280,77 @@ internal static class DiscordTransportSmoke
                 string description = (string?)embed["description"] ?? "";
                 Check(description.Length > 256 && description.Length <= 2500 && (description.Contains("truncated") || description.Contains("…")) && !description.Contains(new string('p', 1025)),
                     "Concise plugin mismatch details preserve their bounded explicit truncation marker.");
+            }
+        }
+    }
+
+    private static async Task ConnectionRejectionIdentityDisplay()
+    {
+        const string account = "steamworks:76561198000000001";
+        foreach (string prefix in new[] { "", "Anonymous" })
+        foreach (var item in new[]
+        {
+            (Status: "unverified", Name: "halla", Expected: "halla (unverified)", Id: account, ShowId: true),
+            (Status: "unverified", Name: "띠 오", Expected: "띠 오 (unverified)", Id: account, ShowId: true),
+            (Status: "unavailable", Name: "Two Words", Expected: "Two Words (unverified)", Id: account, ShowId: false),
+            (Status: "unverified", Name: "", Expected: "Unverified player", Id: account, ShowId: true),
+            (Status: "authenticated", Name: "Reported Claim", Expected: "Trusted Player", Id: account, ShowId: true),
+            (Status: "AUTHENTICATED", Name: "Spoofed Claim", Expected: "Unverified player", Id: account, ShowId: false),
+            (Status: "unknown", Name: "Spoofed Claim", Expected: "Unverified player", Id: account, ShowId: false),
+            (Status: "unverified", Name: "<b>띠 오</b>\n@everyone\u202e", Expected: "띠 오 @\u200beveryone (unverified)", Id: account, ShowId: true),
+            (Status: "unverified", Name: "halla", Expected: "halla (unverified)", Id: "192.0.2.42", ShowId: false),
+            (Status: "unverified", Name: "halla", Expected: "halla (unverified)", Id: "76561198000000001", ShowId: false),
+            (Status: "unverified", Name: "halla", Expected: "halla (unverified)", Id: "steamworks:00000000000000000", ShowId: false),
+            (Status: "unverified", Name: "halla", Expected: "halla (unverified)", Id: account + "\n", ShowId: false)
+        })
+        {
+            DiscordSettings settings = Settings("connection.rejected");
+            settings.WebhookRoutes[0].AnonymousPrefix = prefix;
+            using (FakeHandler handler = new FakeHandler())
+            using (DiscordHttp http = new DiscordHttp("", delegate { }, handler))
+            using (DiscordWebhooks webhooks = new DiscordWebhooks(settings, http, delegate { }))
+            {
+                ServerManagerEvent value = OperatorEvent("connection.rejected");
+                value.Fields["identity_status"] = item.Status;
+                value.Fields["character"] = item.Name;
+                value.Fields["account_id"] = item.Id;
+                value.Fields["plugin_details"] = "PRIVATE_PLUGIN_DETAIL " + item.Name + " " + item.Id;
+                value.Fields["message"] = "PRIVATE_RAW_MESSAGE " + item.Name + " " + item.Id;
+                value.Actor = new ServerManagerActor("RAW_ACTOR_ID", "Trusted Player", "player")
+                    { PlayerAccountId = account };
+                Check(webhooks.Enqueue(value), "Connection identity case remains routable: " + item.Status + "/" + prefix);
+                Task running = webhooks.RunAsync(CancellationToken.None);
+                await webhooks.StopAsync(TimeSpan.FromSeconds(3)); await running;
+                JObject payload = JObject.Parse(handler.Requests.Single().Body!);
+                JObject embed = (JObject)payload["embeds"]![0]!;
+                string title = (string)embed["title"]!;
+                string description = (string?)embed["description"] ?? "";
+                string body = payload.ToString();
+                Check(((JArray)payload["allowed_mentions"]!["parse"]!).Count == 0 &&
+                    !title.Contains("@everyone") && !title.Contains("\n") && !title.Contains("\u202e") && title.Length <= 256,
+                    "Connection names preserve mention protection, single-line layout and bounds.");
+                Check(!body.Contains("PRIVATE_RAW_MESSAGE"), "Rejection display never forwards raw message fields.");
+                if (prefix.Length > 0)
+                {
+                    Check(title.Contains("Anonymous") && !body.Contains("Trusted Player") &&
+                        !body.Contains("halla") && !body.Contains("띠 오") && !body.Contains("Two Words") &&
+                        !body.Contains("Claim") && !body.Contains("PRIVATE_PLUGIN_DETAIL") &&
+                        !body.Contains("76561198000000001") && !body.Contains("192.0.2.42") && !body.Contains("Steam ID:"),
+                        "Anonymous rejection suppresses claimed names, actor names, accounts and identifying plugin details.");
+                }
+                else
+                {
+                    Check(title.Replace("\\", "") == "Connection rejected — " + item.Expected,
+                        "Rejection subject distinguishes authenticated actor, unverified claim and unknown status: " + item.Status);
+                    Check(description.Contains("Steam ID:") == item.ShowId,
+                        "Only recognized identity status plus canonical Steam account permits ID disclosure.");
+                    if (item.ShowId)
+                        Check(description.StartsWith("Steam ID: 76561198000000001" +
+                            (item.Status == "unverified" ? " (unverified)" : "") + "\n", StringComparison.Ordinal),
+                            "Steam account display retains its actual authentication label before rejection details.");
+                    if (item.Status != "authenticated")
+                        Check(!title.Contains("Trusted Player"), "Unverified subject never promotes a conflicting actor name.");
+                }
             }
         }
     }

@@ -173,6 +173,7 @@
     </ItemGroup>
     <ItemGroup>
         <None Include="Tests\RuntimeSecuritySmoke.ps1"/>
+        <None Include="Tests\ValheavenNativeLoaderSmoke.ps1"/>
         <None Include="Tests\PlayerLocalizationSmoke.ps1"/>
         <None Include="Tests\AdminStatCapSmoke.ps1"/>
         <None Include="Tests\CecilControlFlow.ps1"/>
@@ -234,6 +235,7 @@
         <None Include="Tests\CharacterStarterItemsSmoke.ps1"/>
         <None Include="Tests\CharacterStarterItemsHarness.cs"/>
         <None Include="Tests\CharacterLoadValidationSmoke.ps1"/>
+        <None Include="Tests\CharacterEquipmentRecoverySmoke.ps1"/>
         <None Include="Tests\PeerInfoPreflightSmoke.ps1"/>
         <None Include="Tests\CharacterAuditSmoke.ps1"/>
         <None Include="Tests\RaidEventsSmoke.ps1"/>

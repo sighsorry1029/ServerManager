@@ -42,7 +42,10 @@ internal static partial class ServerManagerRuntime
                 marker.Recorded = true;
             }
 
-            string accountId = "", characterName = "", identityStatus = "unavailable";
+            // The manifest's selected name is display-only. It never supplies an
+            // account identity and is replaced by vanilla's peer name after auth.
+            string accountId = "", characterName = session?.ReportedCharacterName ?? "",
+                identityStatus = "unavailable";
             SteamAuthenticationAttempt? attempt;
             lock (SteamAuthenticationGate) SteamAuthenticationsByRpc.TryGetValue(rpc, out attempt);
             ZNetPeer? peer = unregisteredPeer ?? attempt?.Peer;
@@ -54,15 +57,26 @@ internal static partial class ServerManagerRuntime
             {
                 if (peer != null && ReferenceEquals(peer.m_rpc, rpc))
                 {
-                    ISocket? socket = peer.m_socket;
+                    bool reservedSocket;
+                    lock (SteamAuthenticationGate)
+                        reservedSocket = attempt != null && IsCurrentSteamAuthenticationLocked(attempt) &&
+                            ReferenceEquals(attempt.Rpc, rpc) && ReferenceEquals(attempt.Peer, peer);
+                    // ServerSync may replace the public socket with its own
+                    // wrapper. Keep the identity bound to our original Steam
+                    // reservation, not a wrapper or any client-supplied account.
+                    ISocket? socket = reservedSocket ? attempt!.Socket : peer.m_socket;
                     while (socket is BufferedWorldSocket buffered) socket = buffered.Original;
-                    if (socket is ZSteamSocket steam && steam.GetPeerID().IsValid())
+                    if (socket is ZSteamSocket steam)
                     {
-                        ulong steamId = steam.GetPeerID().m_SteamID;
-                        accountId = CharacterSteamIdentity.AccountPrefix + steamId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                        characterName = peer.m_playerName ?? "";
-                        identityStatus = session != null && session.PeerInfoAuthenticated && attempt != null &&
-                            attempt.SteamId.m_SteamID == steamId ? "authenticated" : "unverified";
+                        Steamworks.CSteamID currentSteamId = steam.GetPeerID();
+                        if (currentSteamId.IsValid() && (!reservedSocket || currentSteamId == attempt!.SteamId))
+                        {
+                            accountId = CharacterSteamIdentity.AccountPrefix + currentSteamId.m_SteamID
+                                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            identityStatus = session != null && session.PeerInfoAuthenticated && reservedSocket
+                                ? "authenticated" : "unverified";
+                            if (identityStatus == "authenticated") characterName = peer.m_playerName ?? "";
+                        }
                     }
                 }
             }

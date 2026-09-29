@@ -480,7 +480,7 @@ try {
     $limits = $limitsCtor.Invoke($limitArgs)
     $packetCodec = $plugin.GetType('ServerManager.ProtocolPacketCodec')
     $decode = $packetCodec.GetMethods() | Where-Object { $_.Name -eq 'TryDecode' -and $_.GetParameters()[0].ParameterType.Name -eq 'ZPackage' }
-    Assert-True ($packetCodec.GetField('WireVersion', $allStatic).GetRawConstantValue() -eq 21) 'The current backup handshake and scoped library manifest require wire version 21.'
+    Assert-True ($packetCodec.GetField('WireVersion', $allStatic).GetRawConstantValue() -eq 23) 'The current backup handshake and display-only admission metadata require wire version 23.'
     foreach ($kind in @('BackupCaptureRequest', 'BackupCaptureCommitted')) {
         $kindValue = [Enum]::Parse($plugin.GetType('ServerManager.ProtocolPacketKind'), $kind)
         $sequence = [uint32]$plugin.GetType('ServerManager.ProtocolSequence').GetField($kind).GetRawConstantValue()

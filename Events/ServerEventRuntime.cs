@@ -1899,10 +1899,13 @@ namespace ServerManager.Events
                 bool canonical = accountId != null && accountId.Length <= 30 &&
                     CharacterSteamIdentity.TryParseCanonicalAccountId(accountId, out _);
                 if (identityStatus == "authenticated" && !canonical) return;
+                // A selected name may be available before Steam identity. Keep
+                // it only as bounded display metadata, never a fabricated actor.
+                // A malformed nonempty account still clears its attached name.
+                if (!canonical && !string.IsNullOrEmpty(accountId)) characterName = "";
                 if (identityStatus == "unavailable" || !canonical)
                 {
                     accountId = "";
-                    characterName = "";
                     identityStatus = "unavailable";
                 }
                 characterName = SafeCharacterAuditValue(characterName, 96);

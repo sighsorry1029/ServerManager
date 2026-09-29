@@ -2712,8 +2712,8 @@ Assert-True ($null -ne (Get-InstanceMethod `
 $protocolWireVersion = $protocolCodecType.GetField(
     "WireVersion",
     [Reflection.BindingFlags]"Static,Public").GetRawConstantValue()
-Assert-True ($protocolWireVersion -eq 21) `
-    "Server character controls and scoped library manifest challenges are not protected by wire version 21."
+Assert-True ($protocolWireVersion -eq 23) `
+    "Server character controls and display-only admission metadata are not protected by wire version 23."
 
 $controlLimitsType = $plugin.GetType(
     "ServerManager.ConnectionProtocolLimits",

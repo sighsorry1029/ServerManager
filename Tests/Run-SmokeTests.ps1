@@ -208,6 +208,11 @@ $smokeTests = @(
         NeedsGamePath = $true
     },
     [pscustomobject]@{
+        Name = "Character equipment restoration recovery"
+        File = "CharacterEquipmentRecoverySmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
         Name = "Valheim PeerInfo bounded preflight"
         File = "PeerInfoPreflightSmoke.ps1"
         NeedsGamePath = $true
@@ -286,6 +291,11 @@ $smokeTests = @(
         Name = "Anti-cheat"
         File = "RuntimeSecuritySmoke.ps1"
         NeedsGamePath = $true
+    },
+    [pscustomobject]@{
+        Name = "Valheaven native-loader signatures"
+        File = "ValheavenNativeLoaderSmoke.ps1"
+        NeedsGamePath = $false
     },
     [pscustomobject]@{
         Name = "Direct RPC socket compatibility"

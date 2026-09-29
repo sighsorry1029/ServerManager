@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.7
+
+- Improved compatibility when restoring equipped items during character loading. Failures limited to the final equipment step are logged without blocking entry; other load-failure safeguards remain in place.
+- Added character names and available Steam IDs to connection-rejection webhooks, with unverified labels before authentication and identity hiding on anonymous routes.
+- Strengthened defensive checks.
+- Update ServerManager on both the server and all clients; the connection protocol has changed.
+
 ## 1.1.6
 
 - Preserved the original exception stack when managed character loading fails, making the initial game or mod error easier to locate in the affected client's BepInEx log.

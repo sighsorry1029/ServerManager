@@ -551,8 +551,12 @@ namespace ServerManager.Discord
                     title = "Skill change observed — " + player;
                     description = Diagnostic(value, anonymous, "Skill progress observation"); break;
                 case "connection.rejected":
-                    string subject = Field(value, "identity_status") == "authenticated" ? player :
-                        anonymous ? prefix + " player" : "Unverified player";
+                    string identityStatus = OperatorToken(value.Fields, "identity_status", 32);
+                    string reportedCharacter = identityStatus == "unverified" || identityStatus == "unavailable"
+                        ? ReportedCharacter(value) : string.Empty;
+                    string subject = identityStatus == "authenticated" ? player :
+                        anonymous ? prefix + " player" : reportedCharacter.Length > 0
+                            ? reportedCharacter + " (unverified)" : "Unverified player";
                     title = (Field(value, "outcome") == "client_aborted" ? "Connection stopped by client" :
                         "Connection rejected") + " — " + subject;
                     string category = Field(value, "category");
@@ -570,6 +574,22 @@ namespace ServerManager.Discord
             }
 
             JObject primary = CompactEmbed(value, title, description);
+            if (!anonymous && value.Kind == "connection.rejected")
+            {
+                // The producer obtains this account from the server socket, not
+                // the manifest. Display it without upgrading its authentication
+                // status or using it for operator rate limits or authorization.
+                string status = OperatorToken(value.Fields, "identity_status", 32);
+                string steamId = status == "authenticated" || status == "unverified"
+                    ? SteamIdFromAccount(value.Fields.TryGetValue("account_id", out string? account) ? account : null)
+                    : string.Empty;
+                if (steamId.Length > 0)
+                {
+                    string identity = "Steam ID: " + steamId + (status == "unverified" ? " (unverified)" : string.Empty);
+                    string body = (string?)primary["description"] ?? string.Empty;
+                    primary["description"] = identity + (body.Length > 0 ? "\n" + body : string.Empty);
+                }
+            }
             if (includeSteamId && !anonymous && (value.Kind == "player.login" || value.Kind == "player.leave"))
             {
                 string steamId = VerifiedPlayerSteamId(value.Actor);
@@ -626,13 +646,28 @@ namespace ServerManager.Discord
             // This adapter-only field is assigned by authenticated producers.
             // Recheck its shape at the disclosure boundary; raw Id, names and
             // public event fields are not substitutes for verified attribution.
+            return SteamIdFromAccount(actor?.PlayerAccountId);
+        }
+
+        private static string SteamIdFromAccount(string? rawAccount)
+        {
             const string prefix = "steamworks:";
-            string account = actor?.PlayerAccountId ?? string.Empty;
+            string account = rawAccount ?? string.Empty;
             if (account.Length != prefix.Length + 17 || !account.StartsWith(prefix, StringComparison.Ordinal))
                 return string.Empty;
             string steamId = account.Substring(prefix.Length);
             return ulong.TryParse(steamId, NumberStyles.None, CultureInfo.InvariantCulture, out ulong id) &&
                 id >= 76561197960265729UL && id <= 76561202255233023UL ? steamId : string.Empty;
+        }
+
+        private static string ReportedCharacter(ServerManagerEvent value)
+        {
+            // This is a bounded display claim, never a verified actor. Remove
+            // rich-text and invisible direction controls before normal Discord
+            // escaping; spaces and non-Latin character names remain readable.
+            string name = StripValheimRichText(Field(value, "character", 96));
+            return OneLine(new string(name.Where(character =>
+                !char.IsControl(character) && char.GetUnicodeCategory(character) != UnicodeCategory.Format).ToArray()), 96);
         }
 
         private string DisplayPlayerLocked(ServerManagerActor? actor, string prefix, string fallback)

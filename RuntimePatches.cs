@@ -1299,6 +1299,112 @@ internal static class ManagedCharacterPlayerLoadPatch
     }
 }
 
+// Recover only at the vanilla Load call site after the core profile has been
+// read. A global EquipItem/EquipInventoryItems finalizer would also swallow
+// failures from normal gameplay or from another mod's earlier load callbacks.
+[HarmonyPatch(typeof(Player), nameof(Player.Load), new[] { typeof(ZPackage) })]
+internal static class ManagedCharacterEquipmentRestorePatch
+{
+    private static readonly MethodInfo? EquipInventoryItems =
+        AccessTools.DeclaredMethod(typeof(Player), "EquipInventoryItems", Type.EmptyTypes);
+
+    [HarmonyPriority(Priority.Last)]
+    private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        List<CodeInstruction> code = new(instructions);
+        MethodInfo? updatePieces = AccessTools.DeclaredMethod(typeof(Player), "UpdateAvailablePiecesList", Type.EmptyTypes);
+        MethodInfo? updateEvents = AccessTools.DeclaredMethod(typeof(Player), nameof(Player.UpdateEvents), Type.EmptyTypes);
+        FieldInfo? isLoading = AccessTools.DeclaredField(typeof(Player), "m_isLoading");
+        MethodInfo? wrapper = AccessTools.DeclaredMethod(
+            typeof(ManagedCharacterEquipmentRestorePatch), nameof(RestoreEquipment), new[] { typeof(Player) });
+
+        List<int> meaningful = new();
+        int equipCalls = 0;
+        for (int index = 0; index < code.Count; ++index)
+        {
+            if (code[index].opcode != OpCodes.Nop) meaningful.Add(index);
+            if (Calls(code[index], EquipInventoryItems)) ++equipCalls;
+        }
+
+        // The reviewed vanilla tail is: loading=false; refresh pieces;
+        // equip saved items; update events; return. If it changes, retain the
+        // original call and the existing strict Load failure guard.
+        int start = meaningful.Count - 10;
+        bool verified = EquipInventoryItems != null &&
+            !EquipInventoryItems.IsStatic && EquipInventoryItems.ReturnType == typeof(void) &&
+            isLoading is { IsStatic: false } && isLoading.FieldType == typeof(bool) &&
+            updatePieces != null && updateEvents != null && wrapper != null &&
+            equipCalls == 1 && start >= 0;
+        if (verified)
+        {
+            CodeInstruction At(int offset) => code[meaningful[start + offset]];
+            verified = At(0).opcode == OpCodes.Ldarg_0 && At(1).opcode == OpCodes.Ldc_I4_0 &&
+                At(2).opcode == OpCodes.Stfld && Equals(At(2).operand, isLoading) &&
+                At(3).opcode == OpCodes.Ldarg_0 && Calls(At(4), updatePieces) &&
+                At(5).opcode == OpCodes.Ldarg_0 && Calls(At(6), EquipInventoryItems) &&
+                At(7).opcode == OpCodes.Ldarg_0 && Calls(At(8), updateEvents) &&
+                At(9).opcode == OpCodes.Ret;
+        }
+        if (!verified)
+        {
+            ServerManagerPlugin.Log.LogWarning(
+                "The final Player.Load equipment call site was not recognized; " +
+                "equipment recovery is disabled and strict character load protection remains active.");
+            return code;
+        }
+
+        // Replace in place so Harmony labels and exception-block markers stay
+        // attached. Invoke the real helper, including other mods' patches.
+        CodeInstruction call = code[meaningful[start + 6]];
+        call.opcode = OpCodes.Call;
+        call.operand = wrapper;
+        return code;
+    }
+
+    private static bool Calls(CodeInstruction instruction, MethodInfo? method) =>
+        method != null && (instruction.opcode == OpCodes.Call || instruction.opcode == OpCodes.Callvirt) &&
+        Equals(instruction.operand, method);
+
+    private static void RestoreEquipment(Player player)
+    {
+        MethodInfo method = EquipInventoryItems ??
+            throw new MissingMethodException(typeof(Player).FullName, "EquipInventoryItems");
+        try
+        {
+            method.Invoke(player, null);
+        }
+        catch (TargetInvocationException invocation) when (invocation.InnerException != null)
+        {
+            Exception error = invocation.InnerException;
+            while (error is TargetInvocationException nested && nested.InnerException != null)
+                error = nested.InnerException;
+
+            if (!IntegrityCanonical.IsFatal(error) &&
+                ServerManagerRuntime.IsPlayerLoadInProgress &&
+                ServerManagerRuntime.ShouldValidatePlayerLoad(player) &&
+                !ServerManagerRuntime.CharacterLoadSaveBlocked)
+            {
+                // No retry, inventory rollback, or equipment clearing: those
+                // actions can repeat mod side effects or discard valid data.
+                try
+                {
+                    ServerManagerPlugin.Log.LogWarning(
+                        "Character equipment restoration failed after the core data was read; " +
+                        "continuing character loading without retrying equipment. Some items may remain " +
+                        "unequipped or have incomplete effects; normal character saving remains enabled. " + error);
+                }
+                catch (Exception loggingError) when (!IntegrityCanonical.IsFatal(loggingError)) { }
+                return;
+            }
+
+            // Do not hide fatal errors inside reflection's invocation wrapper,
+            // and leave unmanaged/previously failed loads under their old policy.
+            ExceptionDispatchInfo.Capture(error).Throw();
+            throw;
+        }
+    }
+}
+
 [HarmonyPatch]
 internal static class OperationalKickEntryPointPatch
 {

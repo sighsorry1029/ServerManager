@@ -64,7 +64,7 @@ internal sealed class ClientDetectionAgent
         _nextCarryWeightScanTimestamp = 0;
         _runtimeWorldReady = false;
 
-        if (policy.DetectValheimTooler)
+        if (policy.DetectInjectedCheatAssemblies)
         {
             StartAssemblyDetector();
         }
@@ -122,7 +122,7 @@ internal sealed class ClientDetectionAgent
         _policyGeneration = generation;
         _nextCarryWeightScanTimestamp = 0;
         _nextProcessScanTimestamp = 0;
-        if (updated.DetectValheimTooler) BeginAssemblyReconciliation(initialPass: true);
+        if (updated.DetectInjectedCheatAssemblies) BeginAssemblyReconciliation(initialPass: true);
     }
 
     /// <summary>
@@ -141,7 +141,7 @@ internal sealed class ClientDetectionAgent
 
         _runtimeWorldReady = runtimeWorldReady;
 
-        if (policy.DetectValheimTooler)
+        if (policy.DetectInjectedCheatAssemblies)
         {
             TickAssemblyDetector();
         }
@@ -513,11 +513,16 @@ internal sealed class ClientDetectionAgent
 
         _inspectedAssemblies[assembly] = _policyGeneration;
 
-        ValheimToolerInspection result =
-            ValheimToolerAssemblyInspector.Inspect(assembly);
-        if (result.Detected)
+        InjectedCheatAssemblyInspection result =
+            InjectedCheatAssemblyInspector.Inspect(assembly);
+        if (result.ValheimToolerDetected)
         {
             Emit(DetectionEvidence.ValheimToolerDetected);
+        }
+
+        if (result.ValheavenDetected)
+        {
+            Emit(DetectionEvidence.ValheavenAssemblyDetected);
         }
 
         if (result.InspectionIncomplete)

@@ -174,6 +174,13 @@ membership, even for the local host. Review warnings before choosing automatic
 bans. Client-reported observations can be wrong or forged, and ServerManager
 cannot make a client cheat-proof.
 
+Defensive client checks use `cheatDetection.action` and `security.alert`.
+Admin status does not exempt cheat-tool detections.
+
+Keep ServerManager updated on both the server and clients. These checks can be
+bypassed by a modified client and do not establish the cause of a server freeze
+or protect against every form of object duplication or network abuse.
+
 ### Starting items
 
 `startItems` replaces the entire starting inventory for **new server characters**.
@@ -207,9 +214,16 @@ saves can replace the server character with this reduced inventory, so restore
 a backup if removed items need to be recovered. Load-time changes to equipment,
 item flags, skills and custom data are also allowed.
 
-If loading throws an exception or another patch skips the original managed
-load, ServerManager blocks saving and returns the player to the menu with an
-explanation. Data-format, ownership and network checks still apply.
+If the final equipment re-equip step fails after the core character data has
+been read, ServerManager logs the error and continues loading without retrying
+equipment. Some items may remain unequipped or have incomplete effects; normal
+saves remain enabled and can preserve that state. Check the affected client's
+BepInEx log. No automatic rollback or item deletion is performed.
+
+Other load failures, or another patch skipping the original managed load, still
+block saving and return the player to the menu. If the game's final equipment
+call site cannot be recognized, this recovery is disabled and the strict load
+protection remains active. Data-format, ownership and network checks still apply.
 
 Inventory changes are sent frequently; full character updates are also sent
 periodically and during save/logout handling. The server keeps accepted updates
@@ -476,6 +490,11 @@ webhooks:
 Use separate routes for public news and private admin alerts. Multiple routes
 to the same channel may produce duplicate notifications. These filters select
 messages; they are not a full copy of the audit log.
+
+`connection.rejected` shows the selected character name and the server-observed
+Steam ID when available. Before authentication they are marked `unverified`;
+the character name is client-reported and does not grant access or permissions.
+Keep these alerts private. Anonymous routes hide both the name and Steam ID.
 
 - Set `language: Korean` for Korean public messages; English is the default.
 - Set `anonymous_prefix: Anonymous` for labels such as `Anonymous 1`.

@@ -21,12 +21,19 @@ foreach ($name in @('BepInEx.dll', '0Harmony.dll')) {
     [Reflection.Assembly]::Load([IO.File]::ReadAllBytes((Join-Path (Split-Path -Parent $pluginPath) $name))) | Out-Null
 }
 [Reflection.Assembly]::LoadFrom((Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll')) | Out-Null
-Add-Type -TypeDefinition @'
+Add-Type -ReferencedAssemblies @((Join-Path $managedRoot 'assembly_valheim.dll'),
+    (Join-Path $managedRoot 'assembly_utils.dll'), (Join-Path $managedRoot 'com.rlabrecque.steamworks.net.dll')) -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 public static class ConnectionRejectionProbe {
     public static readonly List<string[]> Records = new List<string[]>();
     public static bool ThrowAudit;
+    public static bool ThrowIdentity;
+    public static object SteamSocket;
+    public static ulong SteamId;
+    public static object Identity, ValidatedIdentity;
+    public static byte[] ValidatedPayload;
+    public static int Validations;
     public static int Sends;
     public static void Record(string account, string name, string category, string stage,
         string reason, string source, string identity, string detail, string plugins) {
@@ -34,6 +41,35 @@ public static class ConnectionRejectionProbe {
         Records.Add(new [] { account, name, category, stage, reason, source, identity, detail, plugins });
     }
     public static void FailSend() { Sends++; throw new InvalidOperationException("fixture disconnected transport"); }
+    public static Steamworks.CSteamID GetPeerID(object socket) {
+        if (ThrowIdentity || !ReferenceEquals(SteamSocket, socket)) throw new InvalidOperationException("fixture unavailable Steam socket");
+        return new Steamworks.CSteamID(SteamId);
+    }
+    public static object GetIdentity() { return Identity; }
+    public static void Validate(object identity, byte[] payload) {
+        ++Validations; ValidatedIdentity = identity; ValidatedPayload = payload;
+    }
+    public static void Send(ZRpc rpc, ZPackage package) { throw new InvalidOperationException("Rejected manifest cannot be acknowledged."); }
+}
+public sealed class ConnectionRejectionForeignSocket : ISocket {
+    public bool IsConnected() { return true; }
+    public void Send(ZPackage package) { }
+    public ZPackage Recv() { return null; }
+    public int GetSendQueueSize() { return 0; }
+    public int GetCurrentSendRate() { return 0; }
+    public bool IsHost() { return false; }
+    public void Dispose() { }
+    public bool GotNewData() { return false; }
+    public void Close() { }
+    public string GetEndPointString() { throw new InvalidOperationException("untrusted wrapper endpoint"); }
+    public void GetAndResetStats(out int sent, out int received) { sent = received = 0; }
+    public void GetConnectionQuality(out float local, out float remote, out int ping, out float sent, out float received)
+    { local = remote = sent = received = 0; ping = 0; }
+    public ISocket Accept() { return null; }
+    public int GetHostPort() { return 0; }
+    public bool Flush() { return true; }
+    public string GetHostName() { throw new InvalidOperationException("untrusted wrapper identity"); }
+    public void VersionMatch() { }
 }
 '@
 $definition = [Mono.Cecil.AssemblyDefinition]::ReadAssembly($pluginPath)
@@ -73,6 +109,14 @@ function Clear-Body($Method) {
 $initializer = $runtimeIL.Methods | Where-Object Name -eq '.cctor'
 Clear-Body $initializer
 $initializer.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ret))
+$auditIL = $runtimeIL.Methods | Where-Object Name -eq 'RecordConnectionRejection'
+foreach ($instruction in $auditIL.Body.Instructions) {
+    if ($instruction.Operand -is [Mono.Cecil.MethodReference] -and
+        $instruction.Operand.DeclaringType.FullName -eq 'ZSteamSocket' -and $instruction.Operand.Name -eq 'GetPeerID') {
+        $instruction.OpCode = [Mono.Cecil.Cil.OpCodes]::Call
+        $instruction.Operand = $definition.MainModule.ImportReference([ConnectionRejectionProbe].GetMethod('GetPeerID'))
+    }
+}
 $resolverIL = $definition.MainModule.Types | Where-Object FullName -eq 'ServerManager.ServerPeerResolver'
 $resolveIL = $resolverIL.Methods | Where-Object Name -eq 'TryResolvePeer'
 Clear-Body $resolveIL
@@ -83,6 +127,19 @@ foreach ($index in @(2, 3)) {
 }
 $resolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_1))
 $resolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ret))
+$identityResolveIL = $resolverIL.Methods | Where-Object Name -eq 'TryResolve'
+Clear-Body $identityResolveIL
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ldarg, $identityResolveIL.Parameters[2]))
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Call,
+    $definition.MainModule.ImportReference([ConnectionRejectionProbe].GetMethod('GetIdentity'))))
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Castclass,
+    $definition.MainModule.GetType('ServerManager.ServerPeerIdentity')))
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Stind_Ref))
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ldarg, $identityResolveIL.Parameters[3]))
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ldnull))
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Stind_Ref))
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ldc_I4_1))
+$identityResolveIL.Body.Instructions.Add([Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Ret))
 $eventIL = $definition.MainModule.Types | Where-Object FullName -eq 'ServerManager.Events.ServerEventRuntime'
 $recordIL = $eventIL.Methods | Where-Object Name -eq 'RecordConnectionRejected'
 Clear-Body $recordIL
@@ -122,7 +179,7 @@ $coordinator = $coordinatorType.GetConstructors()[0].Invoke([object[]]@($limits,
 $runtime.GetField('_coordinator', $static).SetValue($null, $coordinator)
 $runtime.GetField('_connectionLimits', $static).SetValue($null, $limits)
 $runtime.GetField('SteamAuthenticationGate', $static).SetValue($null, [object]::new())
-foreach ($fieldName in @('ConnectionRejections', 'LocalHostConnectionRejections', 'SteamAuthenticationsByRpc')) {
+foreach ($fieldName in @('ConnectionRejections', 'LocalHostConnectionRejections', 'SteamAuthenticationsByRpc', 'SteamAuthenticationsById')) {
     $field = $runtime.GetField($fieldName, $static)
     $field.SetValue($null, [Activator]::CreateInstance($field.FieldType))
 }
@@ -131,13 +188,14 @@ $rpcType = [ZRpc]
 $sessionId = [byte[]](1..16)
 $nonce = [byte[]](21..52)
 $messageId = [byte[]](61..76)
-function New-Fixture([string]$State = 'CharacterSent', [bool]$Authenticated = $true, [bool]$Characters = $true) {
+function New-Fixture([string]$State = 'CharacterSent', [bool]$Authenticated = $true, [bool]$Characters = $true,
+    [string]$ReportedName = '') {
     $rpc = [Runtime.Serialization.FormatterServices]::GetUninitializedObject($rpcType)
     $session = [Activator]::CreateInstance($sessionType, $true)
     $values = @{ Rpc = $rpc; State = [Enum]::Parse($stateType, $State); SessionId = $sessionId; Nonce = $nonce;
         LastSequence = [uint32]4; AbsoluteDeadline = [long]::MaxValue; PhaseDeadline = [long]::MaxValue;
         CharacterMessageId = $messageId; CharacterTransferPrepared = $true; PeerInfoAuthenticated = $Authenticated;
-        ServerCharactersEnabled = $Characters }
+        ServerCharactersEnabled = $Characters; ReportedCharacterName = $ReportedName }
     foreach ($key in $values.Keys) { $sessionType.GetField($key, $instance).SetValue($session, $values[$key]) }
     $sessions.Add($rpc, $session)
     return [pscustomobject]@{ Rpc = $rpc; Session = $session }
@@ -212,6 +270,125 @@ $sinkFailure = New-Fixture
 $audit.Invoke($null, [object[]]@($sinkFailure.Rpc, $result.Rejection, 'server_observed', $null)) | Out-Null
 [ConnectionRejectionProbe]::ThrowAudit = $false
 Assert-True $true 'A failed optional audit sink must not throw into rejection handling.'
+
+# Display-only manifest names survive early failures, while identities come
+# from the same reserved Steam connection even after foreign socket wrapping.
+$named = New-Fixture -State 'Challenged' -Authenticated $false -ReportedName 'Selected Viking'
+$audit.Invoke($null, [object[]]@($named.Rpc, $result.Rejection, 'server_observed', $null)) | Out-Null
+$recorded = [ConnectionRejectionProbe]::Records[[ConnectionRejectionProbe]::Records.Count - 1]
+Assert-True ($recorded[0] -eq '' -and $recorded[1] -eq 'Selected Viking' -and $recorded[6] -eq 'unavailable') 'An early selected name was lost or promoted to account identity.'
+$attemptType = $runtime.GetNestedType('SteamAuthenticationAttempt', $instance)
+$byRpc = $runtime.GetField('SteamAuthenticationsByRpc', $static).GetValue($null)
+$byId = $runtime.GetField('SteamAuthenticationsById', $static).GetValue($null)
+function New-IdentityFixture([bool]$Authenticated = $false) {
+    $fixture = New-Fixture -State 'Challenged' -Authenticated $Authenticated -ReportedName 'Reported Name'
+    $peer = [Runtime.Serialization.FormatterServices]::GetUninitializedObject([ZNetPeer])
+    $socket = [Runtime.Serialization.FormatterServices]::GetUninitializedObject([ZSteamSocket])
+    [GC]::SuppressFinalize($socket)
+    $peer.m_rpc = $fixture.Rpc; $peer.m_playerName = 'Peer Name'
+    $peer.m_socket = [ConnectionRejectionForeignSocket]::new()
+    $id = [uint64](76561198000001000 + $byRpc.Count)
+    $attempt = $attemptType.GetConstructors($instance)[0].Invoke([object[]]@(
+        $peer, $fixture.Rpc, $socket, [Steamworks.CSteamID]::new($id), [long]::MaxValue))
+    $byRpc.Add($fixture.Rpc, $attempt); $byId.Add($id, $attempt)
+    [ConnectionRejectionProbe]::SteamSocket = $socket; [ConnectionRejectionProbe]::SteamId = $id
+    return [pscustomobject]@{ Rpc = $fixture.Rpc; Peer = $peer; Socket = $socket; Id = $id; Attempt = $attempt }
+}
+foreach ($authenticated in @($false, $true)) {
+    $bound = New-IdentityFixture $authenticated
+    $beforeIdentityAudit = [ConnectionRejectionProbe]::Records.Count
+    $audit.Invoke($null, [object[]]@($bound.Rpc, $result.Rejection, 'server_observed', $null)) | Out-Null
+    $recorded = [ConnectionRejectionProbe]::Records[[ConnectionRejectionProbe]::Records.Count - 1]
+    $expectedName = if ($authenticated) { 'Peer Name' } else { 'Reported Name' }
+    $expectedStatus = if ($authenticated) { 'authenticated' } else { 'unverified' }
+    Assert-True ([ConnectionRejectionProbe]::Records.Count -eq $beforeIdentityAudit + 1 -and
+        $recorded[0] -eq ('steamworks:' + $bound.Id) -and $recorded[1] -eq $expectedName -and
+        $recorded[6] -eq $expectedStatus) 'Foreign socket wrapping lost the bound account or conflated claimed and authenticated character names.'
+}
+foreach ($invalid in @('changed_id', 'missing_id_index', 'throw_identity', 'wrong_peer', 'wrong_rpc')) {
+    $bound = New-IdentityFixture
+    $unregistered = $null
+    switch ($invalid) {
+        'changed_id' { [ConnectionRejectionProbe]::SteamId = [uint64]76561198999999999 }
+        'missing_id_index' { $byId.Remove($bound.Id) | Out-Null }
+        'throw_identity' { [ConnectionRejectionProbe]::ThrowIdentity = $true }
+        'wrong_peer' {
+            $unregistered = [Runtime.Serialization.FormatterServices]::GetUninitializedObject([ZNetPeer])
+            $unregistered.m_rpc = $bound.Rpc; $unregistered.m_socket = [ConnectionRejectionForeignSocket]::new()
+        }
+        'wrong_rpc' { $bound.Peer.m_rpc = [Runtime.Serialization.FormatterServices]::GetUninitializedObject([ZRpc]) }
+    }
+    $beforeIdentityAudit = [ConnectionRejectionProbe]::Records.Count
+    $audit.Invoke($null, [object[]]@($bound.Rpc, $result.Rejection, 'server_observed', $unregistered)) | Out-Null
+    [ConnectionRejectionProbe]::ThrowIdentity = $false
+    $recorded = [ConnectionRejectionProbe]::Records[[ConnectionRejectionProbe]::Records.Count - 1]
+    Assert-True ([ConnectionRejectionProbe]::Records.Count -eq $beforeIdentityAudit + 1 -and
+        $recorded[0] -eq '' -and $recorded[1] -eq 'Reported Name' -and $recorded[6] -eq 'unavailable') "An invalid Steam binding was reused or lost its display-only name: $invalid"
+}
+
+# Execute the actual AcceptManifest boundary. Only peer resolution and the
+# validator are fixtures: session/nonce/sequence validation and metadata stay real.
+$validatorInterface = $plugin.GetType('ServerManager.IManifestValidator', $true)
+$peerIdentityType = $plugin.GetType('ServerManager.ServerPeerIdentity', $true)
+$decisionType = $plugin.GetType('ServerManager.ManifestValidationDecision', $true)
+$emitAssembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly(
+    [Reflection.AssemblyName]::new('RejectionManifestProbe' + [Guid]::NewGuid().ToString('N')),
+    [Reflection.Emit.AssemblyBuilderAccess]::Run)
+$emitType = $emitAssembly.DefineDynamicModule('Fixture').DefineType('FixtureValidator',
+    [Reflection.TypeAttributes]'Public,Sealed', [object], [Type[]]@($validatorInterface))
+$emitType.DefineDefaultConstructor([Reflection.MethodAttributes]::Public) | Out-Null
+$validateMethod = $emitType.DefineMethod('Validate', [Reflection.MethodAttributes]'Public,Virtual,Final,HideBySig,NewSlot',
+    $decisionType, [Type[]]@($peerIdentityType, [byte[]]))
+$il = $validateMethod.GetILGenerator()
+$il.Emit([Reflection.Emit.OpCodes]::Ldarg_1); $il.Emit([Reflection.Emit.OpCodes]::Ldarg_2)
+$il.Emit([Reflection.Emit.OpCodes]::Call, [ConnectionRejectionProbe].GetMethod('Validate'))
+$il.Emit([Reflection.Emit.OpCodes]::Ldstr, 'Fixture mod rejection')
+$il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, 1300)
+$il.Emit([Reflection.Emit.OpCodes]::Call, $decisionType.GetMethod('Reject'))
+$il.Emit([Reflection.Emit.OpCodes]::Ret)
+$emitType.DefineMethodOverride($validateMethod, $validatorInterface.GetMethod('Validate'))
+$fixtureValidator = [Activator]::CreateInstance($emitType.CreateType())
+$senderType = $plugin.GetType('ServerManager.ProtocolPacketSender', $true)
+$fixtureSender = [Delegate]::CreateDelegate($senderType, [ConnectionRejectionProbe].GetMethod('Send'))
+$acceptManifest = $coordinatorType.GetMethod('AcceptManifest')
+$reportedProperty = $packetType.GetProperty('ReportedCharacterName', $instance)
+$snapshotName = $plugin.GetType('ServerManager.ConnectionSessionSnapshot', $true).GetProperty('ReportedCharacterName', $instance)
+foreach ($invalid in @('none', 'session_id', 'nonce', 'duplicate_sequence', 'out_of_order', 'operation_in_progress', 'state')) {
+    $fixture = New-Fixture -State 'Challenged' -Authenticated $false -ReportedName 'Prior Hint'
+    $sessionType.GetField('LastSequence', $instance).SetValue($fixture.Session, [uint32]1)
+    $peer = [Runtime.Serialization.FormatterServices]::GetUninitializedObject([ZNetPeer]); $peer.m_rpc = $fixture.Rpc
+    [ConnectionRejectionProbe]::Identity = $peerIdentityType.GetConstructors($instance)[0].Invoke([object[]]@(
+        $peer, '76561198000001001', 'fixture-endpoint', 'Resolved Peer Name'))
+    $packet = $packetType.GetConstructors()[0].Invoke([object[]]@(
+        [Enum]::Parse($kindType, 'ManifestResponse'), [uint32]2, $sessionId, $nonce, [byte[]]@(81, 82, 83)))
+    $reportedProperty.SetValue($packet, "Selected`nViking")
+    switch ($invalid) {
+        'session_id' { $packet.SessionId[0] = 99 }
+        'nonce' { $packet.Nonce[0] = 99 }
+        'duplicate_sequence' { $sessionType.GetField('LastSequence', $instance).SetValue($fixture.Session, [uint32]2) }
+        'out_of_order' { $packetType.GetProperty('Sequence').SetValue($packet, [uint32]3) }
+        'operation_in_progress' { $sessionType.GetField('OperationInProgress', $instance).SetValue($fixture.Session, $true) }
+        'state' { $sessionType.GetField('State', $instance).SetValue($fixture.Session, [Enum]::Parse($stateType, 'Connected')) }
+    }
+    $beforeValidations = [ConnectionRejectionProbe]::Validations
+    $manifestResult = $acceptManifest.Invoke($coordinator, [object[]]@($null, $fixture.Rpc, $packet, $fixtureValidator, $fixtureSender))
+    $hint = $snapshotName.GetValue($manifestResult.Session)
+    if ($invalid -eq 'none') {
+        Assert-True (-not $manifestResult.Succeeded -and $hint -eq 'Selected Viking' -and
+            [ConnectionRejectionProbe]::Validations -eq $beforeValidations + 1) 'A valid but rejected manifest did not retain its normalized display name.'
+        Assert-True ([object]::ReferenceEquals([ConnectionRejectionProbe]::ValidatedIdentity, [ConnectionRejectionProbe]::Identity) -and
+            [ConnectionRejectionProbe]::ValidatedIdentity.PlayerName -eq 'Resolved Peer Name' -and
+            [BitConverter]::ToString([ConnectionRejectionProbe]::ValidatedPayload) -eq '51-52-53' -and
+            -not [object]::ReferenceEquals([ConnectionRejectionProbe]::ValidatedPayload, $packet.Payload)) 'Display metadata replaced authoritative peer identity or changed the validator manifest payload.'
+        $reportedProperty.SetValue($packet, 'Replay Hint')
+        $replayed = $acceptManifest.Invoke($coordinator, [object[]]@($null, $fixture.Rpc, $packet, $fixtureValidator, $fixtureSender))
+        Assert-True ($snapshotName.GetValue($replayed.Session) -eq 'Selected Viking' -and
+            [ConnectionRejectionProbe]::Validations -eq $beforeValidations + 1) 'A duplicate terminal manifest replaced the original display hint.'
+    } else {
+        Assert-True (-not $manifestResult.Succeeded -and $hint -eq 'Prior Hint' -and
+            [ConnectionRejectionProbe]::Validations -eq $beforeValidations) "An invalid manifest copied its display hint or reached policy validation: $invalid"
+    }
+}
 $clientType = $runtime.GetNestedType('ClientConnection', $instance)
 $client = [Runtime.Serialization.FormatterServices]::GetUninitializedObject($clientType)
 foreach ($pair in @{ Rpc = $fixture.Rpc; SessionId = $sessionId; Nonce = $nonce; ManifestAccepted = $true }.GetEnumerator()) {

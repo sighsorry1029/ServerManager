@@ -872,7 +872,8 @@ internal static partial class ServerManagerRuntime
                 ConnectionProtocolLimits.AbsoluteMaxManifestBytes;
             int packetLimit = Math.Max(
                 512 * 1024,
-                checked(networkManifestLimit + ProtocolPacketCodec.FixedHeaderBytes));
+                checked(networkManifestLimit + ProtocolPacketCodec.FixedHeaderBytes +
+                    ProtocolPacketCodec.MaximumManifestMetadataBytes));
             packetLimit = Math.Min(packetLimit, ConnectionProtocolLimits.AbsoluteMaxPacketBytes);
 
             _integrityLimits = new IntegrityLimits(maxPayloadBytes: maximumManifestBytes);
@@ -2526,7 +2527,7 @@ internal static partial class ServerManagerRuntime
             detectCheatEngine: true,
             detectExternalTools: true,
             detectGenericProcessNames: true,
-            detectValheimTooler: true,
+            detectInjectedCheatAssemblies: true,
             monitorCheatCommands: true,
             blockCheatCommands: true,
             allowAdminCheatCommands: true,
@@ -5265,7 +5266,7 @@ internal static partial class ServerManagerRuntime
         {
             if (evidence == DetectionEvidence.AssemblyDetectorUnavailable)
             {
-                return state.Policy.DetectValheimTooler;
+                return state.Policy.DetectInjectedCheatAssemblies;
             }
 
             return state.Policy.DetectCheatEngine ||
@@ -5288,9 +5289,9 @@ internal static partial class ServerManagerRuntime
             return state.Policy.DetectGenericProcessNames;
         }
 
-        if (DetectionEvidenceCatalog.IsValheimTooler(evidence))
+        if (DetectionEvidenceCatalog.IsInjectedCheatAssembly(evidence))
         {
-            return state.Policy.DetectValheimTooler;
+            return state.Policy.DetectInjectedCheatAssemblies;
         }
 
         if (evidence == DetectionEvidence.CarryWeightLimitExceeded)
@@ -7190,8 +7191,17 @@ internal static partial class ServerManagerRuntime
     {
         if (!ReferenceEquals(_client, session) || session.Failed || session.ManifestResponseSent)
             return;
+        string reportedCharacterName = string.Empty;
+        try
+        {
+            reportedCharacterName = Game.instance?.GetPlayerProfile()?.GetName() ?? string.Empty;
+        }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        {
+            // Optional diagnostics must not prevent an otherwise valid join.
+        }
         ZPackage response = ProtocolPacketCodec.CreateManifestResponse(
-            session.SessionId!, session.Nonce!, manifestPayload, _connectionLimits);
+            session.SessionId!, session.Nonce!, manifestPayload, _connectionLimits, reportedCharacterName);
         SendProtocolOrThrow(session.Rpc, response);
         session.ManifestResponseSent = true;
     }

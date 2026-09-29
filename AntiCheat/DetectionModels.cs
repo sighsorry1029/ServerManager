@@ -26,6 +26,8 @@ internal enum DetectionEvidence : ushort
     GenericTrainerProcess = 122,
 
     ValheimToolerDetected = 200,
+    ValheavenAssemblyDetected = 201,
+    ValheavenNativeLoaderDetected = 202,
 
     CheatCommand = 300,
 
@@ -116,12 +118,14 @@ internal static class DetectionEvidenceCatalog
     {
         return evidence == DetectionEvidence.ArtMoneyProcess ||
                evidence == DetectionEvidence.WeModProcess ||
-               evidence == DetectionEvidence.SharpMonoInjectorProcess;
+               evidence == DetectionEvidence.SharpMonoInjectorProcess ||
+               evidence == DetectionEvidence.ValheavenNativeLoaderDetected;
     }
 
-    internal static bool IsValheimTooler(DetectionEvidence evidence)
+    internal static bool IsInjectedCheatAssembly(DetectionEvidence evidence)
     {
-        return evidence == DetectionEvidence.ValheimToolerDetected;
+        return evidence == DetectionEvidence.ValheimToolerDetected ||
+               evidence == DetectionEvidence.ValheavenAssemblyDetected;
     }
 
     internal static bool IsGameplayLimit(DetectionEvidence evidence)

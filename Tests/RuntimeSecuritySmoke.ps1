@@ -512,7 +512,7 @@ foreach ($argumentSpec in @(
     @{ Index = 3; Value = 1; Name = 'detectCheatEngine' },
     @{ Index = 4; Value = 1; Name = 'detectExternalTools' },
     @{ Index = 5; Value = 1; Name = 'detectGenericProcessNames' },
-    @{ Index = 6; Value = 1; Name = 'detectValheimTooler' },
+    @{ Index = 6; Value = 1; Name = 'detectInjectedCheatAssemblies' },
     @{ Index = 7; Value = 1; Name = 'monitorCheatCommands' },
     @{ Index = 8; Value = 1; Name = 'blockCheatCommands' },
     @{ Index = 9; Value = 1; Name = 'allowAdminCheatCommands' },
@@ -3115,6 +3115,43 @@ Assert-True (
     $decodedModuleDetail.Length -eq 0) `
     "The module report was not a fixed, detail-free evidence value."
 
+foreach ($valheavenEvidenceCode in @(201, 202)) {
+    $valheavenReportArguments = [object[]]$moduleReportArguments.Clone()
+    $valheavenReportArguments[3] = [Enum]::ToObject($evidenceType, [ushort]$valheavenEvidenceCode)
+    $valheavenReport = $reportConstructor.Invoke($valheavenReportArguments)
+    $valheavenPackage = $encodeDetection.Invoke($null, [object[]]@($valheavenReport))
+    $valheavenDecoded = Decode-DetectionReport $valheavenPackage
+    Assert-True ($valheavenDecoded.Succeeded -and
+        [int]$reportType.GetProperty('Evidence', $instanceNonPublic).GetValue($valheavenDecoded.Report, $null) -eq $valheavenEvidenceCode -and
+        $reportType.GetProperty('Detail', $instanceNonPublic).GetValue($valheavenDecoded.Report, $null) -eq '' -and
+        $reportType.GetProperty('Sequence', $instanceNonPublic).GetValue($valheavenDecoded.Report, $null) -eq 1 -and
+        $reportType.GetProperty('PolicyGeneration', $instanceNonPublic).GetValue($valheavenDecoded.Report, $null) -eq 1) `
+        "Detail-free Valheaven evidence $valheavenEvidenceCode did not round-trip."
+
+    # A syntactically valid command token is still forbidden for tool reports.
+    $valheavenReportArguments[4] = 'unexpected'
+    $valheavenDetailRejected = $false
+    try { $null = $reportConstructor.Invoke($valheavenReportArguments) }
+    catch {
+        $detailError = $_.Exception
+        while ($null -ne $detailError.InnerException) { $detailError = $detailError.InnerException }
+        $valheavenDetailRejected = $detailError -is [ArgumentException] -and
+            $detailError.Message.Contains('Only command reports')
+    }
+    Assert-True $valheavenDetailRejected "Valheaven evidence $valheavenEvidenceCode accepted arbitrary report detail."
+
+    [byte[]]$valheavenWire = $zPackageGetArray.Invoke($valheavenPackage, $null)
+    Assert-True ($valheavenWire.Length -eq 65 -and $valheavenWire[64] -eq 0) `
+        'The fixed detail-free detection wire shape changed.'
+    [byte[]]$forgedDetail = [Text.Encoding]::ASCII.GetBytes('unexpected')
+    [byte[]]$forgedValheavenWire = [byte[]]::new(65 + $forgedDetail.Length)
+    [Array]::Copy($valheavenWire, $forgedValheavenWire, 64)
+    $forgedValheavenWire[64] = [byte]$forgedDetail.Length
+    [Array]::Copy($forgedDetail, 0, $forgedValheavenWire, 65, $forgedDetail.Length)
+    Assert-True (-not (Decode-DetectionReport (New-ZPackage $forgedValheavenWire)).Succeeded) `
+        "The decoder accepted forged arbitrary detail for Valheaven evidence $valheavenEvidenceCode."
+}
+
 $evidenceCatalogType = $pluginAssembly.GetType("ServerManager.DetectionEvidenceCatalog", $true)
 $isClientReportable = $evidenceCatalogType.GetMethod("IsClientReportable", $staticNonPublic)
 $isSnapshotStatLimit = $evidenceCatalogType.GetMethod("IsSnapshotStatLimit", $staticNonPublic)
@@ -3398,8 +3435,8 @@ $allStatic = [Reflection.BindingFlags]"Static,Public,NonPublic"
 $protocolWireVersion = $protocolCodecType.GetField(
     "WireVersion",
     [Reflection.BindingFlags]"Static,Public").GetRawConstantValue()
-Assert-True ($protocolWireVersion -eq 21) `
-    "The main protocol wire version was not bumped to 21 for scoped library manifest challenges and updates."
+Assert-True ($protocolWireVersion -eq 23) `
+    "The main protocol wire version was not bumped to 23 for display-only admission metadata."
 
 $limitsArguments = [object[]]::new(6)
 $limitsArguments[0] = 512 * 1024
@@ -3446,10 +3483,10 @@ $challengePackage = $createChallenge.Invoke($null, $createArguments)
 
 $decodedPacket = Decode-ProtocolPacket $challengePackage $limits
 Assert-True $decodedPacket.Succeeded `
-    "A valid wire-v21 challenge packet was rejected."
+    "A valid wire-v23 challenge packet was rejected."
 $decodedChallenge = Decode-ChallengeOptions $decodedPacket.Packet
 Assert-True $decodedChallenge.Succeeded `
-    "Valid wire-v21 challenge options were rejected."
+    "Valid wire-v23 challenge options were rejected."
 
 $createFinalSaveBegin = $protocolCodecType.GetMethod(
     "CreateFinalSaveBegin",
@@ -3459,7 +3496,7 @@ $createFinalSaveReady = $protocolCodecType.GetMethod(
     $allStatic)
 Assert-True ($null -ne $createFinalSaveBegin -and
     $null -ne $createFinalSaveReady) `
-    "The wire-v21 final-save gate packet factories were missing."
+    "The wire-v23 final-save gate packet factories were missing."
 $finalControlArguments = [object[]]@($sessionId, $nonce, $limits)
 $finalBeginPacket = Decode-ProtocolPacket (
     $createFinalSaveBegin.Invoke($null, $finalControlArguments)) $limits
@@ -3882,6 +3919,47 @@ Assert-True ($isStickyEvidence.Invoke(
     $null,
     [object[]]@($injectedModuleEvidence))) `
     "Injected-module evidence was not sticky."
+$isManagedCheatEvidence = $catalogType.GetMethod('IsInjectedCheatAssembly', $staticNonPublic)
+$isExternalToolEvidence = $catalogType.GetMethod('IsExternalTool', $staticNonPublic)
+foreach ($managedEvidenceName in @('ValheimToolerDetected', 'ValheavenAssemblyDetected')) {
+    $managedEvidence = [Enum]::Parse($evidenceType, $managedEvidenceName)
+    Assert-True ($isManagedCheatEvidence.Invoke($null, [object[]]@($managedEvidence)) -and
+        -not $isExternalToolEvidence.Invoke($null, [object[]]@($managedEvidence))) `
+        "$managedEvidenceName did not use the managed assembly policy."
+}
+$nativeLoaderEvidence = [Enum]::ToObject($evidenceType, [ushort]202)
+Assert-True ($isExternalToolEvidence.Invoke($null, [object[]]@($nativeLoaderEvidence)) -and
+    -not $isManagedCheatEvidence.Invoke($null, [object[]]@($nativeLoaderEvidence)) -and
+    -not $isCheatEngineEvidence.Invoke($null, [object[]]@($nativeLoaderEvidence))) `
+    'Valheaven native-loader evidence did not use the external-tool policy.'
+
+$gatingRuntimeType = $pluginAssembly.GetType('ServerManager.ServerManagerRuntime', $true)
+$gatingStateType = $pluginAssembly.GetType('ServerManager.ServerManagerRuntime+ServerDetectionState', $true)
+$gatingStateConstructor = $gatingStateType.GetConstructors($instanceNonPublic)[0]
+$gatingActionType = $pluginAssembly.GetType('ServerManager.DetectionAction', $true)
+$gatingLogAction = [Enum]::Parse($gatingActionType, 'Log')
+$expectedEvidenceMethod = $gatingRuntimeType.GetMethod('IsExpectedDetectionEvidence', $staticNonPublic)
+foreach ($gatingCase in @(
+    @{ Managed = $false; External = $false; CheatEngine = $false },
+    @{ Managed = $true; External = $false; CheatEngine = $false },
+    @{ Managed = $false; External = $true; CheatEngine = $false },
+    @{ Managed = $false; External = $false; CheatEngine = $true },
+    @{ Managed = $true; External = $true; CheatEngine = $true }
+)) {
+    $gatingArguments = [object[]]$challengeArguments.Clone()
+    $gatingArguments[3] = $gatingCase.CheatEngine
+    $gatingArguments[4] = $gatingCase.External
+    $gatingArguments[5] = $false
+    $gatingArguments[6] = $gatingCase.Managed
+    $gatingPolicy = $challengeType.GetConstructors()[0].Invoke($gatingArguments)
+    $gatingState = $gatingStateConstructor.Invoke([object[]]@($gatingPolicy, $gatingLogAction, $gatingLogAction, 3, 10))
+    foreach ($gatingEvidenceCode in @(200, 201, 202, 902)) {
+        $gatingEvidence = [Enum]::ToObject($evidenceType, [ushort]$gatingEvidenceCode)
+        $expectedEnabled = if ($gatingEvidenceCode -eq 202) { $gatingCase.External } else { $gatingCase.Managed }
+        Assert-True ($expectedEvidenceMethod.Invoke($null, [object[]]@($gatingState, $gatingEvidence)) -eq $expectedEnabled) `
+            "Server evidence $gatingEvidenceCode did not follow its own advertised detector policy."
+    }
+}
 
 $isExpectedEvidenceDefinition = $runtimeDefinition.Methods |
     Where-Object Name -eq "IsExpectedDetectionEvidence"
@@ -3958,6 +4036,11 @@ $detectCheatEngineCall = $scanCalls |
             "ServerManager.ExternalProcessScanPolicy"
     } |
     Select-Object -First 1
+$detectExternalToolsCall = $scanCalls |
+    Where-Object {
+        $_.Operand.Name -eq 'get_DetectExternalTools' -and
+        $_.Operand.DeclaringType.FullName -eq 'ServerManager.ExternalProcessScanPolicy'
+    } | Select-Object -First 1
 $currentModuleScanCall = $scanCalls |
     Where-Object {
         $_.Operand.Name -eq "TryScanCurrentProcessNativeModules" -and
@@ -3968,22 +4051,31 @@ $currentModuleScanCall = $scanCalls |
 $modulePolicyBranch = Get-FirstConditionalBranch `
     $detectCheatEngineCall `
     $currentModuleScanCall
-$policyTargetReachesModule =
+$policyTargetReachesModuleWithoutExternal =
     $null -ne $modulePolicyBranch -and
     (Test-CecilReachable `
         -Start $modulePolicyBranch.Operand `
-        -Target $currentModuleScanCall)
-$policyFallthroughReachesModule =
+        -Target $currentModuleScanCall `
+        -Blocked @($detectExternalToolsCall))
+$policyFallthroughReachesModuleWithoutExternal =
     $null -ne $modulePolicyBranch -and
     (Test-CecilReachable `
         -Start $modulePolicyBranch.Next `
-        -Target $currentModuleScanCall)
+        -Target $currentModuleScanCall `
+        -Blocked @($detectExternalToolsCall))
+$externalModulePolicyBranch = Get-FirstConditionalBranch $detectExternalToolsCall $currentModuleScanCall
 Assert-True (
     $null -ne $detectCheatEngineCall -and
+    $null -ne $detectExternalToolsCall -and
     $null -ne $currentModuleScanCall -and
     $null -ne $modulePolicyBranch -and
-    $policyTargetReachesModule -ne $policyFallthroughReachesModule) `
-    "The current-process module scan was not gated by DetectCheatEngine."
+    $policyTargetReachesModuleWithoutExternal -ne $policyFallthroughReachesModuleWithoutExternal -and
+    ((Test-CecilReachable $modulePolicyBranch.Operand $detectExternalToolsCall) -xor
+        (Test-CecilReachable $modulePolicyBranch.Next $detectExternalToolsCall)) -and
+    $null -ne $externalModulePolicyBranch -and
+    ((Test-CecilReachable $externalModulePolicyBranch.Operand $currentModuleScanCall) -xor
+        (Test-CecilReachable $externalModulePolicyBranch.Next $currentModuleScanCall))) `
+    'The current-process module pass must run for Cheat Engine OR external-tool detection, and skip when both are disabled.'
 
 $moduleScanCalls = @(
     $moduleScanDefinition.Body.Instructions |
@@ -4107,7 +4199,7 @@ Assert-True ($null -ne $responseSelectionBranch -and
      (Test-CecilReachable $invalidGameplayBranch.Next $cheatResponseGetter))) `
     "Numeric limits and invalid gameplay values must select StatLimitResponse while other detectors select CheatDetectionResponse."
 Assert-True (@($processEvidenceCalls | Where-Object {
-    $_.Operand.Name -in @('IsCheatEngine', 'IsExternalTool', 'IsValheimTooler')
+    $_.Operand.Name -in @('IsCheatEngine', 'IsExternalTool', 'IsInjectedCheatAssembly')
 }).Count -eq 0) "The unified detector response retained per-tool action branches."
 
 $applyEvidenceCall = $processEvidenceCalls |
@@ -4434,8 +4526,8 @@ Assert-True ($normalizeProcessName.Invoke(
     [object[]]@(" trainer.exe ")) -eq " trainer.exe ") `
     "Whitespace was trimmed from a strict process name."
 
-$toolerInspectorType = $pluginAssembly.GetType(
-    "ServerManager.ValheimToolerAssemblyInspector",
+$assemblyInspectorType = $pluginAssembly.GetType(
+    "ServerManager.InjectedCheatAssemblyInspector",
     $true)
 $detectionEvidenceType = $pluginAssembly.GetType(
     "ServerManager.DetectionEvidence",
@@ -4443,65 +4535,212 @@ $detectionEvidenceType = $pluginAssembly.GetType(
 $detectionEvidenceNames = [Enum]::GetNames($detectionEvidenceType)
 Assert-True (
     $detectionEvidenceNames -contains "ValheimToolerDetected" -and
+    $detectionEvidenceNames -contains "ValheavenAssemblyDetected" -and
     $detectionEvidenceNames -notcontains "ValheimToolerAssembly" -and
     $detectionEvidenceNames -notcontains "ValheimToolerNamespace") `
     "ValheimTooler evidence was not consolidated to one wire value."
-$inspectTooler = $toolerInspectorType.GetMethod(
+$inspectAssembly = $assemblyInspectorType.GetMethod(
     "Inspect",
     $staticNonPublic)
-$toolerResultType = $pluginAssembly.GetType(
-    "ServerManager.ValheimToolerInspection",
+$assemblyResultType = $pluginAssembly.GetType(
+    "ServerManager.InjectedCheatAssemblyInspection",
     $true)
-$toolerDetectedProperty = $toolerResultType.GetProperty(
-    "Detected",
+$toolerDetectedProperty = $assemblyResultType.GetProperty(
+    "ValheimToolerDetected",
     $instanceNonPublic)
+$valheavenDetectedProperty = $assemblyResultType.GetProperty(
+    'ValheavenDetected', $instanceNonPublic)
+$inspectionIncompleteProperty = $assemblyResultType.GetProperty(
+    'InspectionIncomplete', $instanceNonPublic)
 
-$benignResult = $inspectTooler.Invoke(
+$benignResult = $inspectAssembly.Invoke(
     $null,
     [object[]]@($pluginAssembly))
-Assert-True (-not $toolerDetectedProperty.GetValue(
-    $benignResult,
-    $null)) "A benign assembly matched ValheimTooler."
+Assert-True (-not $toolerDetectedProperty.GetValue($benignResult, $null) -and
+    -not $valheavenDetectedProperty.GetValue($benignResult, $null)) `
+    'The plugin itself matched an injected-cheat signature.'
+Assert-True ([int][Enum]::Parse($detectionEvidenceType, 'ValheimToolerDetected') -eq 200 -and
+    [int][Enum]::Parse($detectionEvidenceType, 'ValheavenAssemblyDetected') -eq 201) `
+    'Managed detector wire values changed unexpectedly.'
 
-$toolerAssemblyName = New-Object Reflection.AssemblyName(
-    "ValheimTooler")
-$toolerAssembly = if ($PSVersionTable.PSEdition -eq "Core") {
-    [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly(
-        $toolerAssemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
-} else {
-    [AppDomain]::CurrentDomain.DefineDynamicAssembly(
-        $toolerAssemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+function New-InspectionAssembly {
+    param([string]$Name, [string[]]$TypeNames = @('Neutral.Probe'))
+    $assemblyName = [Reflection.AssemblyName]::new($Name)
+    $assembly = if ($PSVersionTable.PSEdition -eq 'Core') {
+        [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly(
+            $assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+    } else {
+        [AppDomain]::CurrentDomain.DefineDynamicAssembly(
+            $assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+    }
+    $module = $assembly.DefineDynamicModule('main')
+    foreach ($typeName in $TypeNames) {
+        $null = $module.DefineType($typeName, [Reflection.TypeAttributes]::Public).CreateType()
+    }
+    return $assembly
 }
-$toolerModule = $toolerAssembly.DefineDynamicModule("main")
-$null = $toolerModule.DefineType(
-    "Neutral.Probe",
-    [Reflection.TypeAttributes]::Public).CreateType()
-$toolerAssemblyResult = $inspectTooler.Invoke(
-    $null,
-    [object[]]@($toolerAssembly))
-Assert-True ($toolerDetectedProperty.GetValue(
-    $toolerAssemblyResult,
-    $null)) "The exact ValheimTooler assembly name did not match."
 
-$namespaceAssemblyName = New-Object Reflection.AssemblyName(
-    "NamespaceProbe")
-$namespaceAssembly = if ($PSVersionTable.PSEdition -eq "Core") {
-    [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly(
-        $namespaceAssemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
-} else {
-    [AppDomain]::CurrentDomain.DefineDynamicAssembly(
-        $namespaceAssemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+foreach ($testCase in @(
+    @{ Name = 'ValheimTooler'; Types = @('Neutral.Probe'); Tooler = $true; Valheaven = $false },
+    @{ Name = 'valheimtooler'; Types = @('Neutral.Probe'); Tooler = $true; Valheaven = $false },
+    @{ Name = 'Valheaven'; Types = @('Neutral.Probe'); Tooler = $false; Valheaven = $true },
+    @{ Name = 'ValheavenModMenu'; Types = @('Neutral.Probe'); Tooler = $false; Valheaven = $true },
+    @{ Name = 'valheavenmodmenu'; Types = @('Neutral.Probe'); Tooler = $false; Valheaven = $true },
+    @{ Name = 'ValheimAdminMenu'; Types = @('Neutral.Probe'); Tooler = $false; Valheaven = $true },
+    @{ Name = 'ManagedProbe1'; Types = @('ValheimTooler.Probe'); Tooler = $true; Valheaven = $false },
+    @{ Name = 'ManagedProbe2'; Types = @('ValheimTooler.Nested.Probe'); Tooler = $true; Valheaven = $false },
+    @{ Name = 'ManagedProbe3'; Types = @('Valheaven.Entrypoint'); Tooler = $false; Valheaven = $true },
+    @{ Name = 'ManagedProbe4'; Types = @('Valheaven.Nested.Probe'); Tooler = $false; Valheaven = $true },
+    @{ Name = 'ManagedProbe5'; Types = @('ValheimAdminMenu.Probe'); Tooler = $false; Valheaven = $true },
+    @{ Name = 'ManagedProbe6'; Types = @('ValheimAdminMenu.Nested.Probe'); Tooler = $false; Valheaven = $true },
+    @{ Name = 'ManagedProbe7'; Types = @('ValheimTooler.Probe', 'valheaven.Entrypoint'); Tooler = $true; Valheaven = $true },
+    @{ Name = 'ValheimToolerHelper'; Types = @('ValheimToolerHelper.Probe'); Tooler = $false; Valheaven = $false },
+    @{ Name = 'ValheavenCompatibility'; Types = @('ValheavenCompatibility.Probe'); Tooler = $false; Valheaven = $false },
+    @{ Name = 'ValheavenModMenuHelper'; Types = @('ValheavenModMenu.Probe'); Tooler = $false; Valheaven = $false },
+    @{ Name = 'ValheimAdminMenuTools'; Types = @('ValheimAdminMenuTools.Probe'); Tooler = $false; Valheaven = $false },
+    @{ Name = 'ManagedProbe8'; Types = @('Other.Valheaven.Probe', 'Other.ValheimTooler.Probe', 'Other.ValheimAdminMenu.Probe'); Tooler = $false; Valheaven = $false },
+    @{ Name = 'ManagedProbe9'; Types = @('Valheaven', 'ValheimTooler', 'ValheimAdminMenu'); Tooler = $false; Valheaven = $false }
+)) {
+    $probeAssembly = New-InspectionAssembly $testCase.Name $testCase.Types
+    $inspection = $inspectAssembly.Invoke($null, [object[]]@($probeAssembly))
+    Assert-True ($toolerDetectedProperty.GetValue($inspection, $null) -eq $testCase.Tooler -and
+        $valheavenDetectedProperty.GetValue($inspection, $null) -eq $testCase.Valheaven -and
+        -not $inspectionIncompleteProperty.GetValue($inspection, $null)) `
+        "Exact/rooted managed-cheat inspection failed for $($testCase.Name): $($testCase.Types -join ', ')."
 }
-$namespaceModule = $namespaceAssembly.DefineDynamicModule("main")
-$null = $namespaceModule.DefineType(
-    "ValheimTooler.Probe",
-    [Reflection.TypeAttributes]::Public).CreateType()
-$toolerNamespaceResult = $inspectTooler.Invoke(
-    $null,
-    [object[]]@($namespaceAssembly))
-Assert-True ($toolerDetectedProperty.GetValue(
-    $toolerNamespaceResult,
-    $null)) "The ValheimTooler namespace prefix did not match."
+
+# Fake reflection failures exercise partial matches without loading any cheat.
+Add-Type -TypeDefinition @'
+using System;
+using System.Reflection;
+namespace ServerManager.Tests {
+    public sealed class InspectionAssembly : Assembly {
+        public string SimpleName = "Neutral";
+        public Type[] Types = new Type[0];
+        public Exception NameError;
+        public Exception TypesError;
+        public int NameReads;
+        public int TypeReads;
+        public override AssemblyName GetName() { return GetName(false); }
+        public override AssemblyName GetName(bool copiedName) {
+            ++NameReads;
+            if (NameError != null) throw NameError;
+            return new AssemblyName(SimpleName);
+        }
+        public override Type[] GetTypes() {
+            ++TypeReads;
+            if (TypesError != null) throw TypesError;
+            return Types;
+        }
+    }
+    public sealed class InspectionType : TypeDelegator {
+        public Exception Error;
+        public InspectionType() : base(typeof(object)) { }
+        public override string Namespace { get { throw Error; } }
+    }
+}
+'@
+$partialAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+$partialTypesAssembly = New-InspectionAssembly 'PartialProbe' @('Valheaven.Entrypoint', 'ValheimTooler.Probe')
+$partialTypes = [Type[]]@($partialTypesAssembly.GetType('Valheaven.Entrypoint'), $null,
+    $partialTypesAssembly.GetType('ValheimTooler.Probe'))
+$partialAssembly.TypesError = [Reflection.ReflectionTypeLoadException]::new(
+    $partialTypes, [Exception[]]@([TypeLoadException]::new('Synthetic missing dependency.')))
+$partialResult = $inspectAssembly.Invoke($null, [object[]]@($partialAssembly))
+Assert-True ($toolerDetectedProperty.GetValue($partialResult, $null) -and
+    $valheavenDetectedProperty.GetValue($partialResult, $null) -and
+    $inspectionIncompleteProperty.GetValue($partialResult, $null)) `
+    'A partial type-load failure discarded positive evidence or its diagnostic.'
+
+$nameFailureAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+$nameFailureAssembly.NameError = [InvalidOperationException]::new('Synthetic name failure.')
+$nameFailureAssembly.Types = $partialTypes
+$nameFailureResult = $inspectAssembly.Invoke($null, [object[]]@($nameFailureAssembly))
+Assert-True ($toolerDetectedProperty.GetValue($nameFailureResult, $null) -and
+    $valheavenDetectedProperty.GetValue($nameFailureResult, $null) -and
+    $inspectionIncompleteProperty.GetValue($nameFailureResult, $null)) `
+    'Assembly-name failure prevented type inspection.'
+
+foreach ($matchingName in @('Neutral', 'ValheimTooler', 'ValheavenModMenu')) {
+    $typesFailureAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+    $typesFailureAssembly.SimpleName = $matchingName
+    $typesFailureAssembly.TypesError = [InvalidOperationException]::new('Synthetic type failure.')
+    $typesFailureResult = $inspectAssembly.Invoke($null, [object[]]@($typesFailureAssembly))
+    Assert-True ($toolerDetectedProperty.GetValue($typesFailureResult, $null) -eq ($matchingName -eq 'ValheimTooler') -and
+        $valheavenDetectedProperty.GetValue($typesFailureResult, $null) -eq ($matchingName -eq 'ValheavenModMenu') -and
+        $inspectionIncompleteProperty.GetValue($typesFailureResult, $null)) `
+        'Type enumeration failure erased exact-name evidence or was treated as positive evidence itself.'
+}
+$badNamespace = [ServerManager.Tests.InspectionType]::new()
+$badNamespace.Error = [InvalidOperationException]::new('Synthetic namespace failure.')
+$namespaceFailureAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+$namespaceFailureAssembly.Types = [Type[]]@($badNamespace, $partialTypes[0])
+$namespaceFailureResult = $inspectAssembly.Invoke($null, [object[]]@($namespaceFailureAssembly))
+Assert-True (-not $toolerDetectedProperty.GetValue($namespaceFailureResult, $null) -and
+    $valheavenDetectedProperty.GetValue($namespaceFailureResult, $null) -and
+    $inspectionIncompleteProperty.GetValue($namespaceFailureResult, $null)) `
+    'A namespace getter failure prevented inspection of later types.'
+foreach ($failureLocation in @('NameError', 'TypesError', 'Namespace')) {
+    $fatalAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+    $syntheticFatal = [OutOfMemoryException]::new('Synthetic fatal: no memory exhaustion was induced.')
+    if ($failureLocation -eq 'Namespace') {
+        $fatalNamespace = [ServerManager.Tests.InspectionType]::new()
+        $fatalNamespace.Error = $syntheticFatal
+        $fatalAssembly.Types = [Type[]]@($fatalNamespace)
+    } else {
+        $fatalAssembly.$failureLocation = $syntheticFatal
+    }
+    $fatalPropagated = $false
+    try { $null = $inspectAssembly.Invoke($null, [object[]]@($fatalAssembly)) }
+    catch {
+        $observedError = $_.Exception
+        while ($null -ne $observedError.InnerException) { $observedError = $observedError.InnerException }
+        $fatalPropagated = [object]::ReferenceEquals($observedError, $syntheticFatal)
+    }
+    Assert-True $fatalPropagated "Fatal $failureLocation errors were swallowed by managed-cheat inspection."
+}
+
+# Both tools share one reflection pass, one bounded loader queue and generation
+# cache. Event callbacks enqueue only; inspection runs in TickAssemblyDetector.
+$assemblyAgentType = $pluginAssembly.GetType('ServerManager.ClientDetectionAgent', $true)
+$assemblyAgent = [Activator]::CreateInstance($assemblyAgentType, $true)
+$assemblyPolicyArguments = [object[]]$challengeArguments.Clone()
+foreach ($index in @(3,4,5)) { $assemblyPolicyArguments[$index] = $false }
+$assemblyPolicyArguments[6] = $true
+$assemblyPolicy = $challengeType.GetConstructors()[0].Invoke($assemblyPolicyArguments)
+$null = $assemblyAgentType.GetMethod('Configure', $instanceNonPublic).Invoke($assemblyAgent, [object[]]@($assemblyPolicy))
+try {
+    $onceAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+    $onceAssembly.Types = $partialTypes
+    $inspectOnce = $assemblyAgentType.GetMethod('InspectAssemblyOnce', $instanceNonPublic)
+    $null = $inspectOnce.Invoke($assemblyAgent, [object[]]@($onceAssembly))
+    $null = $inspectOnce.Invoke($assemblyAgent, [object[]]@($onceAssembly))
+    Assert-True ($onceAssembly.NameReads -eq 1 -and $onceAssembly.TypeReads -eq 1) `
+        'One assembly was enumerated more than once per policy generation.'
+    $signalType = $pluginAssembly.GetType('ServerManager.ClientDetectionSignal', $true)
+    $dequeueAssemblySignal = $assemblyAgentType.GetMethod('TryDequeue', $instanceNonPublic)
+    $assemblySignalCodes = [Collections.Generic.List[int]]::new()
+    $assemblySignalArguments = [object[]]@($null)
+    while ($dequeueAssemblySignal.Invoke($assemblyAgent, $assemblySignalArguments)) {
+        $assemblySignalCodes.Add([int]$signalType.GetProperty('Evidence', $instanceNonPublic).GetValue($assemblySignalArguments[0], $null))
+    }
+    Assert-True (@($assemblySignalCodes | Where-Object { $_ -eq 200 }).Count -eq 1 -and
+        @($assemblySignalCodes | Where-Object { $_ -eq 201 }).Count -eq 1) `
+        'The shared inspector did not emit one sticky signal for each detected tool.'
+
+    $lateAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+    $lateAssembly.Types = $partialTypes
+    $null = $assemblyAgentType.GetMethod('OnAssemblyLoad', $instanceNonPublic).Invoke(
+        $assemblyAgent, [object[]]@($null, [AssemblyLoadEventArgs]::new($lateAssembly)))
+    Assert-True ($lateAssembly.NameReads -eq 0 -and $lateAssembly.TypeReads -eq 0) `
+        'The loader callback performed reflection instead of bounded enqueueing.'
+    $null = $assemblyAgentType.GetMethod('TickAssemblyDetector', $instanceNonPublic).Invoke($assemblyAgent, $null)
+    Assert-True ($lateAssembly.NameReads -eq 1 -and $lateAssembly.TypeReads -eq 1) `
+        'A later assembly-load event was not inspected by the shared tick path.'
+}
+finally {
+    $null = $assemblyAgentType.GetMethod('Reset', $instanceNonPublic).Invoke($assemblyAgent, $null)
+}
 
 $commandGuardType = $pluginAssembly.GetType(
     "ServerManager.CheatCommandGuard",
@@ -5121,5 +5360,5 @@ Assert-True ($staleObservationOffset -ge 0 -and $processObservationOffset -gt $s
     $fixedRuntimeSource.Substring($staleObservationOffset, $processObservationOffset - $staleObservationOffset).Contains(
         'LogDetection(identity, report, DetectionAction.Log, "stale_policy_observation")')) 'Old observations can inherit new terminal responses.'
 
-Write-Output ("Fixed 120-second/30-second timeout wiring and separate 10 MiB server/32 MiB client character bounds, unified responses, server-only snapshot stat evidence, post-ACK guarded stat sanctions/audit, anti-cheat wire-v21, authenticated hot policy updates, generation-bound reports, generic security rejection, gameplay limits, first-join/two-phase final-save gate, report-codec, exact-name/module, assembly, " +
+Write-Output ("Fixed 120-second/30-second timeout wiring and separate 10 MiB server/32 MiB client character bounds, unified responses, server-only snapshot stat evidence, post-ACK guarded stat sanctions/audit, anti-cheat wire-v23, authenticated hot policy updates, generation-bound reports, generic security rejection, gameplay limits, first-join/two-phase final-save gate, report-codec, exact-name/module, assembly, " +
     "admin-entitlement, event-integration, flood-cap, and command-queue smoke tests passed.")

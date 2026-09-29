@@ -425,6 +425,10 @@ namespace ServerManager
         public byte[] Nonce { get; private set; }
 
         public byte[] Payload { get; private set; }
+
+        // Manifest-only presentation metadata. Never an account/character identity
+        // for authorization, storage, quotas, or administrator exemptions.
+        internal string ReportedCharacterName { get; set; } = string.Empty;
     }
 
     public sealed class ProtocolChallengeOptions
@@ -433,7 +437,7 @@ namespace ServerManager
         public const ushort ServerCharactersFlag = 1 << 1;
         public const ushort CheatEngineDetectionFlag = 1 << 2;
         public const ushort ExternalToolDetectionFlag = 1 << 3;
-        public const ushort ValheimToolerDetectionFlag = 1 << 4;
+        public const ushort InjectedCheatAssemblyDetectionFlag = 1 << 4;
         public const ushort CheatCommandMonitoringFlag = 1 << 5;
         public const ushort CheatCommandBlockingFlag = 1 << 6;
         public const ushort GenericProcessNameDetectionFlag = 1 << 7;
@@ -447,7 +451,7 @@ namespace ServerManager
             ServerCharactersFlag |
             CheatEngineDetectionFlag |
             ExternalToolDetectionFlag |
-            ValheimToolerDetectionFlag |
+            InjectedCheatAssemblyDetectionFlag |
             CheatCommandMonitoringFlag |
             CheatCommandBlockingFlag |
             GenericProcessNameDetectionFlag |
@@ -465,7 +469,7 @@ namespace ServerManager
             bool detectCheatEngine,
             bool detectExternalTools,
             bool detectGenericProcessNames,
-            bool detectValheimTooler,
+            bool detectInjectedCheatAssemblies,
             bool monitorCheatCommands,
             bool blockCheatCommands,
             bool allowAdminCheatCommands,
@@ -510,7 +514,7 @@ namespace ServerManager
             DetectCheatEngine = detectCheatEngine;
             DetectExternalTools = detectExternalTools;
             DetectGenericProcessNames = detectGenericProcessNames;
-            DetectValheimTooler = detectValheimTooler;
+            DetectInjectedCheatAssemblies = detectInjectedCheatAssemblies;
             MonitorCheatCommands = monitorCheatCommands;
             BlockCheatCommands = blockCheatCommands;
             AllowAdminCheatCommands = allowAdminCheatCommands;
@@ -533,7 +537,7 @@ namespace ServerManager
 
         public bool DetectGenericProcessNames { get; private set; }
 
-        public bool DetectValheimTooler { get; private set; }
+        public bool DetectInjectedCheatAssemblies { get; private set; }
 
         public bool MonitorCheatCommands { get; private set; }
 
@@ -555,7 +559,7 @@ namespace ServerManager
         {
             return new ProtocolChallengeOptions(EnforceManifest, ServerCharactersEnabled,
                 MaximumManifestBytes, DetectCheatEngine, DetectExternalTools,
-                DetectGenericProcessNames, DetectValheimTooler, MonitorCheatCommands,
+                DetectGenericProcessNames, DetectInjectedCheatAssemblies, MonitorCheatCommands,
                 BlockCheatCommands, AllowAdminCheatCommands, ProcessScanIntervalSeconds,
                 EnforceCarryWeightLimit, carryWeight, EnforceMaximumDamageLimit, damage);
         }
@@ -579,12 +583,18 @@ namespace ServerManager
     /// Fixed binary envelope for pre-PeerInfo protocol messages. Pair it with
     /// RawProtocolRpcTransport so ZRpc does not call ReadPackage before this decoder runs. The
     /// envelope itself deliberately avoids ZPackage.ReadString/ReadByteArray: every forged inner
-    /// length is checked before allocation.
+    /// length is checked before allocation. ManifestResponse alone appends a bounded ushort
+    /// UTF-8 length and display-only character name after the unchanged manifest payload.
     /// </summary>
     public static class ProtocolPacketCodec
     {
         private const int Magic = 0x52474D53; // "SMGR" when viewed as little-endian bytes.
-        public const ushort WireVersion = 21;
+        // Version 23 adds bounded display-only character names to manifest
+        // responses, retaining version 22's expanded cheat-detection coverage.
+        public const ushort WireVersion = 23;
+        internal const int MaximumReportedCharacterNameCharacters = 96;
+        internal const int MaximumReportedCharacterNameBytes = 384;
+        internal const int MaximumManifestMetadataBytes = sizeof(ushort) + MaximumReportedCharacterNameBytes;
 
         private const int MaximumPlayerMessageBytes = 1112; // key + four bounded arguments, including lengths
         private static readonly Encoding RejectUtf8 = new UTF8Encoding(false, true);
@@ -607,7 +617,12 @@ namespace ServerManager
             }
 
             ValidatePayloadForKind(packet.Kind, packet.Payload.Length, limits);
-            int totalLength = checked(FixedHeaderBytes + packet.Payload.Length);
+            byte[] reportedName = packet.Kind == ProtocolPacketKind.ManifestResponse
+                ? Encoding.UTF8.GetBytes(NormalizeReportedCharacterName(packet.ReportedCharacterName))
+                : ProtocolByteUtil.Empty;
+            int metadataBytes = packet.Kind == ProtocolPacketKind.ManifestResponse
+                ? sizeof(ushort) + reportedName.Length : 0;
+            int totalLength = checked(FixedHeaderBytes + packet.Payload.Length + metadataBytes);
             if (totalLength > limits.MaxPacketBytes)
             {
                 throw new ArgumentOutOfRangeException(nameof(packet), "Packet exceeds the configured limit.");
@@ -624,6 +639,11 @@ namespace ServerManager
                 writer.Write(packet.Nonce);
                 writer.Write(packet.Payload.Length);
                 writer.Write(packet.Payload);
+                if (packet.Kind == ProtocolPacketKind.ManifestResponse)
+                {
+                    writer.Write((ushort)reportedName.Length);
+                    writer.Write(reportedName);
+                }
                 writer.Flush();
                 return new ZPackage(stream.ToArray());
             }
@@ -753,6 +773,19 @@ namespace ServerManager
                     byte[] payload = ProtocolByteUtil.ReadExact(
                         reader,
                         payloadLength);
+                    string reportedName = string.Empty;
+                    if (kind == ProtocolPacketKind.ManifestResponse)
+                    {
+                        int nameLength = reader.ReadUInt16();
+                        if (nameLength > MaximumReportedCharacterNameBytes ||
+                            nameLength > stream.Length - stream.Position)
+                        {
+                            rejection = Malformed("The reported character name length was invalid.");
+                            return false;
+                        }
+                        reportedName = NormalizeReportedCharacterName(
+                            RejectUtf8.GetString(ProtocolByteUtil.ReadExact(reader, nameLength)));
+                    }
                     if (stream.Position != stream.Length)
                     {
                         rejection = new ProtocolRejection(
@@ -761,7 +794,10 @@ namespace ServerManager
                         return false;
                     }
 
-                    packet = new ProtocolPacket(kind, sequence, sessionId, nonce, payload);
+                    packet = new ProtocolPacket(kind, sequence, sessionId, nonce, payload)
+                    {
+                        ReportedCharacterName = reportedName
+                    };
                     return true;
                 }
             }
@@ -780,13 +816,19 @@ namespace ServerManager
                 rejection = Malformed("The protocol packet length overflowed.");
                 return false;
             }
+            catch (DecoderFallbackException)
+            {
+                rejection = Malformed("The reported character name was not valid UTF-8.");
+                return false;
+            }
         }
 
         public static ZPackage CreateManifestResponse(
             byte[] sessionId,
             byte[] nonce,
             byte[] manifestPayload,
-            ConnectionProtocolLimits limits)
+            ConnectionProtocolLimits limits,
+            string reportedCharacterName = "")
         {
             return Encode(
                 new ProtocolPacket(
@@ -794,8 +836,28 @@ namespace ServerManager
                     ProtocolSequence.ManifestResponse,
                     sessionId,
                     nonce,
-                    manifestPayload),
+                    manifestPayload)
+                {
+                    ReportedCharacterName = NormalizeReportedCharacterName(reportedCharacterName)
+                },
                 limits);
+        }
+
+        internal static string NormalizeReportedCharacterName(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            int count = Math.Min(value.Length, MaximumReportedCharacterNameCharacters);
+            StringBuilder result = new StringBuilder(count);
+            for (int index = 0; index < count; ++index)
+            {
+                char character = value[index];
+                System.Globalization.UnicodeCategory category = char.GetUnicodeCategory(character);
+                result.Append(char.IsControl(character) || char.IsSurrogate(character) ||
+                    category == System.Globalization.UnicodeCategory.Format ||
+                    category == System.Globalization.UnicodeCategory.LineSeparator ||
+                    category == System.Globalization.UnicodeCategory.ParagraphSeparator ? ' ' : character);
+            }
+            return result.ToString().Trim();
         }
 
         public static ZPackage CreateReadyAck(
@@ -981,7 +1043,7 @@ namespace ServerManager
                         (flags & ProtocolChallengeOptions.CheatEngineDetectionFlag) != 0,
                         (flags & ProtocolChallengeOptions.ExternalToolDetectionFlag) != 0,
                         (flags & ProtocolChallengeOptions.GenericProcessNameDetectionFlag) != 0,
-                        (flags & ProtocolChallengeOptions.ValheimToolerDetectionFlag) != 0,
+                        (flags & ProtocolChallengeOptions.InjectedCheatAssemblyDetectionFlag) != 0,
                         (flags & ProtocolChallengeOptions.CheatCommandMonitoringFlag) != 0,
                         (flags & ProtocolChallengeOptions.CheatCommandBlockingFlag) != 0,
                         (flags & ProtocolChallengeOptions.AllowAdminCheatCommandsFlag) != 0,
@@ -1050,9 +1112,9 @@ namespace ServerManager
                 flags |= ProtocolChallengeOptions.GenericProcessNameDetectionFlag;
             }
 
-            if (options.DetectValheimTooler)
+            if (options.DetectInjectedCheatAssemblies)
             {
-                flags |= ProtocolChallengeOptions.ValheimToolerDetectionFlag;
+                flags |= ProtocolChallengeOptions.InjectedCheatAssemblyDetectionFlag;
             }
 
             if (options.MonitorCheatCommands)
