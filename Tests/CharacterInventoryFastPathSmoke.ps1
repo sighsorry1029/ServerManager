@@ -104,7 +104,8 @@ function New-CustomDictionaryFixture {
         [string]$Value = "retained-value",
         [int]$Count = 1,
         [bool]$DuplicateKeys = $false,
-        [bool]$TruncatedValue = $false
+        [bool]$TruncatedValue = $false,
+        [bool]$InvalidUtf8Value = $false
     )
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
@@ -118,10 +119,15 @@ function New-CustomDictionaryFixture {
                 $writer.Write([byte[]]@(0x80, 0x80, 0x04, 0x41))
                 break
             }
+            if ($InvalidUtf8Value) {
+                # Two bytes, but not a valid UTF-8 continuation sequence.
+                $writer.Write([byte[]]@(0x02, 0xC3, 0x28))
+                continue
+            }
             $writer.Write($Value)
         }
         $writer.Flush()
-        return $stream.ToArray()
+        return ,$stream.ToArray()
     }
     finally { $writer.Dispose(); $stream.Dispose() }
 }
@@ -1018,13 +1024,66 @@ foreach ($retainedCustomKey in @("Bad.Key", "ServerManager.Probe")) {
         "The inventory fast path changed complete item/player custom-data bytes for '$retainedCustomKey'."
 }
 
-foreach ($malformedCustomCase in @("duplicate", "count", "negative_count", "oversize", "truncated")) {
+# Player-owned mod state may be larger than the ordinary 64 KiB string bound.
+# Keep the original bytes through validation, native profile serialization and
+# inventory replacement; granting more room must not normalize or discard it.
+$largePlayerDeserialize = $profileCodecType.GetMethod('DeserializeProfileFromBytes')
+$largePlayerSerialize = $profileCodecType.GetMethod('SerializeProfileToBytes')
+$largePlayerLocal = [Enum]::Parse($largePlayerDeserialize.GetParameters()[2].ParameterType, 'Local')
+foreach ($largePlayerValue in @(
+        ('progress-record;' * 5000),
+        ([string][char]0xAC00 * 24000))) {
+    $largePlayerByteCount = [Text.Encoding]::UTF8.GetByteCount($largePlayerValue)
+    Assert-True ($largePlayerByteCount -gt 64 * 1024) `
+        'The large player-state fixture must exceed 64 KiB in UTF-8 bytes.'
+    [byte[]]$largePlayerDictionary = New-CustomDictionaryFixture `
+        -Key 'pt.craft.work.v2' -Value $largePlayerValue
+    $largePlayerInner = New-InnerPlayerDataFixture $baseInventory $largePlayerDictionary
+    [byte[]]$largePlayerProfile = New-PlayerProfilePayload `
+        -CharacterName 'FastPathHero' -PlayerId ([long]76561198000000001) `
+        -PlayerData $largePlayerInner.Bytes
+    [byte[]]$largePlayerBefore = $largePlayerProfile.Clone()
+    $largePlayerValidated = Invoke-TwoArguments `
+        $extractValidatedSnapshot $profileCodec $identity $largePlayerProfile
+    $largePlayerSemantic = $semanticProperty.GetValue($largePlayerValidated)
+    Assert-True ($largePlayerSemantic.PlayerCustomDataKeys[0] -ceq 'pt.craft.work.v2' -and
+        (Test-ByteArrayEqual $largePlayerBefore $largePlayerProfile)) `
+        'Valid large player custom data was rejected, removed or mutated.'
+
+    $largePlayerLoaded = $largePlayerDeserialize.Invoke($profileCodec,
+        [object[]]@($largePlayerProfile, $null, $largePlayerLocal))
+    [byte[]]$largePlayerRoundTrip = $largePlayerSerialize.Invoke($profileCodec,
+        [object[]]@($largePlayerLoaded))
+    Assert-True (Test-ByteArrayEqual $largePlayerBefore $largePlayerRoundTrip) `
+        'Native profile deserialize/serialize changed large player custom-data bytes.'
+
+    $largePlayerReplaceArguments = [object[]]@(
+        $identity, $largePlayerProfile, $replacementInventory, $null)
+    [byte[]]$largePlayerMerged = $replaceInventory.Invoke($profileCodec, $largePlayerReplaceArguments)
+    $largePlayerInventoryStart = $largePlayerProfile.Length - $largePlayerInner.Bytes.Length +
+        $largePlayerInner.InventoryOffset
+    $largePlayerOldSuffix = $largePlayerInventoryStart + $baseInventory.Length
+    $largePlayerNewSuffix = $largePlayerInventoryStart + $replacementInventory.Length
+    Assert-True ((Test-ByteRangeEqual $largePlayerProfile $largePlayerOldSuffix `
+            $largePlayerMerged $largePlayerNewSuffix `
+            ($largePlayerProfile.Length - $largePlayerOldSuffix)) -and
+        (Test-ByteArrayEqual $largePlayerProfile $largePlayerBefore)) `
+        'The inventory hot path changed or truncated large player custom data.'
+    Invoke-TwoArguments $validateSnapshot $profileCodec $identity $largePlayerMerged | Out-Null
+}
+
+foreach ($malformedCustomCase in @(
+        "duplicate", "count", "negative_count", "oversize", "oversize_key",
+        "multibyte_value", "truncated", "invalid_utf8")) {
     $fixtureOptions = switch ($malformedCustomCase) {
         "duplicate" { @{ Count = 2; DuplicateKeys = $true } }
         "count" { @{ Count = 257 } }
         "negative_count" { @{ Count = -1 } }
         "oversize" { @{ Value = "v" * (64 * 1024 + 1) } }
+        "oversize_key" { @{ Key = "k" * (64 * 1024 + 1) } }
+        "multibyte_value" { @{ Value = [string][char]0xAC00 * 24000 } }
         "truncated" { @{ TruncatedValue = $true } }
+        "invalid_utf8" { @{ InvalidUtf8Value = $true } }
     }
     [byte[]]$badCustomDictionary = New-CustomDictionaryFixture @fixtureOptions
     [byte[]]$badCustomInventory = New-InventorySnapshotBytes `
@@ -1045,6 +1104,9 @@ foreach ($malformedCustomCase in @("duplicate", "count", "negative_count", "over
     }
     # Player dictionaries have their own 1024-entry ceiling, independent of items.
     if ($malformedCustomCase -eq "count") { $fixtureOptions.Count = 1025 }
+    # Only player values have the wider bound. Their UTF-8 success case is above.
+    if ($malformedCustomCase -eq "multibyte_value") { continue }
+    if ($malformedCustomCase -eq "oversize") { $fixtureOptions.Value = 'v' * (4 * 1024 * 1024 + 1) }
     [byte[]]$badPlayerDictionary = New-CustomDictionaryFixture @fixtureOptions
     $badPlayerInner = New-InnerPlayerDataFixture $baseInventory $badPlayerDictionary
     [byte[]]$badPlayerProfile = New-PlayerProfilePayload `
@@ -1060,6 +1122,94 @@ foreach ($malformedCustomCase in @("duplicate", "count", "negative_count", "over
             "Malformed player custom data must fail as a protocol error."
     }
 }
+
+# The wider player-value allowance still shares the original 4 MiB aggregate
+# string budget with inventory, known data and all other inner Player strings.
+$diagnosticKey = 'pt.craft.work.v2' + "`r`n`t" + [char]0x202E +
+    [char]0x2028 + [char]0x2029 + '"\\' + ('k' * 240) + 'hidden-key-tail'
+$privateValueMarker = 'private-value-must-not-appear'
+foreach ($largePlayerFailure in @('individual', 'aggregate')) {
+    $failureValueBytes = if ($largePlayerFailure -eq 'individual') {
+        4 * 1024 * 1024 + 1
+    } else { 2 * 1024 * 1024 }
+    $failureCount = if ($largePlayerFailure -eq 'individual') { 1 } else { 2 }
+    $failureValue = $privateValueMarker + ('v' * ($failureValueBytes - $privateValueMarker.Length))
+    [byte[]]$failureDictionary = New-CustomDictionaryFixture `
+        -Key $diagnosticKey -Value $failureValue -Count $failureCount
+    $failureInner = New-InnerPlayerDataFixture $baseInventory $failureDictionary
+    [byte[]]$failureProfile = New-PlayerProfilePayload `
+        -CharacterName 'FastPathHero' -PlayerId ([long]76561198000000001) `
+        -PlayerData $failureInner.Bytes
+    $failureReplaceArguments = [object[]]@($identity, $failureProfile, $replacementInventory, $null)
+    foreach ($largeFailureAction in @(
+            { Invoke-TwoArguments $validateSnapshot $profileCodec $identity $failureProfile },
+            { $replaceInventory.Invoke($profileCodec, $failureReplaceArguments) })) {
+        $largePlayerError = Assert-ThrowsLike $largeFailureAction '*player custom data value*' `
+            "The $largePlayerFailure player custom-data bound was not enforced."
+        $diagnostic = $largePlayerError.Message
+        Assert-True ($largePlayerError.GetType() -eq $protocolExceptionType -and
+            $diagnostic.Contains('pt.craft.work.v2') -and
+            $diagnostic.Contains('declaredBytes=' + $failureValueBytes) -and
+            $diagnostic.Contains('4194304') -and
+            -not $diagnostic.Contains($privateValueMarker) -and
+            -not $diagnostic.Contains('hidden-key-tail') -and
+            $diagnostic.Length -lt 600) `
+            'Custom-data failure diagnostics lost the key/byte bounds or exposed private/unbounded text.'
+        foreach ($unsafeDiagnosticCharacter in @("`r", "`n", "`t",
+                [string][char]0x202E, [string][char]0x2028, [string][char]0x2029)) {
+            Assert-True (-not $diagnostic.Contains($unsafeDiagnosticCharacter)) `
+                'Custom-data failure diagnostics retained unsafe key control/format characters.'
+        }
+        if ($largePlayerFailure -eq 'individual') {
+            Assert-True ($diagnostic.Contains('limitBytes=4194304')) `
+                'An individual player-value rejection did not report its byte limit.'
+        }
+        else {
+            Assert-True ($diagnostic.Contains('totalLimitBytes=4194304') -and
+                $diagnostic -match 'remainingBytes=\d+') `
+                'An aggregate rejection did not report remaining and total byte budgets.'
+        }
+    }
+}
+
+# Exercise the aggregate boundary itself without hard-coding the other strings
+# present in the full-profile fixture. Keys consume the same UTF-8 budget.
+$budgetReaderType = $profileCodecType.GetNestedType('InnerPlayerDataReader',
+    [Reflection.BindingFlags]::NonPublic)
+$budgetReaderConstructor = $budgetReaderType.GetConstructors(
+    [Reflection.BindingFlags]'Instance,NonPublic') | Select-Object -First 1
+$budgetReadDictionary = $budgetReaderType.GetMethod('ReadStringStringDictionaryKeys',
+    [Reflection.BindingFlags]'Instance,NonPublic')
+$budgetKey = 'budget.boundary'
+$budgetValueBytes = 4 * 1024 * 1024 - [Text.Encoding]::UTF8.GetByteCount($budgetKey)
+foreach ($budgetExcess in @(0, 1)) {
+    [byte[]]$budgetDictionary = New-CustomDictionaryFixture `
+        -Key $budgetKey -Value ('v' * ($budgetValueBytes + $budgetExcess))
+    $budgetReader = $budgetReaderConstructor.Invoke([object[]]@($budgetDictionary, [int]8192))
+    $budgetArguments = [object[]]@('player custom data', [int]1024, $true)
+    if ($budgetExcess -eq 0) {
+        $budgetKeys = $budgetReadDictionary.Invoke($budgetReader, $budgetArguments)
+        Assert-True ($budgetKeys.Count -eq 1 -and $budgetKeys[0] -ceq $budgetKey) `
+            'Exactly 4 MiB of aggregate UTF-8 string bytes was not accepted.'
+    }
+    else {
+        $budgetError = Assert-ThrowsLike `
+            { $budgetReadDictionary.Invoke($budgetReader, $budgetArguments) } `
+            '*totalLimitBytes=4194304*' 'The aggregate limit accepted 4 MiB plus one byte.'
+        Assert-True ($budgetError.Message.Contains('remainingBytes=' + $budgetValueBytes)) `
+            'The aggregate boundary diagnostic did not account for key bytes.'
+    }
+}
+
+$ordinaryOversizeInner = New-InnerPlayerDataFixture $baseInventory `
+    -Beard ('b' * (64 * 1024 + 1))
+[byte[]]$ordinaryOversizeProfile = New-PlayerProfilePayload `
+    -CharacterName 'FastPathHero' -PlayerId ([long]76561198000000001) `
+    -PlayerData $ordinaryOversizeInner.Bytes
+Assert-ThrowsLike `
+    { Invoke-TwoArguments $validateSnapshot $profileCodec $identity $ordinaryOversizeProfile } `
+    '*beard*' 'Large player custom-data support also relaxed the ordinary string limit.' | Out-Null
+Write-Output 'Player custom data: large ASCII/UTF-8 values, native roundtrip, hotpath preservation, byte/aggregate limits, safe diagnostics and malformed inputs passed.'
 
 [byte[]]$emptyProfile = New-PlayerProfilePayload `
     -CharacterName "FastPathHero" `

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.8
+
+- Allowed larger Player custom-data values within existing total-size safeguards, fixing save failures and disconnects when mods accumulate progression in one value.
+- Improved character-data size errors with the affected key and byte limits, without logging the stored value.
+- Added regression coverage for large mod data, inventory-update preservation, size boundaries and malformed data. Existing total-size limits and save protections remain unchanged.
+- Update ServerManager on both the server and all clients.
+
 ## 1.1.7
 
 - Improved compatibility when restoring equipped items during character loading. Failures limited to the final equipment step are logged without blocking entry; other load-failure safeguards remain in place.

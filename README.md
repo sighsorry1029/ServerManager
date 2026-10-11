@@ -214,6 +214,11 @@ saves can replace the server character with this reduced inventory, so restore
 a backup if removed items need to be recovered. Load-time changes to equipment,
 item flags, skills and custom data are also allowed.
 
+Large mod progression values in Player custom data are supported within the
+shared 4 MiB UTF-8 string budget. The full profile is still limited to 10 MiB.
+Oversized Player values are reported with the key and byte counts, never the
+value itself.
+
 If the final equipment re-equip step fails after the core character data has
 been read, ServerManager logs the error and continues loading without retrying
 equipment. Some items may remain unequipped or have incomplete effects; normal

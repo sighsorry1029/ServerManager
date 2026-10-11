@@ -1256,7 +1256,8 @@ namespace ServerManager
             List<string> playerCustomDataKeys =
                 reader.ReadStringStringDictionaryKeys(
                     "player custom data",
-                    maximumCount: 1024);
+                    maximumCount: 1024,
+                    allowLargeValues: true);
             float stamina = reader.ReadNonNegativeFinite("current stamina");
             float maximumEitr =
                 reader.ReadNonNegativeFinite("maximum eitr");
@@ -1539,18 +1540,35 @@ namespace ServerManager
                 return value;
             }
 
-            internal string ReadString(string fieldName)
+            internal string ReadString(
+                string fieldName,
+                int maximumBytes = MaximumStringBytes,
+                string? dictionaryKey = null)
             {
                 int byteCount = Read7BitLength(fieldName);
-                if (byteCount < 0 ||
-                    byteCount > MaximumStringBytes ||
-                    byteCount > _bytes.Length - _position ||
-                    byteCount >
-                        MaximumTotalStringBytes - _totalStringBytes)
+                if (byteCount < 0 || byteCount > maximumBytes)
                 {
                     throw new CharacterProtocolException(
-                        "The inner Player " + fieldName +
-                        " string exceeds the configured limit.");
+                        "The inner Player " + DescribeStringField(fieldName, dictionaryKey) +
+                        " string exceeds the configured limit. " +
+                        $"declaredBytes={byteCount}, limitBytes={maximumBytes} (UTF-8).");
+                }
+
+                if (byteCount > _bytes.Length - _position)
+                {
+                    throw new CharacterProtocolException(
+                        "The inner Player " + DescribeStringField(fieldName, dictionaryKey) +
+                        " string is truncated. " +
+                        $"declaredBytes={byteCount}, remainingBytes={_bytes.Length - _position}.");
+                }
+
+                if (byteCount > MaximumTotalStringBytes - _totalStringBytes)
+                {
+                    throw new CharacterProtocolException(
+                        "The inner Player " + DescribeStringField(fieldName, dictionaryKey) +
+                        " string exceeds the total string budget. " +
+                        $"declaredBytes={byteCount}, remainingBytes={MaximumTotalStringBytes - _totalStringBytes}, " +
+                        $"totalLimitBytes={MaximumTotalStringBytes} (UTF-8).");
                 }
 
                 string value;
@@ -1564,14 +1582,49 @@ namespace ServerManager
                 catch (DecoderFallbackException exception)
                 {
                     throw new CharacterProtocolException(
-                        "The inner Player " + fieldName +
-                        " string is not valid UTF-8.",
+                        "The inner Player " + DescribeStringField(fieldName, dictionaryKey) +
+                        " string is not valid UTF-8. " +
+                        $"declaredBytes={byteCount}, limitBytes={maximumBytes} (UTF-8).",
                         exception);
                 }
 
                 _position += byteCount;
                 _totalStringBytes += byteCount;
                 return value;
+            }
+
+            // Only format a bounded, single-line key on failure. Never log its value.
+            private static string DescribeStringField(string fieldName, string? dictionaryKey)
+            {
+                if (dictionaryKey == null)
+                {
+                    return fieldName;
+                }
+
+                const int maximumKeyCharacters = 160;
+                StringBuilder description = new StringBuilder(fieldName);
+                description.Append(" (key=\"");
+                int length = Math.Min(dictionaryKey.Length, maximumKeyCharacters);
+                for (int index = 0; index < length; ++index)
+                {
+                    char character = dictionaryKey[index];
+                    System.Globalization.UnicodeCategory category = char.GetUnicodeCategory(character);
+                    if (char.IsControl(character) || char.IsSurrogate(character) ||
+                        category == System.Globalization.UnicodeCategory.Format ||
+                        category == System.Globalization.UnicodeCategory.LineSeparator ||
+                        category == System.Globalization.UnicodeCategory.ParagraphSeparator)
+                    {
+                        description.Append('?');
+                    }
+                    else
+                    {
+                        if (character == '\\' || character == '"') description.Append('\\');
+                        description.Append(character);
+                    }
+                }
+
+                if (dictionaryKey.Length > length) description.Append("...");
+                return description.Append("\")").ToString();
             }
 
             internal void SkipStringSet(string fieldName)
@@ -1632,7 +1685,8 @@ namespace ServerManager
 
             internal List<string> ReadStringStringDictionaryKeys(
                 string fieldName,
-                int? maximumCount = null)
+                int? maximumCount = null,
+                bool allowLargeValues = false)
             {
                 int count = ReadCount(fieldName, maximumCount);
                 HashSet<string> keys =
@@ -1641,7 +1695,11 @@ namespace ServerManager
                 for (int index = 0; index < count; ++index)
                 {
                     string key = ReadString(fieldName + " key");
-                    ReadString(fieldName + " value");
+                    // Mods may store a growing progression document in one Player value.
+                    // Retain the shared 4 MiB string budget; keys and other fields stay small.
+                    ReadString(fieldName + " value",
+                        allowLargeValues ? MaximumTotalStringBytes : MaximumStringBytes,
+                        key);
                     if (!keys.Add(key))
                     {
                         throw new CharacterProtocolException(
@@ -1677,7 +1735,7 @@ namespace ServerManager
                 for (int index = 0; index < count; ++index)
                 {
                     string key = ReadString(fieldName + " key");
-                    string value = ReadString(fieldName + " value");
+                    string value = ReadString(fieldName + " value", dictionaryKey: key);
                     if (!keys.Add(key))
                     {
                         throw new CharacterProtocolException(
