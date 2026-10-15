@@ -53,8 +53,13 @@ if (-not $SkipBuild) {
 
 $smokeTests = @(
     [pscustomobject]@{
-        Name = "Valheim 1.0.7 serialization compatibility"
+        Name = "Valheim serialization metadata and shared wire helpers"
         File = "Valheim107CompatibilitySmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
+        Name = "Valheim 1.0.20 character schema and native backup compatibility"
+        File = "Valheim120CompatibilitySmoke.ps1"
         NeedsGamePath = $true
     },
     [pscustomobject]@{
@@ -78,7 +83,7 @@ $smokeTests = @(
         NeedsGamePath = $true
     },
     [pscustomobject]@{
-        Name = "Conflicting plugin load guard"
+        Name = "Capacity coexistence and required authentication hooks"
         File = "PluginIncompatibilitySmoke.ps1"
         NeedsGamePath = $true
     },

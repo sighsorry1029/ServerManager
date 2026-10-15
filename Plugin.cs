@@ -11,13 +11,12 @@ using UnityEngine;
 namespace ServerManager;
 
 [BepInPlugin(ModGuid, ModName, ModVersion)]
-[BepInIncompatibility("Azumatt.MaxPlayerCount")]
 [BepInDependency("sighsorry.Clan", BepInDependency.DependencyFlags.SoftDependency)]
 [BepInDependency("upgrade_world", BepInDependency.DependencyFlags.SoftDependency)]
 public sealed class ServerManagerPlugin : BaseUnityPlugin
 {
     internal const string ModName = "ServerManager";
-    internal const string ModVersion = "1.1.8";
+    internal const string ModVersion = "1.1.9";
     internal const string Author = "sighsorry";
     internal const string ModGuid = "sighsorry.ServerManager";
     internal const bool DefaultEnforceModPolicy = true;
@@ -118,6 +117,9 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
 
     private void UnpatchOwnedPatches()
     {
+        // This optional owner may outlive a failed runtime shutdown; it must not
+        // remove the authentication hooks sharing the vanilla PeerInfo method.
+        ServerPlayerCapacity.Reset();
         // HarmonyX can rebuild a method between individual removals. Remove
         // our finalizers first while their prefix state/__runOriginal still
         // exists, including initialization rollback after a partial PatchAll.

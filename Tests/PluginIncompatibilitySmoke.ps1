@@ -41,8 +41,8 @@ try {
         $_.ConstructorArguments.Count -eq 1 -and
         $_.ConstructorArguments[0].Value -ceq 'Azumatt.MaxPlayerCount'
     })
-    Assert-True ($playerLimitConflicts.Count -eq 1) `
-        'Declare the exact case-sensitive Azumatt.MaxPlayerCount GUID once, so BepInEx skips ServerManager before Awake when both are present.'
+    Assert-True ($playerLimitConflicts.Count -eq 0) `
+        'MaxPlayerCount must not prevent ServerManager from loading; capacity alone must yield to the external mod.'
 
     $dependencies = @($plugin.CustomAttributes | Where-Object {
         $_.AttributeType.FullName -eq 'BepInEx.BepInDependency'
@@ -60,8 +60,8 @@ try {
     Assert-True (@($definition.MainModule.AssemblyReferences | Where-Object Name -eq 'NewCron').Count -eq 0) `
         'Integrated scheduling must not require the external NewCron assembly at runtime.'
 
-    # Declaring plugin incompatibility must not remove or conditionally disable
-    # essential authentication hooks for normal, nonconflicting installations.
+    # Capacity compatibility must not remove or conditionally disable essential
+    # authentication hooks, including when another mod owns the player limit.
     $peerPatch = $definition.MainModule.Types | Where-Object FullName -eq 'ServerManager.ServerPeerInfoPatch'
     Assert-True ($null -ne $peerPatch) 'The critical PeerInfo authentication patch class is missing.'
     $targets = @($peerPatch.CustomAttributes | Where-Object {
@@ -71,6 +71,8 @@ try {
         $_.ConstructorArguments[1].Value -eq 'RPC_PeerInfo'
     })
     Assert-True ($targets.Count -eq 1) 'Critical authentication hooks must still target vanilla ZNet.RPC_PeerInfo.'
+    Assert-True (@($peerPatch.Methods | Where-Object Name -in @('Prepare', 'Transpiler')).Count -eq 0) `
+        'Optional capacity installation must be separate from the mandatory PeerInfo authentication patch.'
     foreach ($entry in @(
         @('Prefix', 'BeforeServerPeerInfo'),
         @('Postfix', 'AfterServerPeerInfo'),

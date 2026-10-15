@@ -1,5 +1,6 @@
-# Independent wire fixtures for Valheim 1.0.7. Do not rewrite game schema
-# markers to make a fixture pass; the original DLL remains the API reference.
+# Independent wire helpers shared by Valheim 1.0.7 and 1.0.20 fixtures.
+# Statistics and compact item record shapes are unchanged; callers explicitly
+# select profile/player/inventory markers. Never rewrite game DLL markers.
 if (-not ('Valheim107Fixture' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;

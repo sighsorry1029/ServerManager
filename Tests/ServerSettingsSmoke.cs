@@ -40,7 +40,7 @@ internal static class ServerSettingsSmoke
     private static void Parser()
     {
         ServerSettings defaults = ServerSettings.Parse(ServerSettings.DefaultYaml);
-        Check(defaults.MaxPlayers == 24 && defaults.MaxCharactersPerAccount == 3 && defaults.BackupsPerProfile == 30 && defaults.LoadServerCharacterOnJoin &&
+        Check(defaults.MaxPlayers == 10 && defaults.MaxCharactersPerAccount == 3 && defaults.BackupsPerProfile == 30 && defaults.LoadServerCharacterOnJoin &&
             defaults.CheatDetectionResponse == DetectionAction.Kick && defaults.StatLimitResponse == DetectionAction.Log &&
             defaults.MaximumHealth == 800f && defaults.MaximumStamina == 800f && defaults.MaximumEitr == 500f &&
             defaults.MaximumCarryWeight == 2000f && defaults.MaximumDamage == 50000f &&
@@ -60,21 +60,25 @@ internal static class ServerSettingsSmoke
             ServerSettings.Parse("{}").MaxCharactersPerAccount == 3 &&
             ServerSettings.Parse("serverSettings: {}").MaxCharactersPerAccount == 3,
             "The renamed character quota defaults to three in every omitted/default path");
-        Check(ServerSettings.Defaults.MaxPlayers == 24 &&
-            ServerSettings.Parse("{}").MaxPlayers == 24 &&
-            ServerSettings.Parse("serverSettings: {}").MaxPlayers == 24,
-            "Concurrent player capacity defaults to 24 in every omitted/default path");
-        Check(ServerSettings.Parse("serverSettings: {maxPlayers: 1}").MaxPlayers == 1 &&
-            ServerSettings.Parse("serverSettings: {maxPlayers: 64}").MaxPlayers == 64 &&
-            ServerSettings.Parse("serverSettings: {maxPlayers: 10}").MaxPlayers == 10,
-            "Capacity accepts both inclusive bounds and preserves an explicit vanilla-sized limit");
+        Check(ServerSettings.Defaults.MaxPlayers == 10 &&
+            ServerSettings.Parse("{}").MaxPlayers == 10 &&
+            ServerSettings.Parse("serverSettings: {}").MaxPlayers == 10,
+            "Concurrent player override defaults to the disabled value 10 in every omitted/default path");
+        Check(ServerSettings.Parse("serverSettings: {maxPlayers: 10}").MaxPlayers == 10 &&
+            ServerSettings.Parse("serverSettings: {maxPlayers: 11}").MaxPlayers == 11 &&
+            ServerSettings.Parse("serverSettings: {maxPlayers: 100}").MaxPlayers == 100 &&
+            ServerSettings.Parse("serverSettings: {maxPlayers: 250}").MaxPlayers == 250,
+            "Capacity accepts disabled, first enabled, hundred-player and upper-bound values");
+        Check(ServerSettings.Parse("serverSettings: {maxPlayers: 24}").MaxPlayers == 24 &&
+            ServerSettings.Parse("serverSettings: {maxPlayers: 64}").MaxPlayers == 64,
+            "Existing explicit values in the new range remain unchanged");
         Check(ServerSettings.Defaults.LoadServerCharacterOnJoin && ServerSettings.Parse("{}").LoadServerCharacterOnJoin &&
             ServerSettings.Parse("serverSettings: {}").LoadServerCharacterOnJoin &&
             ServerSettings.Parse("serverSettings: {loadServerCharacterOnJoin: true}").LoadServerCharacterOnJoin,
             "Server character loading defaults on and accepts an explicit true boolean");
         Check(!ServerSettings.Parse("serverSettings: {loadServerCharacterOnJoin: false}").LoadServerCharacterOnJoin,
             "An explicit false selects local-character capture on the next connection");
-        ServerSettings settings = ServerSettings.Parse(@"serverSettings: {maxPlayers: 64, maxCharactersPerAccount: 128, backupsPerProfile: 50, loadServerCharacterOnJoin: false}
+        ServerSettings settings = ServerSettings.Parse(@"serverSettings: {maxPlayers: 250, maxCharactersPerAccount: 128, backupsPerProfile: 50, loadServerCharacterOnJoin: false}
 forbiddenItems: [Wood, Stone]
 cheatDetection: {action: 'ban'}
 statCaps: {action: kick, health: 1000000, stamina: 1.5, eitr: 5e2, weight: 1, damage: 1000000000}
@@ -82,7 +86,7 @@ startItems:
   - Wood, 20
   - ' Stone , 10 '
   - Resin");
-        Check(settings.MaxPlayers == 64 && settings.MaxCharactersPerAccount == 128 && settings.BackupsPerProfile == 50 && !settings.LoadServerCharacterOnJoin &&
+        Check(settings.MaxPlayers == 250 && settings.MaxCharactersPerAccount == 128 && settings.BackupsPerProfile == 50 && !settings.LoadServerCharacterOnJoin &&
             settings.CheatDetectionResponse == DetectionAction.Ban && settings.StatLimitResponse == DetectionAction.Kick &&
             settings.MaximumHealth == 1000000 && settings.MaximumStamina == 1.5f && settings.MaximumEitr == 500 &&
             settings.MaximumCarryWeight == 1 && settings.MaximumDamage == 1000000000 &&
@@ -117,12 +121,13 @@ startItems:
         {
             "", "# comments only", "[]", "null", "serverSettings: []", "serverSettings: null",
             "serverSettings: {maxPlayers: 0}", "serverSettings: {maxPlayers: -1}",
-            "serverSettings: {maxPlayers: 65}", "serverSettings: {maxPlayers: 2147483648}",
+            "serverSettings: {maxPlayers: 1}", "serverSettings: {maxPlayers: 9}",
+            "serverSettings: {maxPlayers: 251}", "serverSettings: {maxPlayers: 2147483648}",
             "serverSettings: {maxPlayers: '24'}", "serverSettings: {maxPlayers: 24.0}",
             "serverSettings: {maxPlayers: 2.4e1}", "serverSettings: {maxPlayers: true}",
             "serverSettings: {maxPlayers: null}", "serverSettings: {maxPlayers: ~}",
             "serverSettings: {maxPlayers: []}", "serverSettings: {maxPlayers: {}}",
-            "serverSettings: {maxPlayers: +24}", "serverSettings: {maxPlayers: 1, maxPlayers: 64}",
+            "serverSettings: {maxPlayers: +24}", "serverSettings: {maxPlayers: 10, maxPlayers: 64}",
             "serverSettings: {maxCharactersPerAccount: 0}", "serverSettings: {maxCharactersPerAccount: 129}",
             "serverSettings: {maxCharactersPerAccount: '5'}", "serverSettings: {maxCharactersPerAccount: 5.0}",
             "serverSettings: {maxCharactersPerAccount: true}", "serverSettings: {backupsPerProfile: -1}",
@@ -194,7 +199,7 @@ startItems:
             ++applies;
             return true;
         }
-        Check(service.EnsureLoaded(root, Apply) && applies == 1 && service.Current!.MaxPlayers == 24 &&
+        Check(service.EnsureLoaded(root, Apply) && applies == 1 && service.Current!.MaxPlayers == 10 &&
             service.Current.MaxCharactersPerAccount == 3,
             "Missing startup file is created and synchronously applied before readiness");
         ServerSettings initial = service.Current!;
@@ -210,9 +215,10 @@ startItems:
             "Generated configuration documents server-loading default and connection-scoped mode changes without a legacy key");
         Check(generated.Contains("maxCharactersPerAccount: 3") && !generated.Contains("maxProfilesPerAccount"),
             "Generated YAML contains only the new three-character quota key; no legacy alias is advertised");
-        Check(generated.Contains("maxPlayers: 24") && generated.Contains("including the listen host") &&
-            generated.Contains("Lowering does not kick existing players"),
-            "Generated YAML documents the inclusive concurrent-player limit and non-kicking decrease policy");
+        Check(generated.Contains("maxPlayers: 10") && generated.Contains("10 disables this override") &&
+            generated.Contains("11-250") && generated.Contains("including the listen host") &&
+            generated.Contains("Restart required") && generated.Contains("other settings still reload"),
+            "Generated YAML documents disabled default, inclusive bounds and session-scoped application");
         for (int index = 0; index < 100; ++index) service.Tick(root, Apply);
         Check(applies == 1 && PendingRead.GetValue(service) == null, "Ordinary frames schedule no disk reads before poll interval");
 
@@ -223,7 +229,7 @@ startItems:
         Poll(service, root, Apply);
         Check(applies == 2 && service.Current!.MaxPlayers == 32 && service.Current.MaxCharactersPerAccount == 7 && !service.Current.LoadServerCharacterOnJoin &&
             service.Current.StartItems.Count == 1 && service.Current.StartItems["Wood"] == 2 &&
-            initial.MaxPlayers == 24 && initial.LoadServerCharacterOnJoin && HasDefaultStartItems(initial),
+            initial.MaxPlayers == 10 && initial.LoadServerCharacterOnJoin && HasDefaultStartItems(initial),
             "Two identical samples apply the complete candidate");
         Check(File.ReadAllText(path, Utf8) == edit, "Reload never rewrites existing contents/comments");
         DateTime stamp = File.GetLastWriteTimeUtc(path);
@@ -233,7 +239,8 @@ startItems:
         Check(service.Current!.MaxCharactersPerAccount == 6, "Same-length edits with unchanged timestamps are detected by content");
 
         foreach (string bad in new[] { "statCaps: {health: .nan}", "startItems:\n  - UnknownPrefab", "startItems: {Wood: 1}",
-            "serverSettings: {maxPlayers: 65, maxCharactersPerAccount: 9, loadServerCharacterOnJoin: true}",
+            "serverSettings: {maxPlayers: 251, maxCharactersPerAccount: 9, loadServerCharacterOnJoin: true}",
+            "serverSettings: {maxPlayers: 9, maxCharactersPerAccount: 9, loadServerCharacterOnJoin: true}",
             "serverSettings: {maxPlayers: 0, maxCharactersPerAccount: 9}",
             "serverSettings: {maxPlayers: 12, maxCharactersPerAccount: 0}",
             "serverSettings: {maxPlayers: 12}\nstartItems:\n  - UnknownPrefab",
@@ -269,7 +276,7 @@ startItems:
         Check(service.Current!.MaxCharactersPerAccount == 6, "Non-UTF8 file leaves current policy untouched");
         File.WriteAllText(path, "{}", Utf8);
         Poll(service, root, Apply); Poll(service, root, Apply);
-        Check(service.Current!.MaxPlayers == 24 && service.Current.MaxCharactersPerAccount == 3 && service.Current.LoadServerCharacterOnJoin &&
+        Check(service.Current!.MaxPlayers == 10 && service.Current.MaxCharactersPerAccount == 3 && service.Current.LoadServerCharacterOnJoin &&
             HasDefaultStartItems(service.Current) && service.Current.MaximumDamage == 50000f,
             "Valid restoration recovers and omitted fields reset to the new defaults");
         File.WriteAllText(path, "serverSettings: {loadServerCharacterOnJoin: false}", Utf8);

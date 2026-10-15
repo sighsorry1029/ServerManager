@@ -116,7 +116,9 @@ Load-TestDependency (Join-Path $managedRoot 'assembly_utils.dll') {
 $game = Load-TestDependency (Join-Path $managedRoot 'assembly_valheim.dll') {
     param($definition)
     $version = $definition.MainModule.Types | Where-Object FullName -eq 'Version'
-    Assert-True (($version.Fields | Where-Object Name -eq 'c_PlayerVersion').Constant -eq 46) 'Expected original Valheim 1.0.7 profile marker.'
+    Assert-True (($version.Fields | Where-Object Name -eq 'c_PlayerVersion').Constant -eq 47) 'Expected original Valheim 1.0.20 profile marker.'
+    Assert-True (($version.Fields | Where-Object Name -eq 'c_PlayerDataVersion').Constant -eq 34) 'Expected original Valheim 1.0.20 Player marker.'
+    Assert-True (($version.Fields | Where-Object Name -eq 'c_ItemDataVersion').Constant -eq 110) 'Expected original Valheim 1.0.20 inventory marker.'
 }
 $fixtureAssemblyResolver = [ResolveEventHandler] {
     param($sender, $eventArgs)
@@ -154,7 +156,7 @@ $plugin = Load-TestDependency $pluginPath {
 }
 $resolver.Dispose()
 
-function New-InventoryPayload([object[]]$Items = @()) {
+function New-InventoryPayload([object[]]$Items = @(), [int]$InventoryVersion = 110) {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     function Item-Value([Collections.IDictionary]$Item, [string]$Key, $Fallback) {
@@ -162,7 +164,7 @@ function New-InventoryPayload([object[]]$Items = @()) {
         return $Fallback
     }
     try {
-        $writer.Write([int]109); $writer.Write([uint16]$Items.Count)
+        $writer.Write($InventoryVersion); $writer.Write([uint16]$Items.Count)
         $slot = 0
         foreach ($item in $Items) {
             $customStream = [IO.MemoryStream]::new()
@@ -190,29 +192,43 @@ function New-InventoryPayload([object[]]$Items = @()) {
 function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
     [string]$ItemPrefab = '', [bool]$UsedCheats = $false, [bool]$HasPlayerData = $true,
     [object[]]$SkillValues = @(), [object[]]$InventoryItems = $null,
-    [string[]]$KnownBiomes = @(), [byte[]]$BuildMenuState = @()) {
+    [string[]]$KnownBiomes = @(), [byte[]]$BuildMenuState = @(),
+    [int]$ProfileVersion = 47, [int]$PlayerDataVersion = 34, [int]$InventoryVersion = 110,
+    [Collections.IDictionary]$PseudoCounters = @{}, [Collections.IDictionary]$ItemUpgradeSeeds = @{},
+    [Collections.IDictionary]$PlayerCustomData = @{}, [byte[]]$PlayerTail = $null,
+    [string]$Beard = '', [string]$Hair = '') {
     $inner = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($inner)
     try {
-        $writer.Write([int]33)
+        $writer.Write($PlayerDataVersion)
         foreach ($value in @([single]25, [single]25, [single]50, [single]0)) { $writer.Write($value) }
         $writer.Write(''); $writer.Write([single]0)
         if ($null -eq $InventoryItems) { $InventoryItems = if ($ItemPrefab) { @(@{ Prefab = $ItemPrefab }) } else { @() } }
-        $writer.Write([byte[]](New-InventoryPayload $InventoryItems))
+        $writer.Write([byte[]](New-InventoryPayload $InventoryItems -InventoryVersion $InventoryVersion))
         for ($index = 0; $index -lt 6; ++$index) { $writer.Write([int]0) }
         $writer.Write([int]$KnownBiomes.Count)
         foreach ($biome in $KnownBiomes) { $writer.Write($biome) }
         $writer.Write([int]0) # known texts
-        $writer.Write(''); $writer.Write('')
+        $writer.Write($Beard); $writer.Write($Hair)
         for ($index = 0; $index -lt 6; ++$index) { $writer.Write([single]0) }
         $writer.Write([int]0); $writer.Write([int]0)
         $writer.Write([int]2); $writer.Write([int]$SkillValues.Count)
         foreach ($skill in $SkillValues) {
             $writer.Write([int]$skill.Id); $writer.Write([single]$skill.Level); $writer.Write([single]$skill.Accumulator)
         }
-        $writer.Write([int]0)
+        $writer.Write([int]$PlayerCustomData.Count)
+        foreach ($key in $PlayerCustomData.Keys) { $writer.Write([string]$key); $writer.Write([string]$PlayerCustomData[$key]) }
         $writer.Write([single]50); $writer.Write([single]0); $writer.Write([single]0)
         $writer.Write([int]$BuildMenuState.Length); $writer.Write($BuildMenuState)
+        if ($PlayerDataVersion -ge 34) {
+            if ($null -ne $PlayerTail) { $writer.Write($PlayerTail) }
+            else {
+                foreach ($dictionary in @($PseudoCounters, $ItemUpgradeSeeds)) {
+                    $writer.Write([int]$dictionary.Count)
+                    foreach ($key in $dictionary.Keys) { $writer.Write([int]$key); $writer.Write([int]$dictionary[$key]) }
+                }
+            }
+        }
         $writer.Flush()
         [byte[]]$innerBytes = $inner.ToArray()
     }
@@ -220,7 +236,7 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
     $outer = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($outer)
     try {
-        $writer.Write([int]46); [Valheim107Fixture]::Statistics($writer)
+        $writer.Write($ProfileVersion); [Valheim107Fixture]::Statistics($writer)
         $writer.Write($false); $writer.Write([int]0)
         $writer.Write($Name); $writer.Write($PlayerId); $writer.Write($Seed)
         $writer.Write($UsedCheats); $writer.Write([long]0)
@@ -235,7 +251,7 @@ function New-Request($Identity, [Guid]$SessionId, [long]$Revision, [long]$BaseRe
     [byte[]]$Payload, [string]$Kind = 'SaveRequest') {
     return $script:plugin.GetType('ServerManager.CharacterEnvelope').GetMethod('Create').Invoke($null,
         [object[]]@([Enum]::Parse($script:plugin.GetType('ServerManager.CharacterEnvelopeKind'), $Kind),
-            $Revision, $BaseRevision, $SessionId, $Identity, [DateTime]::UtcNow, [int]46, $Payload))
+            $Revision, $BaseRevision, $SessionId, $Identity, [DateTime]::UtcNow, [int]47, $Payload))
 }
 function Get-HostSession($Opened) {
     $lookup = [object[]]@($Opened.Snapshot.SessionId, $null)
@@ -350,7 +366,7 @@ try {
     Assert-True (-not (Get-Hidden (Get-HostSession $authoritative) 'BackupOnly') -and
         $authoritative.Snapshot.Revision -eq 3 -and
         (Test-Bytes $authoritative.Snapshot.GetPayloadCopy() $capture3)) 'Mode-off reconnect did not select latest acknowledged RAM.'
-    $inventory = [byte[]]@([BitConverter]::GetBytes([int]109) + [BitConverter]::GetBytes([uint16]0))
+    $inventory = [byte[]]@([BitConverter]::GetBytes([int]110) + [BitConverter]::GetBytes([uint16]0))
     $inventorySave = New-Request $identity $authoritative.Snapshot.SessionId 4 3 $inventory 'InventorySaveRequest'
     Assert-True (Invoke-Hidden $service 'HandleLocalHostSaveRequest' @($authoritative.Snapshot.SessionId, $inventorySave)).Accepted 'Capture did not establish inventory fast-path baseline.'
     $latest = Invoke-Hidden $service 'GetLocalHostSnapshot' @($authoritative.Snapshot.SessionId)

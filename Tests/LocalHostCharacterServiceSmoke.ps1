@@ -129,7 +129,7 @@ $game = Load-TestDependency (Join-Path $managedRoot "assembly_valheim.dll") {
     $field = $version.Fields | Where-Object Name -eq "c_PlayerVersion"
     Assert-True ($null -ne $field -and $field.HasConstant) "PlayerProfile version marker changed."
     # Assert the installed game marker without altering metadata.
-    Assert-True ($field.Constant -eq 46) 'Expected original Valheim 1.0.7 profile marker.'
+    Assert-True ($field.Constant -eq 47) 'Expected original Valheim 1.0.20 profile marker.'
 }
 # CoreCLR isolates byte-loaded assemblies; resolve only matching images that
 # this fixture has already loaded, preserving the in-memory native-call shims.
@@ -173,7 +173,7 @@ function New-Request([object]$Identity, [Guid]$SessionId, [long]$Revision,
     [long]$BaseRevision, [byte[]]$Payload, [string]$Kind = "SaveRequest") {
     return $script:createEnvelope.Invoke($null, [object[]]@(
         [Enum]::Parse($script:kindType, $Kind), $Revision, $BaseRevision,
-        $SessionId, $Identity, [DateTime]::UtcNow, [int]46, $Payload))
+        $SessionId, $Identity, [DateTime]::UtcNow, [int]47, $Payload))
 }
 
 function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
@@ -184,10 +184,10 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
     $inner = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($inner)
     try {
-        $writer.Write([int]33)
+        $writer.Write([int]34)
         foreach ($value in @($MaximumHealth, $Health, $MaximumStamina, [single]0)) { $writer.Write($value) }
         $writer.Write(""); $writer.Write([single]0)
-        $writer.Write([int]109)
+        $writer.Write([int]110)
         $writer.Write([uint16]([bool]$ItemPrefab))
         if ($ItemPrefab) {
             [Valheim107Fixture]::Item($writer, $ItemPrefab, 1, 0, 0, 0, $false,
@@ -200,6 +200,7 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
         $writer.Write([int]2); $writer.Write([int]0); $writer.Write([int]0)
         $writer.Write($Stamina); $writer.Write($MaximumEitr); $writer.Write($Eitr)
         $writer.Write([int]0) # build menu byte array
+        $writer.Write([int]0); $writer.Write([int]0) # drop counters and item upgrade seeds
         $writer.Flush()
         [byte[]]$innerBytes = $inner.ToArray()
     }
@@ -207,7 +208,7 @@ function New-ProfilePayload([string]$Name, [long]$PlayerId, [string]$Seed,
     $outer = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($outer)
     try {
-        $writer.Write([int]46); [Valheim107Fixture]::Statistics($writer)
+        $writer.Write([int]47); [Valheim107Fixture]::Statistics($writer)
         $writer.Write($false); $writer.Write([int]0)
         $writer.Write($Name); $writer.Write($PlayerId); $writer.Write($Seed)
         $writer.Write($UsedCheats); $writer.Write([long]0)
@@ -274,7 +275,7 @@ try {
     [byte[]]$flaggedRoundTrip = $serializeProfile.Invoke($profiles, [object[]]@($flaggedProfile))
     Assert-True ((Get-Hidden ($extractValidated.Invoke($profiles, [object[]]@($identity, $flaggedRoundTrip))) 'SemanticSnapshot').UsedCheats) `
         'Profile serialization rejected or cleared the cheat flag.'
-    [byte[]]$emptyInventory = @([BitConverter]::GetBytes([int]109) + [BitConverter]::GetBytes([uint16]0))
+    [byte[]]$emptyInventory = @([BitConverter]::GetBytes([int]110) + [BitConverter]::GetBytes([uint16]0))
     $spliceArguments = [object[]]@($identity, $flaggedRoundTrip, $emptyInventory, $null)
     [byte[]]$flaggedSplice = $profileCodecType.GetMethod('ReplaceInventorySnapshot', $allInstance).Invoke($profiles, $spliceArguments)
     Assert-True ((Get-Hidden $spliceArguments[3] 'SemanticSnapshot').UsedCheats -and
@@ -412,7 +413,7 @@ try {
     }
 
     # Inventory requests reuse the same revision path and expose full materialized profiles.
-    [byte[]]$inventory = @([BitConverter]::GetBytes([int]109) + [BitConverter]::GetBytes([uint16]0))
+    [byte[]]$inventory = @([BitConverter]::GetBytes([int]110) + [BitConverter]::GetBytes([uint16]0))
     $inventoryRequest = New-Request $identity $sessionId 3 2 $inventory "InventorySaveRequest"
     $inventoryAccepted = Invoke-Hidden $service "HandleLocalHostSaveRequest" @($sessionId, $inventoryRequest)
     Assert-True ($inventoryAccepted.Accepted -and $inventoryAccepted.StatLimitFindings.Count -eq 0 -and

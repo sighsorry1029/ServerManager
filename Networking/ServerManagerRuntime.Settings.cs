@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using ServerManager.Commands;
-using Steamworks;
 
 namespace ServerManager;
 
@@ -24,44 +23,9 @@ internal static partial class ServerManagerRuntime
     internal static ServerSettings CurrentServerSettings => _currentServerSettings ??
         throw new InvalidOperationException("The server settings have not been loaded.");
 
-    // Admission is already gated on settings readiness. Steam may advertise
-    // earlier during startup, so it uses the same default until settings load.
-    internal static int GetServerPlayerLimit() =>
-        _currentServerSettings?.MaxPlayers ?? ServerSettings.Defaults.MaxPlayers;
-
-    internal static void RefreshServerPlayerLimitAdvertisement()
-    {
-        ZNet? server = ZNet.instance;
-        if (server == null || !server.IsServer() ||
-            ZNet.m_onlineBackend != OnlineBackendType.Steamworks) return;
-        try
-        {
-            if (server.IsDedicated())
-            {
-                // A listen host initializes SteamAPI, not the GameServer API.
-                // Never initialize either API ourselves or probe it per frame.
-                if (GameServer.GetHSteamPipe() != (HSteamPipe)0)
-                    SteamGameServer.SetMaxPlayerCount(GetServerPlayerLimit());
-                return;
-            }
-            if (!SteamManager.Initialized || ZSteamMatchmaking.instance == null) return;
-            CSteamID lobby = ValheimPrivateAccess.GetSteamServerLobby(ZSteamMatchmaking.instance);
-            if (lobby != CSteamID.Nil &&
-                !SteamMatchmaking.SetLobbyMemberLimit(lobby, GetServerPlayerLimit()))
-                ServerManagerPlugin.Log.LogWarning(
-                    "Steam could not update the advertised player limit. The configured admission limit remains active.");
-        }
-        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
-        {
-            // Advertising is best-effort; a native/listing failure must not
-            // partially roll back an otherwise valid YAML policy snapshot.
-            ServerManagerPlugin.Log.LogWarning(
-                "Steam player-limit advertisement could not be updated: " + exception.Message);
-        }
-    }
-
     private static void ResetServerSettings()
     {
+        ServerPlayerCapacity.Reset();
         unchecked { ++_settingsLifecycleGeneration; }
         _settingsDeferredOpenNetwork = null;
         _settingsDeferredOpenGame = null;
@@ -166,6 +130,14 @@ internal static partial class ServerManagerRuntime
             ServerManagerPlugin.Log.LogWarning("ServerManager.yml item policy was rejected: " + exception.Message);
             throw;
         }
+        catch (NotSupportedException)
+        {
+            ServerManagerPlugin.Log.LogWarning(
+                "ServerManager.yml character compatibility check failed. " +
+                ValheimPlayerProfileCodec.DescribeRuntimeSchema() +
+                " Check ServerManager compatibility with this Valheim version; editing YAML cannot fix a save-schema mismatch.");
+            throw;
+        }
         CharacterSemanticPolicy storedPolicy = CharacterSemanticPolicy.FromSettings(
             settings, CharacterSemanticPolicyMode.Observe);
         CharacterSemanticPolicy incomingPolicy = CharacterSemanticPolicy.FromSettings(
@@ -200,10 +172,7 @@ internal static partial class ServerManagerRuntime
                 "; this setting applies to new connections. Existing character sessions keep their admission mode.");
         if (previousMaxPlayers != settings.MaxPlayers)
         {
-            ServerManagerPlugin.Log.LogInfo(
-                "Server maxPlayers=" + settings.MaxPlayers +
-                "; includes the listen host. Existing players are not kicked when the limit is lowered.");
-            RefreshServerPlayerLimitAdvertisement();
+            ServerPlayerCapacity.NotifyReload(settings.MaxPlayers);
         }
         return true;
     }

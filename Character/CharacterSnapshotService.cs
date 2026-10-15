@@ -339,11 +339,11 @@ namespace ServerManager
                     if (stored == null)
                         return Result(false, "character_not_found", "A valid existing primary is required. This command does not recover missing or corrupt primaries.");
                     CharacterEnvelope current = stored.Envelope;
-                    if (current.ValheimProfileVersion != ValheimPlayerProfileCodec.SupportedPlayerProfileVersion)
+                    if (!ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(current.ValheimProfileVersion))
                         return Result(false, "unsupported_profile_version", "The current primary has an unsupported profile version. No files were changed.");
                     CharacterValidatedSnapshot currentProfile = ValidateSnapshotDetailed(identity, current.PayloadUnsafe);
                     CharacterEnvelope backup = _repository.ReadAdminBackup(identity, key, backupId);
-                    if (backup.ValheimProfileVersion != ValheimPlayerProfileCodec.SupportedPlayerProfileVersion)
+                    if (!ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(backup.ValheimProfileVersion))
                         return Result(false, "unsupported_profile_version", "The selected backup has an unsupported profile version. No files were changed.");
                     CharacterValidatedSnapshot candidate = ValidateSnapshotDetailed(identity, backup.PayloadUnsafe);
                     if (backup.RequiresFreshLocalCharacter || !candidate.SemanticSnapshot.HasPlayerData)
@@ -512,6 +512,10 @@ namespace ServerManager
                 // Clone before validation: neither the caller nor serialization
                 // may alter the bytes on which Ready and subsequent saves rely.
                 byte[] payload = CharacterCrypto.Clone(localProfile);
+                if (ValheimPlayerProfileCodec.ReadStoredProfileVersion(payload) !=
+                    ValheimPlayerProfileCodec.SupportedPlayerProfileVersion)
+                    throw new CharacterProtocolException(
+                        "The local backup capture must use the current PlayerProfile version.");
                 CharacterValidatedSnapshot candidate = ValidateSnapshotDetailed(identity, payload);
                 CharacterLiveSnapshot? previous;
                 lock (_liveSnapshotGate) _liveSnapshots.TryGetValue(storageKey, out previous);
@@ -1201,7 +1205,9 @@ namespace ServerManager
                                 request.SessionId,
                                 session.Identity,
                                 request.CreatedUtc,
-                                request.ValheimProfileVersion,
+                                // Inventory splicing retains the original outer
+                                // profile marker until an ordinary full capture.
+                                liveBase.LatestEnvelope.ValheimProfileVersion,
                                 materializedProfile);
                         }
                         else
@@ -1921,6 +1927,14 @@ namespace ServerManager
                     "A character save request may not have an empty payload.");
             }
 
+            if (request.Kind == CharacterEnvelopeKind.SaveRequest &&
+                ValheimPlayerProfileCodec.ReadStoredProfileVersion(request.PayloadUnsafe) !=
+                    request.ValheimProfileVersion)
+            {
+                throw new CharacterProtocolException(
+                    "The save request PlayerProfile version does not match its payload.");
+            }
+
             if (request.Kind == CharacterEnvelopeKind.InventorySaveRequest &&
                 request.PayloadLength >
                     ValheimPlayerProfileCodec.MaximumInventorySnapshotBytes)
@@ -2615,6 +2629,9 @@ namespace ServerManager
             CharacterSemanticValidationResult? auditFindings = null)
         {
             byte[] payload = authoritativePayload ?? Array.Empty<byte>();
+            int profileVersion = payload.Length == 0
+                ? ValheimPlayerProfileCodec.SupportedPlayerProfileVersion
+                : ValheimPlayerProfileCodec.ReadStoredProfileVersion(payload);
             CharacterEnvelope rejected = CharacterEnvelope.Create(
                 CharacterEnvelopeKind.SaveRejected,
                 currentRevision,
@@ -2622,7 +2639,7 @@ namespace ServerManager
                 session.SessionId,
                 session.Identity,
                 DateTime.UtcNow,
-                ValheimPlayerProfileCodec.SupportedPlayerProfileVersion,
+                profileVersion,
                 payload);
 
             return new CharacterSaveResult(

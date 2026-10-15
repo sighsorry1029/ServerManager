@@ -30,7 +30,7 @@ foreach ($name in @('UnityEngine.CoreModule.dll', 'UnityEngine.PhysicsModule.dll
     'Splatform.dll', 'assembly_valheim.dll')) {
     [Reflection.Assembly]::LoadFrom((Join-Path $managedRoot $name)) | Out-Null
 }
-foreach ($name in @('BepInEx.dll', '0Harmony.dll')) {
+foreach ($name in @('BepInEx.dll', '0Harmony.dll', 'YamlDotNet.dll')) {
     [Reflection.Assembly]::Load([IO.File]::ReadAllBytes((Join-Path (Split-Path -Parent $pluginPath) $name))) | Out-Null
 }
 
@@ -75,6 +75,56 @@ function Assert-GuardProtectsCall($Method, [string]$GuardName, [string]$EffectNa
         "$GuardName must guard $EffectName on every normal control-flow path."
 }
 
+function Add-HarmonyCallFixture($Definition, $CapacityType, [string]$MethodName,
+    [string]$CounterName, [bool]$MayThrow) {
+    $module = $Definition.MainModule
+    $counter = [Mono.Cecil.FieldDefinition]::new($CounterName,
+        [Mono.Cecil.FieldAttributes]'Public,Static', $module.TypeSystem.Int32)
+    $CapacityType.Fields.Add($counter)
+    $calls = @($CapacityType.Methods | Where-Object HasBody | ForEach-Object {
+        $_.Body.Instructions | Where-Object {
+            $_.Operand -is [Mono.Cecil.MethodReference] -and
+            $_.Operand.DeclaringType.FullName -eq 'HarmonyLib.Harmony' -and $_.Operand.Name -eq $MethodName
+        }
+    })
+    Assert-True ($calls.Count -gt 0) "The capacity fixture must intercept actual Harmony.$MethodName calls."
+    $index = 0
+    foreach ($call in $calls) {
+        $original = $call.Operand
+        $shim = [Mono.Cecil.MethodDefinition]::new("Test$MethodName$index",
+            [Mono.Cecil.MethodAttributes]'Private,Static', $original.ReturnType)
+        if ($original.HasThis) {
+            $shim.Parameters.Add([Mono.Cecil.ParameterDefinition]::new($original.DeclaringType))
+        }
+        foreach ($parameter in $original.Parameters) {
+            $shim.Parameters.Add([Mono.Cecil.ParameterDefinition]::new($parameter.ParameterType))
+        }
+        $CapacityType.Methods.Add($shim)
+        $il = $shim.Body.GetILProcessor()
+        $il.Emit([Mono.Cecil.Cil.OpCodes]::Ldsfld, $counter)
+        $il.Emit([Mono.Cecil.Cil.OpCodes]::Ldc_I4_1)
+        $il.Emit([Mono.Cecil.Cil.OpCodes]::Add)
+        $il.Emit([Mono.Cecil.Cil.OpCodes]::Stsfld, $counter)
+        $success = [Mono.Cecil.Cil.Instruction]::Create([Mono.Cecil.Cil.OpCodes]::Nop)
+        if ($MayThrow) {
+            $throwAt = $CapacityType.Fields | Where-Object Name -eq 'TestThrowAtPatch'
+            $il.Emit([Mono.Cecil.Cil.OpCodes]::Ldsfld, $counter)
+            $il.Emit([Mono.Cecil.Cil.OpCodes]::Ldsfld, $throwAt)
+            $il.Emit([Mono.Cecil.Cil.OpCodes]::Bne_Un, $success)
+            $il.Emit([Mono.Cecil.Cil.OpCodes]::Ldstr, 'Test-only patch installation failure.')
+            $il.Emit([Mono.Cecil.Cil.OpCodes]::Newobj,
+                $module.ImportReference([InvalidOperationException].GetConstructor([Type[]]@([string]))))
+            $il.Emit([Mono.Cecil.Cil.OpCodes]::Throw)
+        }
+        $il.Append($success)
+        if ($original.ReturnType.FullName -ne 'System.Void') { $il.Emit([Mono.Cecil.Cil.OpCodes]::Ldnull) }
+        $il.Emit([Mono.Cecil.Cil.OpCodes]::Ret)
+        $call.OpCode = [Mono.Cecil.Cil.OpCodes]::Call
+        $call.Operand = $shim
+        ++$index
+    }
+}
+
 $gameDefinition = [Mono.Cecil.AssemblyDefinition]::ReadAssembly((Join-Path $managedRoot 'assembly_valheim.dll'))
 $pluginDefinition = [Mono.Cecil.AssemblyDefinition]::ReadAssembly($pluginPath)
 try {
@@ -117,7 +167,8 @@ try {
         'An accepted peer must become ready and refresh the player list before the next admission.'
 
     $runtimeName = 'ServerManager.ServerManagerRuntime'
-    $refresh = Get-Method $pluginDefinition $runtimeName 'RefreshServerPlayerLimitAdvertisement'
+    $capacityName = 'ServerManager.ServerPlayerCapacity'
+    $refresh = Get-Method $pluginDefinition $capacityName 'RefreshAdvertisement'
     Assert-GuardProtectsCall $refresh 'IsServer' 'SetMaxPlayerCount'
     Assert-GuardProtectsCall $refresh 'IsDedicated' 'SetMaxPlayerCount'
     Assert-GuardProtectsCall $refresh 'GetHSteamPipe' 'SetMaxPlayerCount'
@@ -128,15 +179,19 @@ try {
         $_.Operand -is [Mono.Cecil.FieldReference] -and $_.Operand.Name -eq 'm_onlineBackend'
     }).Count -ge 1) 'Advertisement must be restricted to the Steamworks backend.'
     $apply = Get-Method $pluginDefinition $runtimeName 'ApplyServerSettings'
-    $applyRefresh = @(Get-Calls $apply 'RefreshServerPlayerLimitAdvertisement')
-    $maxReads = @(Get-Calls $apply 'get_MaxPlayers')
-    Assert-True ($applyRefresh.Count -eq 1 -and $maxReads.Count -ge 2) 'Apply must compare the old and new caps and refresh once.'
-    $changeBranches = @($apply.Body.Instructions | Where-Object {
-        $_.Offset -gt $maxReads[1].Offset -and $_.Offset -lt $applyRefresh[0].Offset -and
-        $_.OpCode.FlowControl.ToString() -eq 'Cond_Branch' -and
-        ((Test-CecilReachable $_.Operand $applyRefresh[0]) -xor (Test-CecilReachable $_.Next $applyRefresh[0]))
-    })
-    Assert-True ($changeBranches.Count -ge 1) 'An unchanged cap must skip the live advertisement refresh.'
+    Assert-True (@(Get-Calls $apply 'RefreshAdvertisement').Count -eq 0 -and
+        @(Get-Calls $apply 'Start').Count -eq 0 -and @(Get-Calls $apply 'NotifyReload').Count -eq 1) `
+        'YAML live reload must not change the current session advertisement.'
+    $limitMethod = Get-Method $pluginDefinition $capacityName 'get_EffectiveLimit'
+    $limitFields = @($limitMethod.Body.Instructions | Where-Object {
+        $_.OpCode.Name -eq 'ldsfld' -and $_.Operand.FieldType.FullName -eq 'System.Int32'
+    } | ForEach-Object Operand | Sort-Object FullName -Unique)
+    Assert-True ($limitFields.Count -eq 1 -and @(Get-Calls $limitMethod 'get_MaxPlayers').Count -eq 0) `
+        'Admission must read one frozen integer limit, not the reloadable YAML snapshot.'
+    $frozenLimitFieldName = $limitFields[0].Name
+    Assert-True (@($apply.Body.Instructions | Where-Object {
+        $_.OpCode.Name -eq 'stsfld' -and $_.Operand.Name -eq $frozenLimitFieldName
+    }).Count -eq 0) 'Live settings application must not overwrite the frozen admission limit.'
     foreach ($method in @($refresh, $apply)) {
         $forbidden = @($method.Body.Instructions | Where-Object {
             $_.Operand -is [Mono.Cecil.MethodReference] -and
@@ -144,16 +199,65 @@ try {
         })
         Assert-True ($forbidden.Count -eq 0) 'Changing capacity must never evict or reject already connected players.'
     }
-    $steamPrefix = Get-Method $pluginDefinition 'ServerManager.SteamServerPlayerLimitPatch' 'Prefix'
-    Assert-True (@(Get-Calls $steamPrefix 'GetServerPlayerLimit').Count -eq 1 -and
+    $steamPrefix = Get-Method $pluginDefinition $capacityName 'SteamAdvertisementPrefix'
+    Assert-True (@(Get-Calls $steamPrefix 'GetLimit').Count -eq 1 -and
         @($steamPrefix.Body.Instructions | Where-Object { $_.OpCode.Name -eq 'stind.i4' }).Count -eq 1) `
         'Steam advertisement prefix must write the current cap into the original int argument.'
-    $lobbyPostfix = Get-Method $pluginDefinition 'ServerManager.SteamLobbyPlayerLimitPatch' 'Postfix'
-    Assert-True (@(Get-Calls $lobbyPostfix 'RefreshServerPlayerLimitAdvertisement').Count -eq 1) `
-        'A newly created listen lobby must advertise the latest cap, including reloads while creation was pending.'
+    $lobbyPostfix = Get-Method $pluginDefinition $capacityName 'LobbyCreatedPostfix'
+    Assert-True (@(Get-Calls $lobbyPostfix 'RefreshAdvertisement').Count -eq 1) `
+        'A newly created listen lobby must advertise the frozen session cap.'
+    $capacityType = $pluginDefinition.MainModule.Types | Where-Object FullName -eq $capacityName
+    Assert-True (@($capacityType.CustomAttributes | Where-Object {
+        $_.AttributeType.FullName -like 'HarmonyLib.Harmony*'
+    }).Count -eq 0 -and @($capacityType.Methods | ForEach-Object CustomAttributes | Where-Object {
+        $_.AttributeType.FullName -like 'HarmonyLib.Harmony*'
+    }).Count -eq 0) 'PatchAll must never discover optional capacity hooks when the override is OFF.'
+    $owner = $capacityType.Fields | Where-Object Name -eq 'HarmonyOwner'
+    Assert-True ($owner.Constant -ceq 'sighsorry.ServerManager.PlayerCapacity') `
+        'Optional capacity patches must use a separate owner from mandatory authentication patches.'
+    $resetSettings = Get-Method $pluginDefinition $runtimeName 'ResetServerSettings'
+    Assert-True (@(Get-Calls $resetSettings 'Reset' | Where-Object {
+        $_.Operand.DeclaringType.FullName -eq $capacityName
+    }).Count -eq 1) 'Closing/resetting the server session must remove its optional capacity hooks.'
+    $beforeOpen = Get-Method $pluginDefinition $runtimeName 'BeforeServerOpen'
+    Assert-GuardProtectsCall $beforeOpen 'EnsureServerSettingsReady' 'Start'
+    Assert-GuardProtectsCall $beforeOpen 'EnsureServerCharacterStorageReady' 'Start'
+    $capacityStarts = @($pluginDefinition.MainModule.Types | ForEach-Object Methods | Where-Object {
+        $_.HasBody -and @(Get-Calls $_ 'Start' | Where-Object {
+            $_.Operand.DeclaringType.FullName -eq $capacityName
+        }).Count -gt 0
+    })
+    Assert-True ($capacityStarts.Count -eq 1 -and $capacityStarts[0].Name -eq 'BeforeServerOpen') `
+        'Only a real server-open path may choose the session capacity provider; clients and YAML reloads may not.'
+    $unpatch = Get-Method $pluginDefinition 'ServerManager.ServerManagerPlugin' 'UnpatchOwnedPatches'
+    Assert-True (@(Get-Calls $unpatch 'Reset' | Where-Object {
+        $_.Operand.DeclaringType.FullName -eq $capacityName
+    }).Count -eq 1) 'Plugin teardown must clean up the separate capacity owner even after runtime shutdown failure.'
+    $runtimeType = $pluginDefinition.MainModule.Types | Where-Object FullName -eq $runtimeName
+    foreach ($budget in @(
+        @('MaximumSteamAuthenticationReservations', 512),
+        @('MaximumQueuedSteamAuthenticationCallbacks', 1024),
+        @('MaximumPendingAdminManifests', 64),
+        @('MaximumQueuedWorldSaveWorkerResults', 64),
+        @('MaximumCommandReportsPerWindow', 64),
+        @('MaximumBufferedWorldBytes', 33554432)
+    )) {
+        $field = $runtimeType.Fields | Where-Object Name -eq $budget[0]
+        Assert-True ($null -ne $field -and $field.Constant -eq $budget[1]) `
+            "Authentication and unrelated protection budgets must remain intentional: $($budget[0])."
+    }
+
+    # Execute the real capacity lifecycle below, replacing ONLY native/game
+    # Harmony patch installation/removal calls in this in-memory fixture. This
+    # leaves OFF/external-provider/freeze/rollback decisions and the transpiler
+    # unchanged, without modifying or running the installed game or plugin DLL.
+    $capacityType.Fields.Add([Mono.Cecil.FieldDefinition]::new('TestThrowAtPatch',
+        [Mono.Cecil.FieldAttributes]'Public,Static', $pluginDefinition.MainModule.TypeSystem.Int32))
+    Add-HarmonyCallFixture $pluginDefinition $capacityType 'Patch' 'TestPatchCount' $true
+    Add-HarmonyCallFixture $pluginDefinition $capacityType 'UnpatchSelf' 'TestUnpatchCount' $false
 
     # Disable only the production runtime's eager initializer in this in-memory
-    # fixture. The actual transpiler, immutable settings parser and live getter
+    # fixture. The actual transpiler, immutable settings parser and frozen getter
     # remain unchanged. No Harmony patch is installed and no game method runs.
     $initializer = Get-Method $pluginDefinition $runtimeName '.cctor'
     $initializer.Body.Instructions.Clear()
@@ -167,13 +271,88 @@ try {
 finally { $gameDefinition.Dispose(); $pluginDefinition.Dispose() }
 
 $runtime = $plugin.GetType('ServerManager.ServerManagerRuntime', $true)
-$patch = $plugin.GetType('ServerManager.ServerPeerInfoPatch', $true)
-$transpile = $patch.GetMethod('Transpiler', $static)
-Assert-True ($null -ne $transpile) 'The existing PeerInfo patch must contain the capacity transpiler.'
-$limitGetter = $runtime.GetMethod('GetServerPlayerLimit', $static)
+$capacity = $plugin.GetType('ServerManager.ServerPlayerCapacity', $true)
+$transpile = $capacity.GetMethod('AdmissionTranspiler', $static)
+Assert-True ($null -ne $transpile) 'The optional capacity class must contain its separate admission transpiler.'
+$limitGetter = $capacity.GetMethod('GetLimit', $static)
+$frozenLimit = $capacity.GetField($frozenLimitFieldName, $static)
 $settings = $plugin.GetType('ServerManager.ServerSettings', $true)
 $parse = $settings.GetMethod('Parse', $static)
 $snapshot = $runtime.GetField('_currentServerSettings', $static)
+$plugin.GetType('ServerManager.ServerManagerPlugin', $true).GetProperty('Log', $static).
+    GetSetMethod($true).Invoke($null, [object[]]@([BepInEx.Logging.ManualLogSource]::new('Capacity test'))) | Out-Null
+$start = $capacity.GetMethod('Start', $static)
+$reset = $capacity.GetMethod('Reset', $static)
+$notify = $capacity.GetMethod('NotifyReload', $static)
+$externalOwner = $capacity.GetMethod('FindExternalOwner', $static)
+$requested = $capacity.GetProperty('RequestedAtStart', $static)
+$active = $capacity.GetProperty('IsOverrideActive', $static)
+$patchCount = $capacity.GetField('TestPatchCount', $static)
+$unpatchCount = $capacity.GetField('TestUnpatchCount', $static)
+$throwAtPatch = $capacity.GetField('TestThrowAtPatch', $static)
+function Reset-CapacityFixture {
+    $reset.Invoke($null, @()) | Out-Null
+    $patchCount.SetValue($null, 0)
+    $unpatchCount.SetValue($null, 0)
+    $throwAtPatch.SetValue($null, 0)
+    Assert-True ($null -eq $requested.GetValue($null) -and -not $active.GetValue($null) -and
+        $limitGetter.Invoke($null, @()) -eq 10) 'Reset must return to undecided, hook-free vanilla fallback.'
+}
+function Start-CapacityFixture([int]$Limit, [string[]]$Guids = @()) {
+    $start.Invoke($null, [object[]]@($Limit, $Guids)) | Out-Null
+}
+Reset-CapacityFixture
+Start-CapacityFixture 10
+Assert-True ($requested.GetValue($null) -eq 10 -and -not $active.GetValue($null) -and
+    $patchCount.GetValue($null) -eq 0) 'Default ten must install no capacity hooks at all.'
+$notify.Invoke($null, [object[]]@(250)) | Out-Null
+Start-CapacityFixture 250
+Assert-True ($requested.GetValue($null) -eq 10 -and $limitGetter.Invoke($null, @()) -eq 10 -and
+    $patchCount.GetValue($null) -eq 0) 'An OFF session must stay OFF after reload/repeated server-open calls.'
+foreach ($guid in @('Azumatt.MaxPlayerCount', 'MidnightsFX.NetworkPerformanceSystem', 'org.bepinex.plugins.valheim_plus')) {
+    Reset-CapacityFixture
+    Assert-True ($externalOwner.Invoke($null, [object[]]@(,[string[]]@('unrelated.Mod', $guid))) -ceq $guid) `
+        "Recognize the exact installed provider GUID: $guid."
+    Start-CapacityFixture 250 @($guid)
+    Assert-True ($requested.GetValue($null) -eq 250 -and $limitGetter.Invoke($null, @()) -eq 10 -and
+        -not $active.GetValue($null) -and $patchCount.GetValue($null) -eq 0) `
+        "An installed $guid must own capacity without ServerManager installing competing hooks."
+    Start-CapacityFixture 100
+    Assert-True ($patchCount.GetValue($null) -eq 0) 'The capacity provider must remain frozen for the server session.'
+}
+Assert-True ($null -eq $externalOwner.Invoke($null, [object[]]@(,[string[]]@('unrelated.Mod')))) `
+    'Unrelated plugins must not disable the optional override.'
+foreach ($cap in @(11, 24, 64, 100, 250)) {
+    Reset-CapacityFixture
+    Start-CapacityFixture $cap
+    $installed = $patchCount.GetValue($null)
+    Assert-True ($requested.GetValue($null) -eq $cap -and $limitGetter.Invoke($null, @()) -eq $cap -and
+        $active.GetValue($null) -and $installed -ge 2 -and $installed -le 3) `
+        "Starting capacity $cap must install only its admission and advertisement hooks."
+    $notify.Invoke($null, [object[]]@(10)) | Out-Null
+    Start-CapacityFixture 10
+    Assert-True ($limitGetter.Invoke($null, @()) -eq $cap -and $patchCount.GetValue($null) -eq $installed) `
+        'Reload or a repeated open must neither repatch nor replace the effective limit.'
+    $reset.Invoke($null, @()) | Out-Null
+    Assert-True ($unpatchCount.GetValue($null) -eq 1 -and -not $active.GetValue($null) -and
+        $null -eq $requested.GetValue($null)) 'Closing an active session must remove its separate patch owner exactly once.'
+}
+Reset-CapacityFixture
+$throwAtPatch.SetValue($null, 2)
+Start-CapacityFixture 250
+Assert-True ($patchCount.GetValue($null) -eq 2 -and $unpatchCount.GetValue($null) -eq 1 -and
+    $limitGetter.Invoke($null, @()) -eq 10 -and -not $active.GetValue($null) -and
+    $requested.GetValue($null) -eq 250) 'A partial capacity installation failure must roll back its hooks and freeze fallback.'
+Start-CapacityFixture 250
+Assert-True ($patchCount.GetValue($null) -eq 2) 'Failed capacity installation must not retry on every connection or frame.'
+foreach ($invalid in @(9, 251)) {
+    Reset-CapacityFixture
+    $rejected = $false
+    try { Start-CapacityFixture $invalid } catch { $rejected = $true }
+    Assert-True ($rejected -and $patchCount.GetValue($null) -eq 0 -and
+        $null -eq $requested.GetValue($null)) 'Out-of-range startup must reject before installing any hook.'
+}
+Reset-CapacityFixture
 $vanillaCount = [ZNet].GetMethod('GetNrOfPlayers', $instance)
 $labelMethod = [Reflection.Emit.DynamicMethod]::new('CapacityLabels', [void], [Type[]]@())
 $labelGenerator = $labelMethod.GetILGenerator()
@@ -273,9 +452,10 @@ $wrongBranch = New-Seam ([Reflection.Emit.OpCodes]::Bge_S)
 Assert-SeamRejected $wrongBranch 'A changed admission comparison must fail visibly for review.'
 
 # Emit only the tiny post-transpilation comparison, substituting an integer
-# argument for GetNrOfPlayers. Execute the production getter at each admission,
-# so this catches accidentally baking the initial YAML value into patched IL.
-$admitMethod = [Reflection.Emit.DynamicMethod]::new('CapacityAdmission', [int], [Type[]]@([int]), $runtime.Module, $true)
+# argument for GetNrOfPlayers. Execute the production getter at each admission.
+# Frozen limit values stand in for starting each new server session below; no
+# Steam server, network listener, or game peer is instantiated by this fixture.
+$admitMethod = [Reflection.Emit.DynamicMethod]::new('CapacityAdmission', [int], [Type[]]@([int]), $capacity.Module, $true)
 $il = $admitMethod.GetILGenerator()
 $accepted = $il.DefineLabel()
 $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
@@ -288,20 +468,18 @@ $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
 $il.Emit([Reflection.Emit.OpCodes]::Ret)
 $admit = $admitMethod.CreateDelegate([Func[int,int]])
 $snapshot.SetValue($null, $null)
-Assert-True ($limitGetter.Invoke($null, @()) -eq 24 -and $admit.Invoke(23) -eq 0 -and $admit.Invoke(24) -eq 9) `
-    'Before YAML load the safe default must be 24, including the exact full boundary.'
-foreach ($cap in @(1, 24, 64, 8, 32)) {
+Assert-True ($limitGetter.Invoke($null, @()) -eq 10 -and $admit.Invoke(9) -eq 0 -and $admit.Invoke(10) -eq 9) `
+    'Before server start the getter must retain the vanilla ten-player fallback.'
+foreach ($cap in @(10, 11, 24, 64, 100, 250)) {
     $value = $parse.Invoke($null, [object[]]@("serverSettings:`n  maxPlayers: $cap`n"))
     $snapshot.SetValue($null, $value)
-    Assert-True ($limitGetter.Invoke($null, @()) -eq $cap) 'Every new admission must read the latest immutable settings snapshot.'
+    $frozenLimit.SetValue($null, $cap)
+    Assert-True ($limitGetter.Invoke($null, @()) -eq $cap) 'Admission must read the frozen server-session limit.'
     Assert-True ($admit.Invoke($cap - 1) -eq 0 -and $admit.Invoke($cap) -eq 9 -and $admit.Invoke($cap + 1) -eq 9) `
         "Capacity $cap must accept the last available slot and use vanilla Error(9) at or over the cap."
+    $snapshot.SetValue($null, $parse.Invoke($null, [object[]]@("serverSettings:`n  maxPlayers: 10`n")))
+    Assert-True ($limitGetter.Invoke($null, @()) -eq $cap) 'Reloading YAML to OFF must not change an already running session.'
+    $snapshot.SetValue($null, $parse.Invoke($null, [object[]]@("serverSettings:`n  maxPlayers: 250`n")))
+    Assert-True ($limitGetter.Invoke($null, @()) -eq $cap) 'Reloading YAML to 250 must wait until a new server session.'
 }
-$snapshot.SetValue($null, $parse.Invoke($null, [object[]]@("serverSettings:`n  maxPlayers: 1`n")))
-Assert-True ($admit.Invoke(0) -eq 0 -and $admit.Invoke(1) -eq 9) `
-    'At cap one an empty dedicated server admits one player, while a counted listen host already fills the server.'
-$snapshot.SetValue($null, $parse.Invoke($null, [object[]]@("serverSettings:`n  maxPlayers: 8`n")))
-Assert-True ($admit.Invoke(24) -eq 9) 'Lowering below occupancy must block only subsequent admissions.'
-$snapshot.SetValue($null, $parse.Invoke($null, [object[]]@("serverSettings:`n  maxPlayers: 32`n")))
-Assert-True ($admit.Invoke(24) -eq 0) 'Raising the cap must reopen slots without retranspiling.'
-Write-Output "Server player capacity transpiler, live admission, vanilla accounting and advertisement guard smoke passed ($script:assertions assertions)."
+Write-Output "Server player capacity transpiler, frozen admission, vanilla accounting and advertisement guard smoke passed ($script:assertions assertions)."

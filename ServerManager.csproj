@@ -180,6 +180,7 @@
         <None Include="Tests\CecilControlFlowSmoke.ps1"/>
         <None Include="Tests\Valheim107Fixtures.ps1"/>
         <None Include="Tests\Valheim107CompatibilitySmoke.ps1"/>
+        <None Include="Tests\Valheim120CompatibilitySmoke.ps1"/>
         <None Include="Tests\CharacterSavePipelineSmoke.ps1"/>
         <None Include="Tests\PoisonPersistenceSmoke.ps1"/>
         <None Include="Tests\PoisonPersistenceSmoke.cs"/>

@@ -116,7 +116,10 @@ internal static partial class ServerManagerRuntime
     internal const string ClientSecurityPolicyRejectionMessage =
         "The server security policy ended this connection. " +
         "If you believe this is an error, contact a server administrator.";
-    private const int MaximumSteamAuthenticationReservations = 64;
+    // Active peers remain in this table until disconnect. Allow 250 players
+    // plus bounded in-flight authentication headroom, even with another cap mod.
+    private const int MaximumSteamAuthenticationReservations = 512;
+    private const int MaximumPendingAdminManifests = 64;
     private const int MaximumQuarantinedIncompleteSteamIds = 1024;
     private const int MaximumQueuedSteamCallbacksPerAttempt = 2;
     private const int MaximumQueuedSteamAuthenticationCallbacks =
@@ -580,7 +583,7 @@ internal static partial class ServerManagerRuntime
                         out IntegrityManifest? pendingManifest);
                 if (decision.Accepted && pendingManifest != null)
                 {
-                    if (_pendingAdminManifests.Count >= MaximumSteamAuthenticationReservations)
+                    if (_pendingAdminManifests.Count >= MaximumPendingAdminManifests)
                     {
                         return ManifestValidationDecision.Reject(
                             "The server has too many pending authenticated mod checks.");
@@ -1525,7 +1528,11 @@ internal static partial class ServerManagerRuntime
                 DeferServerOpenForSettings(znet);
                 return false;
             }
-            return EnsureServerCharacterStorageReady(znet);
+            if (!EnsureServerCharacterStorageReady(znet)) return false;
+            // This is the actual OpenServer request; vanilla sets m_openServer
+            // itself, so do not require that flag to have been set in advance.
+            ServerPlayerCapacity.Start(CurrentServerSettings.MaxPlayers, Chainloader.PluginInfos.Keys);
+            return true;
         }
 
         ValheimPrivateAccess.SetOpenServer(false);

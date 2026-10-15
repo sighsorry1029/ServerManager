@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.9
+
+- Added Valheim 1.0.20 character-format support, preserving new drop counters and item-upgrade state. Existing pre-update Deep North character files and backups remain readable.
+- Improved startup diagnostics when the game's character format is unsupported, distinguishing compatibility failures from invalid YAML.
+- Made `maxPlayers` optional: 10 disables ServerManager's override, while 11-250 sets the player limit. Changes require a server restart or reopening a hosted world; other YAML settings still reload live.
+- Allowed coexistence with MaxPlayerCount, NetworkPerformanceSystem and Valheim Plus by leaving player limits to those mods while keeping authentication and character management active. Increased bounded authentication capacity for larger servers; 250 is a configuration ceiling, not a performance guarantee.
+- Update ServerManager on both the server and all clients. Existing YAML values are not rewritten; set `maxPlayers: 10` to disable the override.
+
 ## 1.1.8
 
 - Allowed larger Player custom-data values within existing total-size safeguards, fixing save failures and disconnects when mods accumulate progression in one value.

@@ -989,12 +989,12 @@ More details: README, character backup and restore sections.
             if (expectedPrimary.Kind != CharacterEnvelopeKind.Snapshot ||
                 expectedPrimary.Revision < 1 ||
                 expectedPrimary.Revision == long.MaxValue ||
-                expectedPrimary.ValheimProfileVersion !=
-                    ValheimPlayerProfileCodec.SupportedPlayerProfileVersion ||
+                !ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(
+                    expectedPrimary.ValheimProfileVersion) ||
                 !EnvelopeMatchesIdentity(expectedPrimary, identity) ||
                 restoredSnapshot.Kind != CharacterEnvelopeKind.Snapshot ||
-                restoredSnapshot.ValheimProfileVersion !=
-                    ValheimPlayerProfileCodec.SupportedPlayerProfileVersion ||
+                !ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(
+                    restoredSnapshot.ValheimProfileVersion) ||
                 !EnvelopeMatchesIdentity(restoredSnapshot, identity) ||
                 restoredSnapshot.BaseRevision != expectedPrimary.Revision ||
                 restoredSnapshot.Revision != expectedPrimary.Revision + 1 ||
@@ -1602,8 +1602,8 @@ More details: README, character backup and restore sections.
             if (expectedDurableBase.Kind != CharacterEnvelopeKind.Snapshot ||
                 expectedDurableBase.Revision < entry.DurableBase.Revision ||
                 expectedDurableBase.Revision > entry.Snapshot.Revision ||
-                expectedDurableBase.ValheimProfileVersion !=
-                    ValheimPlayerProfileCodec.SupportedPlayerProfileVersion ||
+                !ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(
+                    expectedDurableBase.ValheimProfileVersion) ||
                 !EnvelopeMatchesIdentity(expectedDurableBase, entry.Identity) ||
                 (expectedDurableBase.Revision == entry.Snapshot.Revision &&
                  !expectedDurableBase.MatchesSnapshot(entry.Snapshot)))
@@ -1622,10 +1622,10 @@ More details: README, character backup and restore sections.
                 snapshot.Kind != CharacterEnvelopeKind.Snapshot ||
                 durable.Revision < 1 ||
                 snapshot.Revision < durable.Revision ||
-                durable.ValheimProfileVersion !=
-                    ValheimPlayerProfileCodec.SupportedPlayerProfileVersion ||
-                snapshot.ValheimProfileVersion !=
-                    ValheimPlayerProfileCodec.SupportedPlayerProfileVersion ||
+                !ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(
+                    durable.ValheimProfileVersion) ||
+                !ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(
+                    snapshot.ValheimProfileVersion) ||
                 !EnvelopeMatchesIdentity(durable, entry.Identity) ||
                 !EnvelopeMatchesIdentity(snapshot, entry.Identity))
             {
@@ -1677,8 +1677,7 @@ More details: README, character backup and restore sections.
                 encoded,
                 _options.MaxPayloadBytes);
             int profileVersion = ReadRawProfileVersion(payload);
-            if (profileVersion !=
-                ValheimPlayerProfileCodec.SupportedPlayerProfileVersion)
+            if (!ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(profileVersion))
             {
                 throw new CharacterStorageException(
                     "The .fch PlayerProfile version is unsupported.")

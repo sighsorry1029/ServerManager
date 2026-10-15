@@ -35,7 +35,16 @@ try {
             if ($workerInstruction.Operand -isnot [Mono.Cecil.MethodReference]) { continue }
             $workerReference = $workerInstruction.Operand
             $workerOwner = $workerReference.DeclaringType.FullName
-            if ($workerOwner -match '^(UnityEngine\.|BepInEx\.|Player$|PlayerProfile|Game$|ZNet|ZRpc|ZLog|ZPackage|ServerManager\.(ValheimPlayerProfileCodec|ServerManagerPlugin|ServerEventRuntime))') {
+            # Native-version membership is integer-only. Walk this exact helper
+            # and its type initializer too; all other codec calls remain banned.
+            $pureVersionCheck = $workerOwner -eq 'ServerManager.ValheimPlayerProfileCodec' -and
+                $workerReference.Name -eq 'IsSupportedStoredProfileVersion'
+            if ($pureVersionCheck) {
+                $versionInitializer = $workerAssembly.MainModule.GetType($workerOwner).Methods |
+                    Where-Object { $_.Name -eq '.cctor' } | Select-Object -First 1
+                if ($null -ne $versionInitializer) { $workerQueue.Enqueue($versionInitializer) }
+            }
+            if (-not $pureVersionCheck -and $workerOwner -match '^(UnityEngine\.|BepInEx\.|Player$|PlayerProfile|Game$|ZNet|ZRpc|ZLog|ZPackage|ServerManager\.(ValheimPlayerProfileCodec|ServerManagerPlugin|ServerEventRuntime))') {
                 throw "Checkpoint worker reaches a game/thread-affine boundary: $($workerReference.FullName)"
             }
             if ($workerOwner.StartsWith('ServerManager.', [StringComparison]::Ordinal)) {

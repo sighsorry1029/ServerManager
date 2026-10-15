@@ -45,14 +45,15 @@ Assert-True (Test-Bytes $populated (Invoke-Codec 'SerializeProfileToBytes' @($ro
 Invoke-Codec 'ValidateSnapshot' @($identity, $populated) | Out-Null
 
 # Unsupported headers, invalid statistics and malformed length prefixes must
-# be rejected before storage. No conversion of old profiles is attempted.
+# be rejected before storage. Legacy import preservation is tested separately
+# by Valheim120CompatibilitySmoke and CharacterDirectStorageSmoke.
 foreach ($mutation in @(
     @{ Offset = 0; Bytes = [BitConverter]::GetBytes([int]43) },
     @{ Offset = 4; Bytes = [BitConverter]::GetBytes([int]105) },
     @{ Offset = 8; Bytes = [BitConverter]::GetBytes([int]11) },
     @{ Offset = 12; Bytes = [BitConverter]::GetBytes([single]::NaN) },
     @{ Offset = (12 + 205 * 4 + 12); Bytes = [BitConverter]::GetBytes([int]6) },
-    @{ Offset = ($payload.Length - 9); Bytes = [BitConverter]::GetBytes([int]99999) })) {
+    @{ Offset = ($payload.Length - 17); Bytes = [BitConverter]::GetBytes([int]99999) })) {
     [byte[]]$bad = $payload.Clone()
     [Array]::Copy($mutation.Bytes, 0, $bad, $mutation.Offset, 4)
     Assert-Throws { Invoke-Codec 'ValidateSnapshot' @($identity, $bad) }
@@ -92,4 +93,4 @@ try {
     }
 }
 finally { $sessionFlags.SetValue($null, $oldFlags) }
-Write-Output "Valheim 1.0.7 schema smoke passed ($script:assertions assertions; original game markers, statistics, biome/build state and compact inventory boundaries; Unity startup shims)."
+Write-Output "Valheim shared schema smoke passed on 1.0.20 ($script:assertions assertions; original game markers, statistics, biome/build state and compact inventory boundaries; Unity startup shims)."

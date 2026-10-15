@@ -484,4 +484,63 @@ Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 0 -and
     (Get-RuntimeField '_queuedSteamAuthenticationCallbackCount') -eq 0 -and
     [SteamAuthenticationEnvironment]::Completed -eq 0) 'Callback disposal left a pending authentication or queued completion.'
 
+# Exercise the production reservation maps at the expanded safety limit. This
+# is a state-only capacity fixture, not a 250-player Steam/network load test:
+# the first 250 reservations represent already active generations, while the
+# remaining 262 represent pending connections. Real callback transitions are
+# covered above; native Steam and outbound I/O stay stubbed throughout.
+Reset-Fixture
+$capacityEntries = [Collections.Generic.List[object]]::new()
+$activePhase = [Enum]::Parse($assembly.GetType($runtimeName + '+SteamAuthenticationPhase', $true), 'Active')
+for ($index = 0; $index -lt 512; ++$index) {
+    $capacitySteamId = [uint64](76561198001000000 + $index)
+    Assert-True (New-Connection $capacitySteamId) "Reservation $($index + 1) was rejected before the 512-entry safety limit."
+    $reservedAttempt = (Get-RuntimeField 'SteamAuthenticationsByRpc')[$script:rpc]
+    if ($index -lt 250) {
+        Set-Property $reservedAttempt 'Phase' $activePhase
+        Set-Property $reservedAttempt 'ReachedActive' $true
+    }
+    $capacityEntries.Add([pscustomobject]@{ SteamId = $capacitySteamId; Rpc = $script:rpc; Attempt = $reservedAttempt })
+}
+Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 512 -and
+    (Get-RuntimeField 'SteamAuthenticationsById').Count -eq 512 -and
+    [SteamAuthenticationEnvironment]::Completed -eq 0 -and
+    [SteamAuthenticationEnvironment]::Rejected -eq 0 -and
+    [SteamAuthenticationEnvironment]::Disconnected -eq 0) `
+    'The capacity fixture did not retain 250 simulated active and 262 pending reservations without network admission.'
+Assert-True (-not (New-Connection ([uint64]76561198001000512)) -and
+    [SteamAuthenticationEnvironment]::UnregisteredReason -eq 'steam_reservation_capacity_exceeded' -and
+    [SteamAuthenticationEnvironment]::Disconnected -eq 1 -and
+    [SteamAuthenticationEnvironment]::Rejected -eq 0 -and
+    (Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 512 -and
+    (Get-RuntimeField 'SteamAuthenticationsById').Count -eq 512) `
+    'Reservation 513 did not reject only the newly arriving peer at the bounded capacity limit.'
+foreach ($entry in $capacityEntries) {
+    $expectedPhase = if ($entry.SteamId -lt [uint64]76561198001000250) { 'Active' } else { 'Reserved' }
+    Assert-True ([object]::ReferenceEquals((Get-RuntimeField 'SteamAuthenticationsByRpc')[$entry.Rpc], $entry.Attempt) -and
+        [object]::ReferenceEquals((Get-RuntimeField 'SteamAuthenticationsById')[$entry.SteamId], $entry.Attempt) -and
+        (Get-Property $entry.Attempt 'Phase').ToString() -eq $expectedPhase) `
+        'Capacity rejection displaced or changed an earlier active/pending authentication generation.'
+}
+foreach ($entry in @($capacityEntries[0], $capacityEntries[250])) {
+    Invoke-Runtime 'RemoveSteamAuthentication' @($entry.Rpc) | Out-Null
+    Assert-True (-not (Get-RuntimeField 'SteamAuthenticationsByRpc').ContainsKey($entry.Rpc) -and
+        -not (Get-RuntimeField 'SteamAuthenticationsById').ContainsKey($entry.SteamId) -and
+        (Get-Property $entry.Attempt 'Phase').ToString() -eq 'Rejected') `
+        'Removing an active or pre-BeginAuth pending reservation did not free both indexes.'
+}
+Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 510 -and
+    (Get-RuntimeField 'SteamAuthenticationsById').Count -eq 510 -and
+    (Get-RuntimeField 'QuarantinedIncompleteSteamIds').Count -eq 0) `
+    'Capacity cleanup changed the incomplete-generation quarantine policy or failed to free two entries.'
+Assert-True (New-Connection ([uint64]76561198001000512)) 'The previously capacity-rejected identity could not use a freed reservation.'
+Assert-True (New-Connection ([uint64]76561198001000513)) 'A second new identity could not use the remaining freed reservation.'
+Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 512 -and
+    (Get-RuntimeField 'SteamAuthenticationsById').Count -eq 512) 'Replacement reservations did not refill both indexes to the bounded limit.'
+Invoke-Runtime 'DisposeSteamAuthenticationCallback' | Out-Null
+Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 0 -and
+    (Get-RuntimeField 'SteamAuthenticationsById').Count -eq 0 -and
+    (Get-RuntimeField '_queuedSteamAuthenticationCallbackCount') -eq 0) `
+    'Shutdown cleanup left entries behind after the full-capacity fixture.'
+
 Write-Host "Steam callback registration and authentication lifecycle smoke tests passed ($script:checks checks)."

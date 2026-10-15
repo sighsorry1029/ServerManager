@@ -404,7 +404,7 @@ internal static class LocalHostCharacterRuntime
         if (snapshot.Kind != CharacterEnvelopeKind.Snapshot ||
             snapshot.SessionId != session.SessionId || snapshot.Revision <= 0 ||
             snapshot.Revision != session.CurrentRevision ||
-            snapshot.ValheimProfileVersion != ValheimPlayerProfileCodec.SupportedPlayerProfileVersion ||
+            !ValheimPlayerProfileCodec.IsSupportedStoredProfileVersion(snapshot.ValheimProfileVersion) ||
             !string.Equals(snapshot.AccountId, session.Identity.AccountId, StringComparison.Ordinal) ||
             !string.Equals(snapshot.CharacterName, session.Identity.CharacterName, StringComparison.Ordinal))
             throw new CharacterProtocolException("The accepted host snapshot is inconsistent.");

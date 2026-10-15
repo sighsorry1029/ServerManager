@@ -13,8 +13,9 @@ namespace ServerManager
     /// </summary>
     public sealed partial class ValheimPlayerProfileCodec
     {
-        public const int SupportedPlayerProfileVersion = 46;
-        public const int SupportedPlayerDataVersion = 33;
+        public const int SupportedPlayerProfileVersion = 47;
+        public const int SupportedPlayerDataVersion = 34;
+        public const int SupportedInventoryVersion = 110;
         public const int MaximumInventorySnapshotBytes = 1024 * 1024;
         private const int SupportedPlayerStatCount = 205;
         private const int SupportedStatGroupCount = 10;
@@ -29,6 +30,22 @@ namespace ServerManager
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _options.Validate();
             EnsureSupportedGameVersion();
+        }
+
+        // Native files saved before 1.0.20 remain readable on the current game.
+        // Do not relabel their inner player/inventory bytes: vanilla uses those
+        // versions to initialize new fields and reset old item cheat flags.
+        internal static bool IsSupportedStoredProfileVersion(int version) =>
+            version == 46 || version == SupportedPlayerProfileVersion;
+
+        internal static int ReadStoredProfileVersion(byte[] payload)
+        {
+            if (payload == null || payload.Length < sizeof(int))
+                throw new CharacterProtocolException("The raw PlayerProfile has an invalid length.");
+            int version = ReadLittleEndianInt32(payload, 0);
+            if (!IsSupportedStoredProfileVersion(version))
+                throw new CharacterProtocolException("The raw PlayerProfile version is unsupported.");
+            return version;
         }
 
         private static PlayerProfile CreateEmptyProfile(string canonicalCharacterName)
@@ -113,6 +130,11 @@ namespace ServerManager
                 throw new CharacterProtocolException(
                     "The inventory snapshot has an invalid length.");
             }
+            // Old item markers are valid inside native stored profiles only.
+            // A new fast-path update must not reintroduce the pre-1.0.20 reset
+            // semantics by labeling newly captured items as inventory 109.
+            if (ReadLittleEndianInt32(payload, 0) != SupportedInventoryVersion)
+                throw new CharacterProtocolException("The inventory snapshot version is unsupported.");
 
             try
             {
@@ -250,7 +272,7 @@ namespace ServerManager
             return materialized;
         }
 
-        /// <summary>Splices only the version-2 skill section into a validated 46/33 profile.</summary>
+        /// <summary>Splices only the version-2 skill section into a validated profile.</summary>
         internal byte[] ReplaceSkillAdmin(
             CharacterIdentity identity, byte[] fullProfile, string operation,
             string skillName, float value, out CharacterValidatedSnapshot validatedSnapshot)
@@ -485,7 +507,7 @@ namespace ServerManager
             {
                 ZPackage package = new ZPackage(rawPlayerProfile);
                 int profileVersion = package.ReadInt();
-                if (profileVersion != SupportedPlayerProfileVersion)
+                if (!IsSupportedStoredProfileVersion(profileVersion))
                 {
                     throw new CharacterProtocolException(
                         "The raw PlayerProfile version is unsupported.");
@@ -683,7 +705,7 @@ namespace ServerManager
             try
             {
                 ZPackage package = new ZPackage(rawPlayerProfile);
-                if (package.ReadInt() != SupportedPlayerProfileVersion)
+                if (!IsSupportedStoredProfileVersion(package.ReadInt()))
                 {
                     throw new CharacterProtocolException(
                         "The raw PlayerProfile version is unsupported.");
@@ -1162,7 +1184,7 @@ namespace ServerManager
                 playerData,
                 _options.MaxProfileCollectionEntries);
             int version = reader.ReadInt32("version");
-            if (version != SupportedPlayerDataVersion)
+            if (version != 33 && version != SupportedPlayerDataVersion)
             {
                 throw new CharacterProtocolException(
                     "The inner Player data version is unsupported.");
@@ -1270,6 +1292,11 @@ namespace ServerManager
             }
 
             reader.SkipByteArray("build menu state");
+            if (version >= 34)
+            {
+                reader.SkipInt32Dictionary("drop counters");
+                reader.SkipInt32Dictionary("item upgrade seeds");
+            }
             reader.RequireEnd();
             return new CharacterSemanticSnapshot(
                 true,
@@ -1285,7 +1312,7 @@ namespace ServerManager
             ParseAndValidateInnerInventory(InnerPlayerDataReader reader)
         {
             int inventoryVersion = reader.ReadInt32("inventory version");
-            if (inventoryVersion != 109)
+            if (inventoryVersion != 109 && inventoryVersion != SupportedInventoryVersion)
             {
                 throw new CharacterProtocolException(
                     "The inner Player inventory version is unsupported.");
@@ -1344,7 +1371,7 @@ namespace ServerManager
                     throw new CharacterProtocolException(diagnostic.ToString());
                 }
 
-                // Inventory 109 encodes coordinates as unsigned bytes. Retain
+                // Inventory 109/110 encode coordinates as unsigned bytes. Retain
                 // the first entry's index so a collision identifies both items.
                 {
                     long positionKey =
@@ -1673,6 +1700,22 @@ namespace ServerManager
                             "The inner Player " + fieldName +
                             " contains an invalid entry.");
                     }
+                }
+            }
+
+            internal void SkipInt32Dictionary(string fieldName)
+            {
+                int count = ReadCount(fieldName);
+                HashSet<int> keys = new HashSet<int>();
+                for (int index = 0; index < count; ++index)
+                {
+                    int key = ReadInt32(fieldName + " key");
+                    // Stable hashes and RNG state are signed Int32 values.
+                    // Preserve the bytes; do not resolve prefabs or infer policy.
+                    _ = ReadInt32(fieldName + " value");
+                    if (!keys.Add(key))
+                        throw new CharacterProtocolException(
+                            "The inner Player " + fieldName + " contains a duplicate key.");
                 }
             }
 
@@ -2209,17 +2252,38 @@ namespace ServerManager
                 ReadRuntimeConstant(
                     ProfilePrivateAccess.ValheimVersionType,
                     "c_PlayerDataVersion");
+            int runtimeInventoryVersion = ReadRuntimeConstant(
+                ProfilePrivateAccess.ValheimVersionType, "c_ItemDataVersion");
             int runtimePlayerStatCount = Convert.ToInt32(
                 Enum.Parse(typeof(PlayerStatType), "Count", false));
 
             if (runtimePlayerProfileVersion != SupportedPlayerProfileVersion ||
                 runtimePlayerDataVersion != SupportedPlayerDataVersion ||
+                runtimeInventoryVersion != SupportedInventoryVersion ||
                 runtimePlayerStatCount != SupportedPlayerStatCount)
             {
                 throw new NotSupportedException(
                     "Valheim changed its PlayerProfile schema. " +
+                    DescribeRuntimeSchema() + " " +
                     "Update and review ValheimPlayerProfileCodec before enabling character saves.");
             }
+        }
+
+        // Only fixed marker names and metadata integers reach the settings log.
+        // Never include YAML contents or arbitrary exceptions from item/mod code.
+        internal static string DescribeRuntimeSchema()
+        {
+            Type? version = typeof(PlayerProfile).Assembly.GetType("Version", false);
+            string Marker(string name)
+            {
+                try { return ReadRuntimeConstant(version!, name).ToString(System.Globalization.CultureInfo.InvariantCulture); }
+                catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception)) { return "unavailable"; }
+            }
+            string stats;
+            try { stats = Convert.ToInt32(Enum.Parse(typeof(PlayerStatType), "Count", false)).ToString(System.Globalization.CultureInfo.InvariantCulture); }
+            catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception)) { stats = "unavailable"; }
+            return $"Expected profile/player/inventory/stats={SupportedPlayerProfileVersion}/{SupportedPlayerDataVersion}/{SupportedInventoryVersion}/{SupportedPlayerStatCount}; " +
+                   $"runtime={Marker("c_PlayerVersion")}/{Marker("c_PlayerDataVersion")}/{Marker("c_ItemDataVersion")}/{stats}.";
         }
 
         private static int ReadRuntimeConstant(Type declaringType, string fieldName)

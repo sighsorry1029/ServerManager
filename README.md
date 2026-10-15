@@ -27,8 +27,12 @@ No preloader patcher, separate bot program or extra RCON listener is needed.
 
 ## Install and start
 
+Use Valheim **1.0.20** on the server and all clients. Existing pre-1.0.20
+Deep North character files and backups remain readable; do not rename or delete
+them for this update. New full saves use the current game format.
+
 1. Install `ServerManager.dll` in `BepInEx/plugins` on the server and all clients.
-2. Disable crossplay. Remove ServerCharacters, MaxPlayerCount and old standalone
+2. Disable crossplay. Remove ServerCharacters and old standalone
    OrbOfDiscord DLLs. Avoid other mods that manage the same character saves.
 3. Start the dedicated server, or open a world with **Start Server**.
    ServerManager creates its files under the Valheim save folder.
@@ -78,9 +82,10 @@ ServerManager/
 └── cache/logos/            Downloaded client logos, when used
 ```
 
-The editable YAML files reload automatically. **Invalid edits keep the last valid
-settings.** Use spaces, not tabs, and keep key names exactly as shown. Existing
-files are not rewritten when defaults change.
+The editable YAML files reload automatically, except `maxPlayers`, which applies
+on the next server session. **Invalid edits keep the last valid settings.** Use
+spaces, not tabs, and keep key names exactly as shown. Existing files are not
+rewritten when defaults change.
 
 Characters share this storage across worlds. For independent servers on one
 computer, use separate `-savedir` folders. Leave generated lock files alone;
@@ -128,7 +133,7 @@ The defaults in `ServerManager.yml` are:
 
 ```yaml
 serverSettings:
-  maxPlayers: 24
+  maxPlayers: 10
   maxCharactersPerAccount: 3
   backupsPerProfile: 30
   loadServerCharacterOnJoin: true
@@ -153,9 +158,14 @@ startItems:
   - Torch
 ```
 
-- `maxPlayers`: simultaneous players, from 1 to 64. Hosts and admins use a slot.
-  Lowering this does not kick players already online. Higher counts need testing
-  with your server and modpack.
+- `maxPlayers`: **10 disables ServerManager's player-limit override**; 11-250
+  sets the simultaneous-player limit, including hosts and admins. Restart a
+  dedicated server, or close and reopen a hosted world, to apply changes.
+  With the override off, Valheim or another mod controls the limit; 10 does not
+  force other mods back to ten players. If MaxPlayerCount, NetworkPerformanceSystem
+  or Valheim Plus is installed, ServerManager leaves player limits to that mod
+  and logs a notice. Its other features remain active. Use only one player-limit
+  mod; 250 is a configuration ceiling, not a performance guarantee.
 - `maxCharactersPerAccount`: new character registrations per Steam account.
   Lowering it does not block existing characters. Verified admins and the local
   host are exempt.
@@ -234,6 +244,8 @@ Inventory changes are sent frequently; full character updates are also sent
 periodically and during save/logout handling. The server keeps accepted updates
 in memory, so reconnecting to the same running server can restore progress not
 yet written to disk. Remaining poison is retained from the latest full update.
+The game's drop counters and item-upgrade random state are also retained in full
+updates; inventory-only updates leave those values unchanged.
 
 Full updates refresh the rejoin position every five minutes and during normal
 save/logout handling, following the game's death and intro rules. Inventory-only

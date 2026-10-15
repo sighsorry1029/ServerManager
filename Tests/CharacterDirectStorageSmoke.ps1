@@ -82,7 +82,7 @@ function Prepare-QuotaCharacter($Fixture, $Identity, [long]$PlayerId) {
         return ,$script:quotaFactoryPayload
     }
     return Invoke-Hidden $Fixture.Repository 'PrepareInitialSnapshot' @(
-        $Identity, $Fixture.Keys.DeriveStorageKey($Identity), [Guid]::NewGuid(), $factory, [int]46)
+        $Identity, $Fixture.Keys.DeriveStorageKey($Identity), [Guid]::NewGuid(), $factory, [int]47)
 }
 function Finalize-QuotaCharacter($Fixture, $Identity, $Prepared) {
     return Invoke-Hidden $Fixture.Repository 'FinalizePreparedInitialSnapshot' @(
@@ -211,7 +211,10 @@ try {
 
     $fixture = New-DirectFixture 'native-baseline'
     $identity = New-Instance 'CharacterIdentity' @('steamworks:76561198000000001', 'DisplayHero')
-    [byte[]]$raw = New-ProfilePayload 'DisplayHero' 101 'copied-native-fch'
+    # Existing native files retain their original schema and bytes through
+    # import-free loading, full-save upgrade, backup creation and admin restore.
+    [byte[]]$raw = New-ProfilePayload 'DisplayHero' 101 'copied-native-fch' `
+        -ProfileVersion 46 -PlayerDataVersion 33 -InventoryVersion 109
     $direct = Write-DirectCharacter $fixture $identity $raw
     Assert-True ($direct.Key -ceq 'Steam_76561198000000001_displayhero' -and
         [IO.Path]::GetFileName($direct.Path) -ceq 'Steam_76561198000000001_displayhero.fch' -and
@@ -256,6 +259,7 @@ try {
 
     $stored = Invoke-Hidden $fixture.Repository 'Load' @($identity, $direct.Key)
     Assert-True ($stored.Envelope.Revision -eq 1 -and $stored.Envelope.BaseRevision -eq 0 -and
+        $stored.Envelope.ValheimProfileVersion -eq 46 -and
         $stored.Envelope.CharacterName -ceq 'DisplayHero' -and
         -not $stored.Envelope.RequiresFreshLocalCharacter -and
         (Test-Bytes $stored.Envelope.GetPayloadCopy() $raw)) 'Direct .fch did not load as an established cold baseline with its original name.'

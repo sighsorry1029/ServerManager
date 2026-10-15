@@ -672,34 +672,6 @@ internal static class ClientPeerInfoPatch
     new[] { typeof(ZRpc), typeof(ZPackage) })]
 internal static class ServerPeerInfoPatch
 {
-    private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
-    {
-        List<CodeInstruction> code = new(instructions);
-        MethodInfo countPlayers = AccessTools.Method(typeof(ZNet), nameof(ZNet.GetNrOfPlayers));
-        MethodInfo configuredLimit = AccessTools.Method(typeof(ServerManagerRuntime),
-            nameof(ServerManagerRuntime.GetServerPlayerLimit));
-        int limitIndex = -1;
-        for (int index = 0; index + 2 < code.Count; ++index)
-        {
-            if (!code[index].Calls(countPlayers) || !code[index + 1].LoadsConstant(10L) ||
-                (code[index + 2].opcode != OpCodes.Blt && code[index + 2].opcode != OpCodes.Blt_S))
-                continue;
-            if (limitIndex >= 0)
-                throw new InvalidOperationException("ServerManager found multiple Valheim player-limit checks.");
-            limitIndex = index + 1;
-        }
-        if (limitIndex < 0)
-            throw new InvalidOperationException(
-                "ServerManager could not locate the vanilla 10-player admission check. " +
-                "Remove overlapping player-limit mods and check the supported Valheim version.");
-
-        // Change only the operand of vanilla's full-server comparison. Keep its
-        // count, Error(9), password/auth flow, branch labels and exception blocks.
-        code[limitIndex].opcode = OpCodes.Call;
-        code[limitIndex].operand = configuredLimit;
-        return code;
-    }
-
     [HarmonyPriority(Priority.First)]
     private static bool Prefix(
         ZNet __instance,
@@ -766,36 +738,6 @@ internal static class ServerPeerInfoPatch
         }
 
         return __exception;
-    }
-}
-
-[HarmonyPatch(typeof(SteamGameServer), nameof(SteamGameServer.SetMaxPlayerCount))]
-internal static class SteamServerPlayerLimitPatch
-{
-    private static void Prefix(ref int __0)
-    {
-        if (ZNet.instance != null && ZNet.instance.IsServer() &&
-            ZNet.m_onlineBackend == OnlineBackendType.Steamworks)
-            __0 = ServerManagerRuntime.GetServerPlayerLimit();
-    }
-}
-
-[HarmonyPatch]
-internal static class SteamLobbyPlayerLimitPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods()
-    {
-        // Only the client/listen build owns this Steam lobby callback. The
-        // dedicated binary may omit it and uses SteamGameServer above instead.
-        MethodInfo? callback = AccessTools.Method(typeof(ZSteamMatchmaking), "OnLobbyCreated",
-            new[] { typeof(LobbyCreated_t), typeof(bool) });
-        if (callback != null) yield return callback;
-    }
-
-    private static void Postfix()
-    {
-        // Read the latest setting, including edits while CreateLobby was pending.
-        ServerManagerRuntime.RefreshServerPlayerLimitAdvertisement();
     }
 }
 

@@ -37,7 +37,7 @@ internal sealed class ServerSettings
     public float MaximumDamage { get; }
     public IReadOnlyDictionary<string, int> StartItems { get; }
 
-    public static ServerSettings Defaults { get; } = new(24, 3, 30, true, string.Empty,
+    public static ServerSettings Defaults { get; } = new(10, 3, 30, true, string.Empty,
         DetectionAction.Kick, DetectionAction.Log, 800f, 800f, 500f, 2000f, 50000f,
         new Dictionary<string, int>(StringComparer.Ordinal)
         {
@@ -101,7 +101,7 @@ internal sealed class ServerSettings
         Dictionary<string, YamlNode> caps = Section(root, "statCaps",
             "action", "health", "stamina", "eitr", "weight", "damage");
         return new ServerSettings(
-            Integer(server, "maxPlayers", Defaults.MaxPlayers, 64),
+            Integer(server, "maxPlayers", Defaults.MaxPlayers, 250, 10),
             Integer(server, "maxCharactersPerAccount", Defaults.MaxCharactersPerAccount, 128),
             Integer(server, "backupsPerProfile", Defaults.BackupsPerProfile, 50),
             Boolean(server, "loadServerCharacterOnJoin", Defaults.LoadServerCharacterOnJoin),
@@ -136,18 +136,19 @@ internal sealed class ServerSettings
         return result;
     }
 
-    private static int Integer(Dictionary<string, YamlNode> map, string key, int fallback, int maximum)
+    private static int Integer(Dictionary<string, YamlNode> map, string key, int fallback, int maximum, int minimum = 1)
     {
         if (!map.TryGetValue(key, out YamlNode node)) return fallback;
-        return PositiveInteger(node, key, maximum);
+        return PositiveInteger(node, key, maximum, minimum);
     }
 
-    private static int PositiveInteger(YamlNode node, string location, int maximum)
+    private static int PositiveInteger(YamlNode node, string location, int maximum, int minimum = 1)
     {
         if (node is not YamlScalarNode scalar || scalar.Style != ScalarStyle.Plain ||
             !int.TryParse(scalar.Value, NumberStyles.None, CultureInfo.InvariantCulture, out int number) ||
-            number < 1 || number > maximum)
-            throw Invalid(location + " must be an integer from 1 to " + maximum.ToString(CultureInfo.InvariantCulture));
+            number < minimum || number > maximum)
+            throw Invalid(location + " must be an integer from " + minimum.ToString(CultureInfo.InvariantCulture) +
+                " to " + maximum.ToString(CultureInfo.InvariantCulture));
         return number;
     }
 
@@ -289,11 +290,12 @@ internal sealed class ServerSettings
     internal const string DefaultYaml = @"# ServerManager server settings. Keep this file on the server only.
 # UTF-8 YAML. Existing files/comments are never rewritten or imported from cfg.
 # Valid edits reload automatically after two matching reads, normally 2-4 seconds.
+# maxPlayers changes take effect on the next server session; other settings still reload.
 # An invalid edit keeps ALL last valid settings. Invalid startup waits for correction.
 # Omitted keys use these defaults. Exact keys only; duplicate/unknown keys are errors.
 # Anchors, aliases, explicit tags and multiple documents are not supported.
 serverSettings:
-  maxPlayers: 24 # 1-64 concurrent players, including the listen host. Lowering does not kick existing players.
+  maxPlayers: 10 # 10 disables this override; 11-250 sets the limit, including the listen host. Restart required.
   maxCharactersPerAccount: 3 # 1-128; limits new registrations, not existing characters. Listen host and verified adminlist admins are exempt.
   backupsPerProfile: 30 # 1-50; the new count is used for future backup rotation.
   # true applies the latest server profile on connection (or the normal new-profile rules).

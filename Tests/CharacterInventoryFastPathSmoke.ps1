@@ -143,9 +143,9 @@ function New-InventoryDiagnosticFixture {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        # Independent compact inventory-109 wire records. The second record
+        # Independent compact inventory-110 wire records. The second record
         # tests ordinal/slot reporting even when the first item is valid.
-        $writer.Write([int]109)
+        $writer.Write([int]110)
         $writer.Write([uint16]2)
         $writer.Write([int]0)
         $writer.Write([byte[]]@(0, 0, 0, 64))
@@ -182,7 +182,7 @@ function New-InventorySnapshotBytes {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([int]109)
+        $writer.Write([int]110)
         $writer.Write([uint16](-not [string]::IsNullOrEmpty($PrefabName)))
         if (-not [string]::IsNullOrEmpty($PrefabName)) {
             if ($null -eq $CustomDictionary) {
@@ -212,7 +212,7 @@ function New-InventoryOverlapFixture {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([int]109)
+        $writer.Write([int]110)
         $writer.Write([uint16]2)
         [byte[]]$custom = New-CustomDictionaryFixture -Key 'private.overlap.key' -Value 'private-overlap-value'
         [Valheim107Fixture]::Item($writer, 'Stone', 7, 12.5, 0, $Y, $false,
@@ -238,7 +238,7 @@ function New-InnerPlayerDataFixture {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([int]33)
+        $writer.Write([int]34)
         $writer.Write([single]25)
         $writer.Write([single]24)
         $writer.Write([single]50)
@@ -280,6 +280,11 @@ function New-InnerPlayerDataFixture {
         $writer.Write([single]5)
         $writer.Write([single]4)
         $writer.Write([int]0) # build menu byte array
+        # Nonempty signed, unsorted Player 34 dictionaries must remain opaque
+        # through inventory, appearance and world-position materialization.
+        foreach ($value in [int[]]@(2, 51, -3, -17, 2147483647, 1, -2147483648, 91)) {
+            $writer.Write($value)
+        }
         $writer.Flush()
 
         return [pscustomobject]@{
@@ -346,7 +351,7 @@ function New-PlayerProfilePayload {
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([int]46); [Valheim107Fixture]::Statistics($writer)
+        $writer.Write([int]47); [Valheim107Fixture]::Statistics($writer)
         $writer.Write($false); $writer.Write([int]$WorldData.Count)
         foreach ($world in $WorldData) {
             $writer.Write([long]$world.WorldId)
@@ -513,7 +518,7 @@ try {
         $null -ne $playerVersionField -and
         $playerVersionField.HasConstant) `
         "The installed PlayerProfile version marker changed."
-    Assert-True ($playerVersionField.Constant -eq 46) 'Expected original Valheim 1.0.7 profile marker.'
+    Assert-True ($playerVersionField.Constant -eq 47) 'Expected original Valheim 1.0.20 profile marker.'
     $gameDefinition.Write($gameStream)
     $gameAssembly = [Reflection.Assembly]::Load($gameStream.ToArray())
 }
@@ -896,7 +901,7 @@ foreach ($itemWorldLevel in @(0, 1, 2, 10, 255)) {
         "The inventory fast path clamped, dropped, or rewrote world level $itemWorldLevel."
 }
 
-# World level is one byte in inventory 109; out-of-range integers cannot be
+# World level is one byte in inventory 110; out-of-range integers cannot be
 # represented. Reject unknown flag bits instead, through the same three paths.
 foreach ($invalidCheatFlags in @(2, 128, 255)) {
     [byte[]]$invalidLevelInventory = New-InventorySnapshotBytes `
@@ -1250,7 +1255,7 @@ $playerDataField = $deserializeProfile.ReturnType.GetField('m_playerData',
 [byte[]]$selectedBefore = $serializeProfile.Invoke($profileCodec, [object[]]@($selected))
 $freshSnapshot = $createOrigin.Invoke($null, [object[]]@(
     [Enum]::Parse($envelopeKindType, 'Snapshot'), [long]1, [long]0, [Guid]::NewGuid(),
-    $identity, [DateTime]::UtcNow, [int]46, $fullProfile, $true))
+    $identity, [DateTime]::UtcNow, [int]47, $fullProfile, $true))
 Assert-True ($preserveAppearance.Invoke($profileCodec, [object[]]@($freshSnapshot, $selected, $managed))) `
     'A fresh server seed did not preserve the selected appearance.'
 [byte[]]$mergedAppearance = $playerDataField.GetValue($managed)
@@ -1275,7 +1280,7 @@ Assert-True (Test-ByteArrayEqual $mergedAppearance ($playerDataField.GetValue($r
 foreach ($origin in @(@([long]1, [long]0, $false), @([long]2, [long]1, $true))) {
     $existingSnapshot = $createOrigin.Invoke($null, [object[]]@(
         [Enum]::Parse($envelopeKindType, 'Snapshot'), $origin[0], $origin[1], [Guid]::NewGuid(),
-        $identity, [DateTime]::UtcNow, [int]46, $fullProfile, $origin[2]))
+        $identity, [DateTime]::UtcNow, [int]47, $fullProfile, $origin[2]))
     $existing = $deserializeProfile.Invoke($profileCodec, [object[]]@($fullProfile, $null, $localSource))
     Assert-True (-not $preserveAppearance.Invoke($profileCodec, [object[]]@($existingSnapshot, $selected, $existing))) `
         'An established server character accepted local appearance.'
@@ -1341,7 +1346,7 @@ foreach ($boundaryKind in @($snapshotKind, $saveRequestKind)) {
         $sessionId,
         $identity,
         $createdUtc,
-        [int]46,
+        [int]47,
         $boundaryPayload)
     $boundaryEnvelope = $createEnvelope.Invoke($null, $boundaryArguments)
     # Direct reflection retains the returned byte[] as one object instead of
@@ -1397,7 +1402,7 @@ $createInventoryArguments[2] = [long]1
 $createInventoryArguments[3] = $sessionId
 $createInventoryArguments[4] = $identity
 $createInventoryArguments[5] = $createdUtc
-$createInventoryArguments[6] = [int]46
+$createInventoryArguments[6] = [int]47
 $createInventoryArguments[7] = $replacementInventory
 $inventoryEnvelope = $createEnvelope.Invoke(
     $null,
@@ -1450,7 +1455,7 @@ Assert-ThrowsLike `
     "An undersized inventory request entered the wire protocol." | Out-Null
 
 $emptyInventoryArguments = [object[]]$createInventoryArguments.Clone()
-$emptyInventoryArguments[7] = [byte[]]([BitConverter]::GetBytes([int]109) + [BitConverter]::GetBytes([uint16]0))
+$emptyInventoryArguments[7] = [byte[]]([BitConverter]::GetBytes([int]110) + [BitConverter]::GetBytes([uint16]0))
 $emptyInventoryEnvelope = $createEnvelope.Invoke($null, $emptyInventoryArguments)
 [byte[]]$emptyInventoryWire = Invoke-OneArgument $encodeEnvelope $envelopeCodec $emptyInventoryEnvelope
 $emptyInventoryDecoded = Invoke-OneArgument $decodeEnvelope $envelopeCodec $emptyInventoryWire
@@ -1480,7 +1485,7 @@ $admissionArguments[2] = [long]$decodedInventory.BaseRevision
 $admissionArguments[3] = $decodedInventory.SessionId
 $admissionArguments[4] = $identity
 $admissionArguments[5] = $decodedInventory.CreatedUtc
-$admissionArguments[6] = [int]46
+$admissionArguments[6] = [int]47
 $admissionArguments[7] = $materialized
 $admissionEnvelope = $createEnvelope.Invoke(
     $null,
@@ -1492,7 +1497,7 @@ $checkpointArguments[2] = [long]$admissionEnvelope.BaseRevision
 $checkpointArguments[3] = $sessionId
 $checkpointArguments[4] = $identity
 $checkpointArguments[5] = $createdUtc
-$checkpointArguments[6] = [int]46
+$checkpointArguments[6] = [int]47
 $checkpointArguments[7] = $admissionEnvelope.GetPayloadCopy()
 $checkpointEnvelope = $createEnvelope.Invoke(
     $null,
@@ -1598,7 +1603,7 @@ foreach ($capturedHaveLogoutPoint in @($true, $false)) {
     # A reconnect Snapshot carries the full materialized profile, not a delta.
     # This is an envelope/selected-payload round trip, not a live reconnect.
     $coordinateCheckpoint = $createEnvelope.Invoke($null, [object[]]@(
-        $snapshotKind, [long]3, [long]2, $sessionId, $identity, $createdUtc, [int]46, $coordinateSplice))
+        $snapshotKind, [long]3, [long]2, $sessionId, $identity, $createdUtc, [int]47, $coordinateSplice))
     [byte[]]$coordinateCheckpointWire = $encodeEnvelope.Invoke($envelopeCodec,
         [object[]]@($coordinateCheckpoint))
     $coordinateCheckpointDecoded = Invoke-OneArgument $decodeEnvelope $envelopeCodec $coordinateCheckpointWire
