@@ -34,7 +34,7 @@ internal static partial class ServerManagerRuntime
     internal const string EventReportRpcName =
         "sighsorry.ServerManager.EventReport.v1";
     internal const string EventDisplayRpcName =
-        "sighsorry.ServerManager.EventDisplay.v2";
+        "sighsorry.ServerManager.EventDisplay.v3";
 
     private static readonly Dictionary<ZRpc, BufferedWorldSocket> WorldBuffers = new();
     private static readonly Dictionary<ZRpc, long> PendingDisconnects = new();
@@ -4781,6 +4781,25 @@ internal static partial class ServerManagerRuntime
         }
     }
 
+    internal static bool TryBroadcastOptionalCenterMessage(string message)
+    {
+        ZNet? server = ZNet.instance;
+        ServerManagerStatusSnapshot status = ServerEventRuntime.GetStatusSnapshot();
+        if (!_initialized || _shuttingDown || server == null || !server.IsServer() ||
+            !status.IsInitialized || !status.IsServer || !status.ServerStarted ||
+            !status.WorldReady || status.ShutdownStarted ||
+            !EventDisplayCodec.IsValidOptionalCenterMessage(message))
+        {
+            return false;
+        }
+
+        // Acceptance means this server dispatched the message to the current
+        // ready audience, not that every recipient displayed or acknowledged it.
+        BroadcastEventDisplay(EventDisplayCodec.OptionalCronCenterKind, message,
+            string.Empty, Array.Empty<string>(), 0);
+        return true;
+    }
+
     internal static void BroadcastEventDisplay(
         string kind, string message, string messageKey, string[] arguments, byte labelMask)
     {
@@ -4849,6 +4868,18 @@ internal static partial class ServerManagerRuntime
     {
         // Remote packets reach here only after authentication and sequence
         // advancement. The real listen host uses the same language-local path.
+        if (kind == EventDisplayCodec.OptionalCronCenterKind)
+        {
+            if (ServerManagerPlugin.ShowOptionalBroadcasts?.Value == false ||
+                UnityEngine.Application.isBatchMode || MessageHud.instance == null)
+            {
+                return;
+            }
+
+            MessageHud.instance.ShowMessage(MessageHud.MessageType.Center, message);
+            return;
+        }
+
         ServerEventOverlay.Show(kind, string.IsNullOrEmpty(key)
             ? message
             : EventMessageText.Render(key, arguments, labelMask));

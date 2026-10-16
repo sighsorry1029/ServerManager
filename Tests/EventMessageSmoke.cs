@@ -31,8 +31,10 @@ internal static class EventMessageSmoke
             FallbackAndNames();
             LocalizationTokens();
             DisplayPackets();
+            OptionalCenterPackets();
             OverlayLabels();
             OverlayToggle(args[2]);
+            OptionalCenterToggle(args[2]);
             Console.WriteLine("PASS: shared event phrasing and overlay (" + _checks + " assertions; no game or network).");
             return 0;
         }
@@ -311,18 +313,53 @@ internal static class EventMessageSmoke
 
         var valid = Packet("player.death", "sm_event_death_smoke_1", new[] { "player" });
         byte[] complete = EventDisplayCodec.Encode(valid).GetArray();
-        Check(BitConverter.ToUInt16(complete, 4) == 2, "Localized event packets require wire version two.");
+        Check(BitConverter.ToUInt16(complete, 4) == 3, "Optional broadcasts require display wire version three.");
         for (int length = 0; length < complete.Length; ++length)
             Check(!EventDisplayCodec.TryDecode(new ZPackage(complete.Take(length).ToArray()), out _), "Truncated event headers/arguments always fail closed.");
         byte[] invalidUtf8 = (byte[])complete.Clone(); invalidUtf8[invalidUtf8.Length - 1] = 0xff;
         Check(!EventDisplayCodec.TryDecode(new ZPackage(invalidUtf8), out _), "Malformed UTF-8 argument bytes are rejected before local rendering.");
         Check(!EventDisplayCodec.TryDecode(new ZPackage(complete.Concat(new byte[] { 0 }).ToArray()), out _) &&
             !EventDisplayCodec.TryDecode(new ZPackage(new byte[EventDisplayCodec.MaximumPacketBytes + 1]), out _), "Trailing payload bytes and oversized display packets are rejected.");
-        byte[] oldVersion = (byte[])complete.Clone(); oldVersion[4] = 1;
+        byte[] oldVersion = (byte[])complete.Clone(); oldVersion[4] = 2;
         Check(!EventDisplayCodec.TryDecode(new ZPackage(oldVersion), out _) && !EventDisplayCodec.TryDecode(new ZPackage(LegacyDisplay()), out _),
-            "Both version-byte downgrade and genuine literal-message v1 frames are rejected without legacy fallback.");
+            "Previous localized v2 and genuine literal-message v1 frames are rejected without legacy fallback.");
         var wrongMagic = (byte[])complete.Clone(); wrongMagic[0] ^= 0xff;
         Check(!EventDisplayCodec.TryDecode(new ZPackage(wrongMagic), out _), "A foreign display frame cannot enter the localization path.");
+    }
+
+    private static void OptionalCenterPackets()
+    {
+        const string text = "<color=yellow><size=32>서버 안내 $sm_event_unknown_player</size></color>\nsecond line";
+        var optional = Packet(EventDisplayCodec.OptionalCronCenterKind, "", Array.Empty<string>());
+        optional.Message = text;
+        Check(EventDisplayCodec.OptionalCronCenterKind == "cron.optional_center" &&
+            RoundTrip(optional).Message == text, "Optional cron messages retain their literal rich text in the existing authenticated frame.");
+        Check(EventDisplayCodec.IsValidOptionalCenterMessage(text), "The scheduling boundary accepts the same literal message contract.");
+        optional.Message = new string('가', 666) + "aa";
+        Check(EventDisplayCodec.IsValidOptionalCenterMessage(optional.Message), "The 2000-byte UTF-8 message boundary is accepted.");
+        RoundTrip(optional);
+        foreach (string invalid in new[] { "", "   ", "\t", "a\tb", "\0", new string('x', 2001), new string('가', 667) })
+        {
+            optional.Message = invalid;
+            Check(!EventDisplayCodec.IsValidOptionalCenterMessage(invalid), "Optional scheduling rejects empty, control-containing or oversized UTF-8 messages.");
+            RejectDisplay(optional);
+        }
+        foreach (var invalid in new[]
+        {
+            Packet(EventDisplayCodec.OptionalCronCenterKind, "sm_event_death_smoke_1", Array.Empty<string>()),
+            Packet(EventDisplayCodec.OptionalCronCenterKind, "", new[] { "extra" }),
+            Packet(EventDisplayCodec.OptionalCronCenterKind, "", Array.Empty<string>(), 1),
+            Packet("cron.unknown_center", "", Array.Empty<string>())
+        })
+        { invalid.Message = text; RejectDisplay(invalid); }
+        optional.Message = text;
+        byte[] complete = EventDisplayCodec.Encode(optional).GetArray();
+        for (int length = 0; length < complete.Length; ++length)
+            Check(!EventDisplayCodec.TryDecode(new ZPackage(complete.Take(length).ToArray()), out _), "Every truncated optional frame fails closed.");
+        Check(!EventDisplayCodec.TryDecode(new ZPackage(complete.Concat(new byte[] { 0 }).ToArray()), out _), "An optional kind does not permit trailing wire data.");
+        byte[] malformedUtf8 = (byte[])complete.Clone(); malformedUtf8[malformedUtf8.Length - 1] = 0xff;
+        Check(!EventDisplayCodec.TryDecode(new ZPackage(malformedUtf8), out _), "Malformed optional UTF-8 cannot enter the native HUD.");
+        optional.Sequence = 0; RejectDisplay(optional);
     }
 
     private static EventDisplayPacket Packet(string kind, string key, string[] arguments, byte mask = 0) => new EventDisplayPacket
@@ -356,7 +393,7 @@ internal static class EventMessageSmoke
         using (var writer = new BinaryWriter(stream, new UTF8Encoding(false, true), true))
         {
             byte[] kind = Encoding.UTF8.GetBytes(value.Kind), message = Encoding.UTF8.GetBytes(value.Message), key = Encoding.UTF8.GetBytes(value.MessageKey);
-            writer.Write(0x44454D53); writer.Write((ushort)2); writer.Write(value.SessionId); writer.Write(value.Nonce); writer.Write(value.Sequence);
+            writer.Write(0x44454D53); writer.Write((ushort)3); writer.Write(value.SessionId); writer.Write(value.Nonce); writer.Write(value.Sequence);
             writer.Write((byte)kind.Length); writer.Write((ushort)message.Length); writer.Write((byte)key.Length); writer.Write((byte)value.Arguments.Length); writer.Write(value.LabelMask);
             writer.Write(kind); writer.Write(message); writer.Write(key);
             foreach (string argument in value.Arguments) { byte[] bytes = Encoding.UTF8.GetBytes(argument); writer.Write((ushort)bytes.Length); writer.Write(bytes); }
@@ -482,6 +519,54 @@ internal static class EventMessageSmoke
         ServerManager.ServerManagerPlugin.ShowEventNotifications = null;
     }
 
+    private static void OptionalCenterToggle(string configurationPath)
+    {
+        var configuration = new ConfigFile(configurationPath, false) { SaveOnConfigSet = false };
+        var events = configuration.Bind("1 - Client", "Show Event Notifications", true);
+        var optional = configuration.Bind("1 - Client", "Show Optional Broadcasts", true);
+        ServerManager.ServerManagerPlugin.ShowEventNotifications = events;
+        ServerManager.ServerManagerPlugin.ShowOptionalBroadcasts = optional;
+        var draw = typeof(ServerEventOverlay).GetMethod("OnGUI", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var instance = typeof(ServerEventOverlay).GetField("_instance", BindingFlags.Static | BindingFlags.NonPublic)!;
+        const string literal = "<color=yellow><size=32>Literal 한국어 notice</size></color>";
+        foreach (bool eventEnabled in new[] { false, true })
+        foreach (bool optionalEnabled in new[] { false, true })
+        {
+            events.Value = eventEnabled; optional.Value = optionalEnabled;
+            ServerEventOverlay.Shutdown(); UnityEngine.GUILayout.Labels.Clear();
+            MessageHud.instance = new MessageHud();
+            int owners = UnityEngine.GameObject.CreatedCount;
+            ServerManager.ServerManagerRuntime.ShowEventDisplay(EventDisplayCodec.OptionalCronCenterKind, literal, "", Array.Empty<string>(), 0);
+            Check(MessageHud.instance.Messages.Count == (optionalEnabled ? 1 : 0), "Optional center visibility depends only on its own live client toggle.");
+            Check(instance.GetValue(null) == null && UnityEngine.GameObject.CreatedCount == owners,
+                "Optional center notices never create or enqueue an event overlay, including when hidden.");
+            if (optionalEnabled)
+                Check(MessageHud.instance.Messages[0] == literal && MessageHud.instance.LastType == MessageHud.MessageType.Center,
+                    "Native center HUD receives the literal rich text without translation or a SERVER prefix.");
+            ServerManager.ServerManagerRuntime.ShowEventDisplay("server.announcement", "normal announcement", "", Array.Empty<string>(), 0);
+            if (instance.GetValue(null) is ServerEventOverlay overlay) draw.Invoke(overlay, null);
+            Check(UnityEngine.GUILayout.Labels.SequenceEqual(eventEnabled ? new[] { "[SERVER] normal announcement" } : Array.Empty<string>()),
+                "Ordinary event display remains controlled by Show Event Notifications, independently of optional broadcasts.");
+            Check(MessageHud.instance.Messages.Count == (optionalEnabled ? 1 : 0), "An ordinary announcement does not enter the optional center path.");
+        }
+        ServerEventOverlay.Shutdown(); MessageHud.instance = new MessageHud();
+        optional.Value = false;
+        ServerManager.ServerManagerRuntime.ShowEventDisplay(EventDisplayCodec.OptionalCronCenterKind, "hidden", "", Array.Empty<string>(), 0);
+        optional.Value = true;
+        Check(MessageHud.instance.Messages.Count == 0, "Re-enabling optional broadcasts does not replay hidden notices.");
+        ServerManager.ServerManagerRuntime.ShowEventDisplay(EventDisplayCodec.OptionalCronCenterKind, "new", "", Array.Empty<string>(), 0);
+        Check(MessageHud.instance.Messages.SequenceEqual(new[] { "new" }), "Only a newly received optional notice displays after enabling.");
+        MessageHud.instance.Messages.Clear(); UnityEngine.Application.isBatchMode = true;
+        ServerManager.ServerManagerRuntime.ShowEventDisplay(EventDisplayCodec.OptionalCronCenterKind, "dedicated", "", Array.Empty<string>(), 0);
+        Check(MessageHud.instance.Messages.Count == 0, "Dedicated/batch mode never renders optional broadcasts.");
+        UnityEngine.Application.isBatchMode = false; MessageHud.instance = null;
+        ServerManager.ServerManagerRuntime.ShowEventDisplay(EventDisplayCodec.OptionalCronCenterKind, "no HUD", "", Array.Empty<string>(), 0);
+        MessageHud.instance = new MessageHud(); ServerManager.ServerManagerPlugin.ShowOptionalBroadcasts = null;
+        ServerManager.ServerManagerRuntime.ShowEventDisplay(EventDisplayCodec.OptionalCronCenterKind, "default", "", Array.Empty<string>(), 0);
+        Check(MessageHud.instance.Messages.SequenceEqual(new[] { "default" }), "An unbound optional setting safely preserves default-on behavior.");
+        ServerManager.ServerManagerPlugin.ShowEventNotifications = null; MessageHud.instance = null;
+    }
+
     private static ServerManagerEvent Make(string bucket, string id) => new ServerManagerEvent
     {
         EventId = id,
@@ -533,6 +618,7 @@ namespace ServerManager
     internal static class ServerManagerPlugin
     {
         internal static ConfigEntry<bool>? ShowEventNotifications { get; set; }
+        internal static ConfigEntry<bool>? ShowOptionalBroadcasts { get; set; }
     }
     // Deliberately strict resource adapter: a missing Korean key throws rather
     // than hiding the omission behind English fallback. The actual bundled
@@ -572,6 +658,15 @@ public sealed class ZPackage
     public ZPackage(byte[] data) => _data = data;
     public int Size() => _data.Length;
     public byte[] GetArray() => _data;
+}
+
+public sealed class MessageHud
+{
+    public enum MessageType { Center }
+    public static MessageHud? instance;
+    public readonly List<string> Messages = new List<string>();
+    public MessageType LastType;
+    public void ShowMessage(MessageType type, string message) { LastType = type; Messages.Add(message); }
 }
 
 namespace UnityEngine

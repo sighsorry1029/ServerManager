@@ -16,7 +16,7 @@ Assert-True (Test-Path -LiteralPath $bepInExPath) 'Real BepInEx configuration as
 # Execute production bindings against real BepInEx without launching Unity.
 $propertyMatches = [regex]::Matches($pluginSource,
     'internal static ConfigEntry<[^>]+> \w+ \{ get; private set; \} = null!;')
-Assert-True ($propertyMatches.Count -eq 5) 'CFG must expose exactly four branding properties and one client notification toggle.'
+Assert-True ($propertyMatches.Count -eq 6) 'CFG must expose four branding properties and two independent client notification toggles.'
 $properties = ($propertyMatches | ForEach-Object { $_.Value.Replace(' = null!;', '') }) -join [Environment]::NewLine
 $methodStart = $pluginSource.IndexOf('    private void BindConfiguration()')
 $classEnd = $pluginSource.LastIndexOf('}')
@@ -43,6 +43,7 @@ namespace ServerManagerConfigurationSmoke
         public ConfigEntryBase GetNotification()
         { return Get("Show Event Notifications"); }
         public bool NotificationsVisible() { return ShowEventNotifications.Value; }
+        public bool OptionalBroadcastsVisible() { return ShowOptionalBroadcasts.Value; }
         $methods
     }
 }
@@ -56,14 +57,15 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
 }
 Add-Type -TypeDefinition $probeSource -ReferencedAssemblies $compilerReferences
 $expected = @'
-Server Address||5
-Server Password||4
-Server Button Text|Start Modded Valheim Server|3
-Logo Path|https://i.ibb.co/23XsG7tz/download.png|2
-Show Event Notifications|True|1
+Server Address||6
+Server Password||5
+Server Button Text|Start Modded Valheim Server|4
+Logo Path|https://i.ibb.co/23XsG7tz/download.png|3
+Show Event Notifications|True|2
+Show Optional Broadcasts|True|1
 '@
 function Assert-ClientSurface($Probe) {
-    Assert-True ($Probe.Config.Count -eq 5) 'ConfigFile must contain exactly five active client-local entries.'
+    Assert-True ($Probe.Config.Count -eq 6) 'ConfigFile must contain exactly six active client-local entries.'
     Assert-True (@($Probe.Config.Keys | Where-Object { $_.Section -cne '1 - Client' }).Count -eq 0) 'Every active setting must belong to the single 1 - Client section.'
     Assert-True (@($Probe.Config.Keys | Where-Object { $_.Key -ceq 'Enabled' }).Count -eq 0) 'The client branding Enabled toggle must not be active.'
     $orderedKeys = foreach ($row in ($expected -split '\r?\n')) {
@@ -79,7 +81,7 @@ function Assert-ClientSurface($Probe) {
         [pscustomobject]@{ Key = $columns[0]; Order = [int]$order }
     }
     Assert-True ((@($orderedKeys | Sort-Object Order -Descending | ForEach-Object Key) -join '|') -ceq
-        'Server Address|Server Password|Server Button Text|Logo Path|Show Event Notifications') 'Configuration Manager must display the five client settings in the requested order.'
+        'Server Address|Server Password|Server Button Text|Logo Path|Show Event Notifications|Show Optional Broadcasts') 'Configuration Manager must display the six client settings in the requested order.'
 }
 function Assert-ClientDefaults($Probe) {
     foreach ($row in ($expected -split '\r?\n')) {
@@ -99,13 +101,19 @@ try {
     $generated = Get-Content -LiteralPath $configPath -Raw
     $sections = [regex]::Matches($generated, '(?m)^\[([^\r\n]+)\]')
     Assert-True ($sections.Count -eq 1 -and $sections[0].Groups[1].Value -ceq '1 - Client') 'Fresh client CFG must serialize only the 1 - Client section.'
-    Assert-True ([regex]::Matches($generated, '(?m)^[^#\[\r\n][^\r\n]* = ').Count -eq 5) 'Serialized fresh client CFG has wrong key count.'
+    Assert-True ([regex]::Matches($generated, '(?m)^[^#\[\r\n][^\r\n]* = ').Count -eq 6) 'Serialized fresh client CFG has wrong key count.'
     Assert-True ($generated -notmatch '(?m)^Enabled = ') 'Fresh client CFG must not serialize an Enabled toggle.'
     $notification = $probe.GetNotification()
     Assert-True ($null -ne $notification -and $notification.BoxedValue -eq $true -and $probe.NotificationsVisible()) 'Event notifications must default to true.'
     Assert-True ($notification.Description.Description -match 'client-local') 'Notification setting must explicitly remain client-local.'
     $notification.BoxedValue = $false
     Assert-True (-not $probe.NotificationsVisible()) 'A real in-memory ConfigEntry update must immediately expose false without reloading CFG.'
+    $optional = $probe.Get('Show Optional Broadcasts')
+    Assert-True ($optional.BoxedValue -eq $true -and $probe.OptionalBroadcastsVisible()) 'Optional broadcasts default to enabled independently of event notifications.'
+    Assert-True ($optional.Description.Description -match 'client-local') 'Optional broadcast setting must explicitly remain client-local.'
+    $notification.BoxedValue = $true
+    $optional.BoxedValue = $false
+    Assert-True ($probe.NotificationsVisible() -and -not $probe.OptionalBroadcastsVisible()) 'Optional broadcasts must be independently mutable without suppressing normal event notifications.'
     Assert-True ($probe.Get('Server Button Text').BoxedValue -ceq 'Start Modded Valheim Server' -and
         $probe.Get('Logo Path').BoxedValue -ceq 'https://i.ibb.co/23XsG7tz/download.png') 'Notification changes must not alter branding settings.'
     $notification.BoxedValue = $true
@@ -164,6 +172,7 @@ Server Password = configured-fixture-only
 Server Button Text = Configured Server
 Logo Path = plugins/Fixture/logo.png
 Show Event Notifications = false
+Show Optional Broadcasts = false
 [4 - Client branding]
 Enabled = true
 Server Address = legacy.example.invalid:2456
@@ -180,13 +189,15 @@ Show Event Notifications = true
     Assert-True ($persisted.Get('Server Button Text').BoxedValue -ceq 'Configured Server') 'The new client section button must be respected.'
     Assert-True ($persisted.Get('Logo Path').BoxedValue -ceq 'plugins/Fixture/logo.png') 'The new client section logo must be respected.'
     Assert-True (-not $persisted.GetNotification().BoxedValue -and -not $persisted.NotificationsVisible()) 'The new client section notification-off value must override the true default without reading legacy settings.'
+    Assert-True (-not $persisted.OptionalBroadcastsVisible()) 'The optional-broadcast off value must override the true default.'
     $persisted.GetNotification().BoxedValue = $true
     Assert-True ($persisted.NotificationsVisible() -and $persisted.Get('Server Button Text').BoxedValue -ceq 'Configured Server') 'Notification visibility must change independently of persisted branding values.'
     $probe.Config.Save()
     $reopened = New-Object ServerManagerConfigurationSmoke.Probe($configPath)
     Assert-ClientSurface $reopened
     Assert-True (-not $reopened.GetNotification().BoxedValue -and -not $reopened.NotificationsVisible()) 'Saving and reopening the real CFG must preserve the notification off value.'
-    Write-Host "Configuration surface smoke passed: $assertions assertions, five client-local keys, one section, ordered metadata, real BepInEx ConfigFile."
+    Assert-True (-not $reopened.OptionalBroadcastsVisible()) 'Saving and reopening the real CFG must preserve optional-broadcast off independently.'
+    Write-Host "Configuration surface smoke passed: $assertions assertions, six client-local keys, one section, ordered metadata, real BepInEx ConfigFile."
 } finally {
     $resolvedTestDirectory = [IO.Path]::GetFullPath($testDirectory)
     if (-not $resolvedTestDirectory.StartsWith($temporaryRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or

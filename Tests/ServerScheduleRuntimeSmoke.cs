@@ -39,7 +39,7 @@ internal static class ServerScheduleRuntimeSmoke
     {
         try
         {
-            Lifecycle(); GuardsAndFiles(); AlternateConfiguration(); CanonicalJournalStartup(); RoutingAndBudget(); Gates(); PollingAndLogging(); Saves(); ReloadAndRetirement(); ReentrancyAndSuspension();
+            Lifecycle(); GuardsAndFiles(); AlternateConfiguration(); CanonicalJournalStartup(); RoutingAndBudget(); OptionalCenterBroadcasts(); Gates(); PollingAndLogging(); Saves(); ReloadAndRetirement(); ReentrancyAndSuspension();
             DurableDispatchAndCatchup(); AutomaticUpgradeWorldPolicies(); UpgradeWorldOwnership(); UntrackedUpgrade(); SynchronousMutationAbort(); MaintenanceSequence(); MaintenanceFailureAndRecovery(); MaintenanceReload(); MaintenanceReviewBarrier(); MaintenanceAdmission();
             Console.WriteLine("ServerScheduleRuntimeSmoke: PASS (" + _checks +
                 " assertions; source-linked runtime/parser/engine/journal; stub game/command/Upgrade World boundaries, no native game execution).");
@@ -66,6 +66,7 @@ internal static class ServerScheduleRuntimeSmoke
         ServerConsoleExecutor.Lines.Clear(); ServerConsoleExecutor.Disposals = 0;
         ServerConsoleExecutor.NextResult = null; ServerConsoleExecutor.OnExecute = null;
         ServerCommands.Calls.Clear(); ServerCommands.NextTask = null;
+        ServerManagerRuntime.CenterMessages.Clear(); ServerManagerRuntime.AcceptCenterMessages = true;
         ServerEventRuntime.Audits.Clear(); ServerEventRuntime.Saves.Clear(); ServerEventRuntime.NextSave = null;
         ServerEventRuntime.CommandWorldEpoch++;
         UpgradeWorldScheduleBridge.Reset();
@@ -84,9 +85,9 @@ internal static class ServerScheduleRuntimeSmoke
     private static void Frame()
     {
         if (Session != null) Set(Session!, "_nextRead", long.MaxValue);
-        int before = ServerConsoleExecutor.Lines.Count + ServerCommands.Calls.Count + ServerEventRuntime.Saves.Count;
+        int before = ServerConsoleExecutor.Lines.Count + ServerCommands.Calls.Count + ServerEventRuntime.Saves.Count + ServerManagerRuntime.CenterMessages.Count;
         ServerScheduleRuntime.Tick();
-        int after = ServerConsoleExecutor.Lines.Count + ServerCommands.Calls.Count + ServerEventRuntime.Saves.Count;
+        int after = ServerConsoleExecutor.Lines.Count + ServerCommands.Calls.Count + ServerEventRuntime.Saves.Count + ServerManagerRuntime.CenterMessages.Count;
         Check(after - before <= 2, "Per-frame command dispatch stays bounded at two.");
     }
 
@@ -312,6 +313,53 @@ internal static class ServerScheduleRuntimeSmoke
         Check(ServerCommands.Calls.Count == 1 && Runs.Count == 1 && Claims == 1, "Unfinished common command prevents same-ID overlap.");
         pending.SetException(new InvalidOperationException("expected fixture")); Tick();
         Check(Runs.Count == 0 && ServerConsoleExecutor.Lines.Count == 0, "Task fault stops chain without executing tail.");
+    }
+
+    private static void OptionalCenterBroadcasts()
+    {
+        foreach (string extra in new[] { "", "    allowClientHide: false\n" })
+        {
+            const string line = "broadcast center <color=yellow>Required  notice</color>";
+            Activate("jobs:\n" + Job("required", new[] { line }, extra)); Due();
+            Check(ServerConsoleExecutor.Lines.SequenceEqual(new[] { line }) && ServerManagerRuntime.CenterMessages.Count == 0,
+                "Absent/false keeps the original external center-broadcast route exactly once");
+        }
+
+        const string text = "<color=#ffaa00>Don't  \"panic</color> \\ keep literal";
+        string optional = "jobs:\n" + Job("optional", new[] { "broadcast center " + text, "broadcast top external", "announce unchanged", "echo tail" }, "    allowClientHide: true\n");
+        Activate(optional); Due(); Tick();
+        Check(ServerManagerRuntime.CenterMessages.SequenceEqual(new[] { text }), "Marked center sends its exact raw suffix once through the authenticated-display boundary");
+        Check(ServerConsoleExecutor.Lines.SequenceEqual(new[] { "broadcast top external", "echo tail" }) &&
+            ServerCommands.Calls.Select(call => call.Line).SequenceEqual(new[] { "announce unchanged" }),
+            "Optional center does not also invoke external broadcast; other channels and commands retain their original routing");
+        Check(ServerEventRuntime.Audits.Count(a => a.Verb == "broadcast") == 2 &&
+            ServerEventRuntime.Audits.All(a => a.Source == "cron" && a.Id == JobId() && a.Name == JobId()),
+            "Center and external broadcasts retain normal per-command cron auditing and identity");
+        ServerEventRuntime.Audit completed = ServerEventRuntime.Audits.Single(a => a.Verb == "schedule");
+        Check(completed.Code == "cron_completed" && completed.Success &&
+            completed.Data["cron_summary"] == "broadcast: " + text + " → broadcast: external → announce: unchanged → echo" &&
+            Runs.Count == 0 && Claims == 0,
+            "Literal quote content remains in the final job summary without changing completion or durable claim release");
+
+        Activate("jobs:\n" + Job("failed", new[] { "broadcast center message", "echo forbidden-tail" }, "    allowClientHide: true\n"));
+        ServerManagerRuntime.AcceptCenterMessages = false; Due(); Tick();
+        Check(ServerManagerRuntime.CenterMessages.Count == 1 && ServerConsoleExecutor.Lines.Count == 0 &&
+            ServerEventRuntime.Audits.Single(a => a.Verb == "schedule").Code == "send_failed" && Claims == 0,
+            "A refused center broadcast stops the job without raw fallback, replay or tail execution");
+
+        string pendingYaml = "jobs:\n" + Job("pending", new[] { "announce pending", "broadcast center captured" }, "    allowClientHide: true\n");
+        Activate(pendingYaml);
+        var pending = new TaskCompletionSource<ServerManagerCommandResult>(); ServerCommands.NextTask = pending.Task;
+        Due(); string identity = JobId();
+        Reload(pendingYaml.Replace("allowClientHide: true", "allowClientHide: false"));
+        Check(ServerCommands.Calls.Single().Caller.Cancellation.IsCancellationRequested && ServerManagerRuntime.CenterMessages.Count == 0,
+            "Display-policy reload retires a delayed ordinary run before its optional center tail");
+        pending.SetResult(new ServerManagerCommandResult(true, "ok", "completed")); ServerCommands.NextTask = null; Tick();
+        Check(JobId() == identity && ServerManagerRuntime.CenterMessages.Count == 0 && ServerConsoleExecutor.Lines.Count == 0,
+            "Cancelled old run emits neither marked nor raw stale tail and retains its job ID");
+        Due();
+        Check(ServerConsoleExecutor.Lines.SequenceEqual(new[] { "broadcast center captured" }) && ServerManagerRuntime.CenterMessages.Count == 0,
+            "Next occurrence follows the newly required external-display policy");
     }
 
     private static void Gates()
@@ -915,6 +963,13 @@ public class Terminal
 }
 namespace ServerManager
 {
+    internal static class ServerManagerRuntime
+    {
+        internal static readonly List<string> CenterMessages = new();
+        internal static bool AcceptCenterMessages = true;
+        internal static bool TryBroadcastOptionalCenterMessage(string message)
+        { CenterMessages.Add(message); return AcceptCenterMessages; }
+    }
     internal static class ValheimPrivateAccess
     {
         internal static readonly Dictionary<string, Terminal.ConsoleCommand> Commands = new(StringComparer.OrdinalIgnoreCase);
@@ -1032,6 +1087,14 @@ namespace ServerManager.Commands
 }
 namespace ServerManager.Events
 {
+    // Inert wire-validation boundary; the production codec has separate wire tests.
+    internal static class EventDisplayCodec
+    {
+        internal const int MaximumMessageBytes = 2000;
+        internal static bool IsValidOptionalCenterMessage(string message) =>
+            !string.IsNullOrWhiteSpace(message) && !message.Any(char.IsControl) &&
+            new UTF8Encoding(false, true).GetByteCount(message) <= MaximumMessageBytes;
+    }
     internal enum ServerEventCommandKind { Save }
     internal enum ServerManagerSaveState { InProgress, Failed, CheckpointCompleted }
     internal enum ServerManagerCharacterCommitScope { Partial, AllRetainedShadowsAtCutoff }

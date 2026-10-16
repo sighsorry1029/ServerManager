@@ -3435,8 +3435,8 @@ $allStatic = [Reflection.BindingFlags]"Static,Public,NonPublic"
 $protocolWireVersion = $protocolCodecType.GetField(
     "WireVersion",
     [Reflection.BindingFlags]"Static,Public").GetRawConstantValue()
-Assert-True ($protocolWireVersion -eq 23) `
-    "The main protocol wire version was not bumped to 23 for display-only admission metadata."
+Assert-True ($protocolWireVersion -eq 24) `
+    "The main protocol wire version was not bumped to 24 for optional center displays."
 
 $limitsArguments = [object[]]::new(6)
 $limitsArguments[0] = 512 * 1024
@@ -3483,10 +3483,10 @@ $challengePackage = $createChallenge.Invoke($null, $createArguments)
 
 $decodedPacket = Decode-ProtocolPacket $challengePackage $limits
 Assert-True $decodedPacket.Succeeded `
-    "A valid wire-v23 challenge packet was rejected."
+    "A valid wire-v24 challenge packet was rejected."
 $decodedChallenge = Decode-ChallengeOptions $decodedPacket.Packet
 Assert-True $decodedChallenge.Succeeded `
-    "Valid wire-v23 challenge options were rejected."
+    "Valid wire-v24 challenge options were rejected."
 
 $createFinalSaveBegin = $protocolCodecType.GetMethod(
     "CreateFinalSaveBegin",
@@ -3496,7 +3496,7 @@ $createFinalSaveReady = $protocolCodecType.GetMethod(
     $allStatic)
 Assert-True ($null -ne $createFinalSaveBegin -and
     $null -ne $createFinalSaveReady) `
-    "The wire-v23 final-save gate packet factories were missing."
+    "The wire-v24 final-save gate packet factories were missing."
 $finalControlArguments = [object[]]@($sessionId, $nonce, $limits)
 $finalBeginPacket = Decode-ProtocolPacket (
     $createFinalSaveBegin.Invoke($null, $finalControlArguments)) $limits
@@ -5360,5 +5360,5 @@ Assert-True ($staleObservationOffset -ge 0 -and $processObservationOffset -gt $s
     $fixedRuntimeSource.Substring($staleObservationOffset, $processObservationOffset - $staleObservationOffset).Contains(
         'LogDetection(identity, report, DetectionAction.Log, "stale_policy_observation")')) 'Old observations can inherit new terminal responses.'
 
-Write-Output ("Fixed 120-second/30-second timeout wiring and separate 10 MiB server/32 MiB client character bounds, unified responses, server-only snapshot stat evidence, post-ACK guarded stat sanctions/audit, anti-cheat wire-v23, authenticated hot policy updates, generation-bound reports, generic security rejection, gameplay limits, first-join/two-phase final-save gate, report-codec, exact-name/module, assembly, " +
+Write-Output ("Fixed 120-second/30-second timeout wiring and separate 10 MiB server/32 MiB client character bounds, unified responses, server-only snapshot stat evidence, post-ACK guarded stat sanctions/audit, anti-cheat wire-v24, authenticated hot policy updates, generation-bound reports, generic security rejection, gameplay limits, first-join/two-phase final-save gate, report-codec, exact-name/module, assembly, " +
     "admin-entitlement, event-integration, flood-cap, and command-queue smoke tests passed.")

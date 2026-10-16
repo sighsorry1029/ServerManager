@@ -346,6 +346,19 @@ internal static class ServerScheduleRuntime
                 run.Verb == "ban" || run.Verb == "unban";
             run.SaveRequested = false;
             run.Deadline = Stopwatch.GetTimestamp() + 120 * Stopwatch.Frequency;
+            if (run.Occurrence.Job.AllowClientHide && !prefixed &&
+                ServerScheduleSettings.TryGetCenterBroadcast(line, out string centerMessage))
+            {
+                // This opted-in display is owned by ServerManager. Never also invoke
+                // the external console handler, which would send an unfilterable duplicate.
+                run.Verb = "broadcast";
+                run.Common = false;
+                bool accepted = ServerManagerRuntime.TryBroadcastOptionalCenterMessage(centerMessage);
+                CompleteCommand(run, Result(accepted, accepted ? "message_sent" : "send_failed",
+                    accepted ? "Optional center broadcast accepted; client delivery is not acknowledged."
+                        : "The optional center broadcast could not be sent."));
+                return;
+            }
             if (run.Verb != "save" && (!run.Common || run.Occurrence.Job.Maintenance))
             {
                 string? validation = ValidateUpgradeWorldCommand(line);
@@ -492,19 +505,22 @@ internal static class ServerScheduleRuntime
         {
             ServerScheduleJob job = run.Occurrence.Job;
             bool multiple = job.Commands.Count > 1;
-            string summary = string.Join(" → ", job.Commands.Select(command => CronCommandSummary(command, multiple)));
+            string summary = string.Join(" → ", job.Commands.Select(command => CronCommandSummary(command, multiple, job.AllowClientHide)));
             Dictionary<string, string> data = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["cron_schedule"] = job.Cron,
                 ["cron_command_count"] = job.Commands.Count.ToString(CultureInfo.InvariantCulture),
                 ["cron_summary"] = ServerCommands.BoundedText(summary, 1000)
             };
-            if (!multiple) data["cron_verb"] = FirstVerb(job.Commands[0]);
+            if (!multiple) data["cron_verb"] = job.AllowClientHide &&
+                ServerScheduleSettings.TryGetCenterBroadcast(job.Commands[0], out _) ? "broadcast" : FirstVerb(job.Commands[0]);
             return data;
         }
 
-        private static string CronCommandSummary(string line, bool includeVerb)
+        private static string CronCommandSummary(string line, bool includeVerb, bool allowClientHide)
         {
+            if (allowClientHide && ServerScheduleSettings.TryGetCenterBroadcast(line, out string centerMessage))
+                return includeVerb ? "broadcast: " + centerMessage : centerMessage;
             if (!ServerCommands.TryTokenize(line, out string[] args, out _) || args.Length == 0)
                 return string.Empty;
             string verb = FirstVerb(line);

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0
+
+- Added per-job `allowClientHide` for scheduled `broadcast center` messages. It defaults to `false`, preserving existing notices; set it to `true` for repeated tips players may hide.
+- Added the client-local **Show Optional Broadcasts** setting, enabled by default and independent of **Show Event Notifications**. Configuration Manager changes apply to new messages immediately.
+- Preserved message color and size tags, scheduled execution, logs and Discord reports. Changing the hide permission does not reset saved schedule progress; manual broadcasts and other game messages are unchanged.
+- Added regression coverage for optional-message routing, independent display settings, authentication and schedule reloads.
+- Update ServerManager on both the server and all clients; the connection protocol has changed.
+
 ## 1.1.10
 
 - Improved connection compatibility by accepting bounded server-side PeerInfo extensions instead of disconnecting with "PeerInfo contained trailing data." Original packet data is preserved for Valheim and mod handlers.

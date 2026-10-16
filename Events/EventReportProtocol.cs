@@ -427,13 +427,28 @@ namespace ServerManager.Events
     internal static class EventDisplayCodec
     {
         private const int Magic = 0x44454D53; // "SMED"
-        private const ushort WireVersion = 2;
+        private const ushort WireVersion = 3;
         private const int MaximumKindBytes = 64;
-        private const int MaximumMessageBytes = 2000;
+        internal const int MaximumMessageBytes = 2000;
         private const int MaximumKeyBytes = 96;
         private const int MaximumArgumentBytes = 320;
         private static readonly UTF8Encoding StrictUtf8 = new(false, true);
         internal const int MaximumPacketBytes = 2304;
+        internal const string OptionalCronCenterKind = "cron.optional_center";
+
+        internal static bool IsValidOptionalCenterMessage(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message) ||
+                ContainsControl(message, allowLineBreaks: true)) return false;
+            try
+            {
+                return StrictUtf8.GetByteCount(message) <= MaximumMessageBytes;
+            }
+            catch (EncoderFallbackException)
+            {
+                return false;
+            }
+        }
 
         internal static ZPackage Encode(EventDisplayPacket packet)
         {
@@ -585,7 +600,7 @@ namespace ServerManager.Events
         {
             if (packet.Arguments == null || packet.Arguments.Length > 2 ||
                 ContainsControl(packet.Kind ?? string.Empty, allowLineBreaks: false)) return false;
-            if (packet.Kind == "server.announcement")
+            if (packet.Kind == "server.announcement" || packet.Kind == OptionalCronCenterKind)
                 return !string.IsNullOrWhiteSpace(packet.Message) &&
                        string.IsNullOrEmpty(packet.MessageKey) && packet.Arguments.Length == 0 && packet.LabelMask == 0 &&
                        !ContainsControl(packet.Message, allowLineBreaks: true);

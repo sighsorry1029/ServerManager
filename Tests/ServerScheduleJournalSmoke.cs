@@ -281,3 +281,15 @@ internal static class ServerScheduleJournalSmoke
         Bad(() => { using ServerScheduleJournal journal = ServerScheduleJournal.Open(path, "one-too-many"); }, "World bound exceeded");
     }
 }
+
+namespace ServerManager.Events
+{
+    // Inert wire-validation boundary; the production codec has separate wire tests.
+    internal static class EventDisplayCodec
+    {
+        internal const int MaximumMessageBytes = 2000;
+        internal static bool IsValidOptionalCenterMessage(string message) =>
+            !string.IsNullOrWhiteSpace(message) && !message.Any(char.IsControl) &&
+            new System.Text.UTF8Encoding(false, true).GetByteCount(message) <= MaximumMessageBytes;
+    }
+}

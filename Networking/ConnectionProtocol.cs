@@ -589,9 +589,9 @@ namespace ServerManager
     public static class ProtocolPacketCodec
     {
         private const int Magic = 0x52474D53; // "SMGR" when viewed as little-endian bytes.
-        // Version 23 adds bounded display-only character names to manifest
-        // responses, retaining version 22's expanded cheat-detection coverage.
-        public const ushort WireVersion = 23;
+        // Version 24 requires optional center-broadcast display semantics,
+        // retaining version 23's bounded display-only manifest character names.
+        public const ushort WireVersion = 24;
         internal const int MaximumReportedCharacterNameCharacters = 96;
         internal const int MaximumReportedCharacterNameBytes = 384;
         internal const int MaximumManifestMetadataBytes = sizeof(ushort) + MaximumReportedCharacterNameBytes;

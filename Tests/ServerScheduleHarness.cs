@@ -12,7 +12,7 @@ internal static class ServerScheduleHarness
     {
         try
         {
-            Parser(); Identity(); DefaultMaintenanceExample(); UpgradeWorldCatalog(); Scheduling(); Reload(); Zones(); AcknowledgeTimer();
+            Parser(); OptionalCenterBroadcasts(); Identity(); DefaultMaintenanceExample(); UpgradeWorldCatalog(); Scheduling(); Reload(); Zones(); AcknowledgeTimer();
             Console.WriteLine("PASS: cron parser/engine " + _checks + " assertions; no Unity, commands, network or user data.");
             return 0;
         }
@@ -46,7 +46,7 @@ internal static class ServerScheduleHarness
     }
 
     private static string Job(string command = "save", string cron = "*/10 * * * * *", string extra = "") =>
-        "  - command: '" + command + "'\n    schedule: '" + cron + "'\n" + extra;
+        "  - command: '" + command.Replace("'", "''") + "'\n    schedule: '" + cron + "'\n" + extra;
     private static ServerScheduleSettings Config(string cron = "*/10 * * * * *", string extra = "") =>
         ServerScheduleSettings.Parse("timezone: UTC\njobs:\n" + Job(cron: cron, extra: extra));
 
@@ -59,7 +59,7 @@ internal static class ServerScheduleHarness
         Check(empty.TimeZone.Id == TimeZoneInfo.Local.Id, "Omitted zone uses local");
         ServerScheduleJob job = Config().Jobs.Single();
         Check(job.Id.StartsWith("save-", StringComparison.Ordinal) && job.Id.Length <= 64 && job.Log && job.Commands.Single() == "save" && job.Enabled && job.Chance == 1 &&
-            !job.UseGameTime && job.GlobalKeys.Count == 0 && job.BannedGlobalKeys.Count == 0, "Defaults");
+            !job.UseGameTime && !job.AllowClientHide && job.GlobalKeys.Count == 0 && job.BannedGlobalKeys.Count == 0, "Defaults");
         job = Config(extra: "    log: false\n    chance: 0.25\n    useGameTime: true\n    globalKeys: 'b, a, a'\n    bannedGlobalKeys: c\n").Jobs.Single();
         Check(job.Enabled && !job.Log && job.Chance == .25 && job.UseGameTime && job.GlobalKeys.SequenceEqual(new[] { "a", "b" }) &&
             job.BannedGlobalKeys.Single() == "c", "Optional fields and canonical key sets");
@@ -118,7 +118,7 @@ internal static class ServerScheduleHarness
             Bad("jobs:\n" + Job(extra: "    chance: " + chance + "\n"));
         foreach (string flag in new[] { "yes", "True", "'true'", "1", "null" })
         {
-            foreach (string name in new[] { "log", "useGameTime" }) Bad("jobs:\n" + Job(extra: "    " + name + ": " + flag + "\n"));
+            foreach (string name in new[] { "log", "useGameTime", "allowClientHide" }) Bad("jobs:\n" + Job(extra: "    " + name + ": " + flag + "\n"));
             foreach (string name in new[] { "logJobs", "logSkipped", "discordConnector" }) Bad(name + ": " + flag);
         }
         Bad("jobs:\n" + Job() + Job());
@@ -142,6 +142,54 @@ internal static class ServerScheduleHarness
         Bad("#" + new string('x', ServerScheduleSettings.MaximumFileBytes) + "\n{}");
         Bad("#" + new string('한', ServerScheduleSettings.MaximumFileBytes / 2) + "\n{}");
         Bad("#\ud800\n{}");
+    }
+
+    private static void OptionalCenterBroadcasts()
+    {
+        const string body = "<color=#ffaa00>Don't  \"panic</color> \\ keep literal";
+        string command = "broadcast center " + body;
+        string yaml = "timezone: UTC\njobs:\n" + Job(command);
+        ServerScheduleJob original = ServerScheduleSettings.Parse(yaml).Jobs.Single();
+        ServerScheduleJob forced = ServerScheduleSettings.Parse(yaml + "    allowClientHide: false\n").Jobs.Single();
+        ServerScheduleSettings optionalSettings = ServerScheduleSettings.Parse(yaml + "    allowClientHide: true\n", _ => false);
+        ServerScheduleJob optional = optionalSettings.Jobs.Single();
+        Check(!original.AllowClientHide && !forced.AllowClientHide && optional.AllowClientHide,
+            "Absent/false retain required broadcasts; true explicitly opts in");
+        Check(optional.Commands.Single() == command && ServerScheduleSettings.TryGetCenterBroadcast(command, out string parsed) && parsed == body,
+            "Center extraction retains rich text, apostrophes, quote characters, backslashes and repeated spaces");
+        Check(ServerScheduleSettings.TryGetCenterBroadcast("  BROADCAST\tcenter   exact  body  ", out parsed) && parsed == "exact  body  ",
+            "Exact command words accept whitespace/case while leaving the body suffix intact");
+        foreach (string other in new[] { "broadcast top hi", "sm:broadcast center hi", "broadcast centered hi", "broadcastcenter hi", "\"broadcast\" center hi", "broadcast \"center\" hi" })
+            Check(!ServerScheduleSettings.TryGetCenterBroadcast(other, out _), "Only the unprefixed exact center command is intercepted: " + other);
+        foreach (string invalid in new[] { "save", "announce Hello", "broadcast top Hello", "sm:broadcast center Hello", "broadcast center", "broadcast center   ",
+            "broadcast center " + new string('x', 2001), "broadcast center " + new string('한', 667) })
+            Bad("jobs:\n" + Job(invalid, extra: "    allowClientHide: true\n"));
+        foreach (string valid in new[] { new string('x', 2000), new string('한', 666) + "xx" })
+            Check(ServerScheduleSettings.Parse("jobs:\n" + Job("broadcast center " + valid, extra: "    allowClientHide: true\n")).Jobs.Single().AllowClientHide,
+                "Optional center display accepts exactly 2000 UTF-8 bytes");
+        Check(ServerScheduleSettings.Parse("jobs:\n" + Job("broadcast center " + new string('한', 667))).Jobs.Count == 1,
+            "Unmarked external broadcasts retain their previous validation limits");
+        int callbacks = 0;
+        ServerScheduleSettings mixed = ServerScheduleSettings.Parse("jobs: [{schedule: '* * * * *', allowClientHide: true, commands: ['broadcast center hello', save]}]",
+            line => { ++callbacks; return line == "save"; });
+        Check(callbacks == 1 && mixed.Jobs[0].Commands.Count == 2, "Only marked center messages bypass the unrelated generic tokenizer");
+        Check(original.Id == optional.Id && original.SameAs(optional) && forced.SameAs(optional), "Display preference does not change execution identity");
+        ServerScheduleSettings originalSettings = ServerScheduleSettings.Parse(yaml);
+        Check(ServerScheduleJournal.Fingerprint(originalSettings, original) == ServerScheduleJournal.Fingerprint(optionalSettings, optional),
+            "Display preference retains the durable cron fingerprint");
+        Bad("jobs:\n" + Job("broadcast center hello") + Job("broadcast center hello", extra: "    allowClientHide: true\n"));
+        ServerScheduleEngine engine = new();
+        engine.Apply(originalSettings, Now, Game);
+        engine.Apply(optionalSettings, Now.AddSeconds(10), Game);
+        ServerScheduleOccurrence occurrence = engine.ClaimDue(Now.AddSeconds(10), Game).Single();
+        Check(occurrence.OccurrenceUtc == Now.AddSeconds(10) && occurrence.Job.AllowClientHide,
+            "Display-only reload keeps the due boundary and uses the new policy");
+        engine.Apply(originalSettings, Now.AddSeconds(11), Game);
+        Check(occurrence.Job.AllowClientHide && engine.ClaimDue(Now.AddSeconds(20), Game).Count == 0,
+            "In-flight occurrences retain their captured policy and claim");
+        engine.Complete(occurrence);
+        Check(!engine.ClaimDue(Now.AddSeconds(30), Game).Single().Job.AllowClientHide,
+            "Later occurrences use the latest display policy");
     }
 
     private static void Identity()
@@ -384,5 +432,17 @@ internal static class ServerScheduleHarness
         engine.Apply(settings, before, Game);
         Check(engine.ClaimDue(before, Game.AddHours(1)).Count == 0 &&
             engine.ClaimDue(before, Game.AddHours(10)).Count == 1, "Game cron ignores real timezone/DST");
+    }
+}
+
+namespace ServerManager.Events
+{
+    // Inert wire-validation boundary; the production codec has separate wire tests.
+    internal static class EventDisplayCodec
+    {
+        internal const int MaximumMessageBytes = 2000;
+        internal static bool IsValidOptionalCenterMessage(string message) =>
+            !string.IsNullOrWhiteSpace(message) && !message.Any(char.IsControl) &&
+            new System.Text.UTF8Encoding(false, true).GetByteCount(message) <= MaximumMessageBytes;
     }
 }

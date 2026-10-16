@@ -15,6 +15,18 @@ $testDirectory = Join-Path $temporaryRoot ('ServerManager-EventMessage-' + [Guid
 New-Item -ItemType Directory -Path $testDirectory | Out-Null
 try {
     $harness = Join-Path $testDirectory 'EventMessageSmoke.exe'
+    # Execute the production client display selector against inert HUD/Unity
+    # adapters. The network/authentication ordering is inspected below.
+    $runtimeSource = Get-Content -LiteralPath (Join-Path $projectRoot 'Networking\ServerManagerRuntime.cs') -Raw
+    $selectorStart = $runtimeSource.IndexOf('    private static void ShowEventDisplay(')
+    $selectorEnd = $runtimeSource.IndexOf('    private static void OnAdminEntitlementPacket(', $selectorStart)
+    if ($selectorStart -lt 0 -or $selectorEnd -le $selectorStart) { throw 'Production event display selector could not be located.' }
+    $selector = $runtimeSource.Substring($selectorStart, $selectorEnd - $selectorStart).Replace(
+        'private static void ShowEventDisplay(', 'internal static void ShowEventDisplay(')
+    $selectorPath = Join-Path $testDirectory 'EventDisplaySelector.cs'
+    [IO.File]::WriteAllText($selectorPath,
+        "using System; using ServerManager.Events; using UnityEngine; namespace ServerManager { internal static class ServerManagerRuntime {`n" +
+        $selector + "`n} }")
     $compileArgs = @(
         $compiler, '/nologo', '/noconfig', '/nostdlib+', '/langversion:10.0', '/nullable:enable',
         '/target:exe', "/out:$harness",
@@ -26,6 +38,7 @@ try {
         (Join-Path $projectRoot 'Events\EventMessageText.cs'),
         (Join-Path $projectRoot 'Events\EventReportProtocol.cs'),
         (Join-Path $projectRoot 'Events\ServerEventOverlay.cs'),
+        $selectorPath,
         (Join-Path $projectRoot 'Tests\EventMessageSmoke.cs')
     )
     & dotnet @compileArgs
@@ -77,8 +90,8 @@ try {
     $broadcast = $runtime.Methods | Where-Object Name -eq 'BroadcastEventDisplay'
     if ($localRender.Count -ne 1 -or @($broadcast.Body.Instructions | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] -and
         $_.Operand.Name -eq 'ShowEventDisplay' }).Count -ne 1) { throw 'Remote clients and the listen host must share the same local-language display path.' }
-    if (($runtime.Fields | Where-Object Name -eq 'EventDisplayRpcName').Constant -cne 'sighsorry.ServerManager.EventDisplay.v2' -or
-        ($assembly.MainModule.GetType('ServerManager.ProtocolPacketCodec').Fields | Where-Object Name -eq 'WireVersion').Constant -ne 23) {
+    if (($runtime.Fields | Where-Object Name -eq 'EventDisplayRpcName').Constant -cne 'sighsorry.ServerManager.EventDisplay.v3' -or
+        ($assembly.MainModule.GetType('ServerManager.ProtocolPacketCodec').Fields | Where-Object Name -eq 'WireVersion').Constant -ne 24) {
         throw 'Localized event displays require the new display endpoint and handshake wire version, without legacy fallback.'
     }
     $webhooks = $assembly.MainModule.GetType('ServerManager.Discord.DiscordWebhooks')
@@ -117,5 +130,29 @@ try {
         $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.DeclaringType.FullName -eq 'ServerManager.ServerManagerPlugin' -and
         $_.Operand.Name -eq 'get_EnableClientBranding'
     }).Count -ne 0) { throw 'Notification visibility must not depend on client branding being enabled.' }
+
+    $optionalReaders = @(
+        foreach ($type in $assembly.MainModule.Types) {
+            foreach ($method in $type.Methods) {
+                if (-not $method.HasBody) { continue }
+                foreach ($instruction in $method.Body.Instructions) {
+                    if ($instruction.Operand -is [Mono.Cecil.MethodReference] -and
+                        $instruction.Operand.DeclaringType.FullName -eq 'ServerManager.ServerManagerPlugin' -and
+                        $instruction.Operand.Name -eq 'get_ShowOptionalBroadcasts') { $method }
+                }
+            }
+        }
+    )
+    if ($optionalReaders.Count -ne 1 -or $optionalReaders[0].FullName -ne $showMethod.FullName) {
+        throw 'Optional broadcast visibility must be read only after authentication/sequence consumption, in the shared host/client display selector.'
+    }
+    $optionalSend = $runtime.Methods | Where-Object Name -eq 'TryBroadcastOptionalCenterMessage'
+    if ($null -eq $optionalSend -or @($optionalSend.Body.Instructions | Where-Object {
+        $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq 'BroadcastEventDisplay'
+    }).Count -ne 1 -or @($showMethod.Body.Instructions | Where-Object {
+        $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.DeclaringType.FullName -eq 'MessageHud' -and $_.Operand.Name -eq 'ShowMessage'
+    }).Count -ne 1) {
+        throw 'Optional cron notices must use the authenticated event transport and the native center HUD.'
+    }
 } finally { $assembly.Dispose() }
-Write-Output 'PASS: factual audit precedes token creation; authenticated clients and host render locally; Discord uses the same formatter; notification toggle affects only the branding-independent client overlay.'
+Write-Output 'PASS: factual audit precedes token creation; authenticated clients and host render locally; independent optional-center and event-overlay toggles run only after authentication and sequence advancement.'

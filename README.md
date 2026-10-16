@@ -626,6 +626,32 @@ Remove NewCron/CronJob before using ServerManager scheduling. Timed-job settings
 use their common format, but zone/join triggers and DiscordConnector delivery
 are not supported.
 
+### Optional center broadcasts
+
+Let players hide repeated tips without hiding important notices:
+
+```yaml
+jobs:
+  - command: broadcast center <color=yellow>Server restart in two minutes.</color>
+    schedule: "28 5,17 * * *"
+    allowClientHide: false
+  - command: broadcast center <color=yellow><size=32>Use the hammer to save a house blueprint.</size></color>
+    schedule: "14-59/30 * * * *"
+    allowClientHide: true
+```
+
+`allowClientHide` defaults to **false**. With **true**, ServerManager delivers
+that job's `broadcast center` messages through its own authenticated channel.
+Players can hide them with **Show Optional Broadcasts** in their client CFG.
+Color and size tags are preserved. This does not skip the job, other commands,
+logs or Discord reports, and changing the flag does not reset `cron_last.yml`.
+
+The flag applies only to `broadcast center`, including those in a `commands`
+list. A job with **true** must contain at least one such message. Messages are
+limited to 2,000 UTF-8 bytes. Unmarked broadcasts still use the original installed
+console command; manual broadcasts, `announce` and vanilla messages are unchanged.
+Update both the server and clients before using this feature.
+
 ### Upgrade World maintenance
 
 Requires separately installed **Upgrade World**. Completion tracking checks the required runtime members rather than enforcing an exact plugin version.
@@ -687,6 +713,7 @@ Server Password =
 Server Button Text = Start Modded Valheim Server
 Logo Path =
 Show Event Notifications = true
+Show Optional Broadcasts = true
 ```
 
 - **Server Address:** dedicated IP/DNS name, or `steam:<host Steam64 ID>` for a
@@ -702,10 +729,14 @@ Show Event Notifications = true
 - **Show Event Notifications:** shows ServerManager’s top-center announcements,
   deaths and boss messages. Turning it off does not hide vanilla messages or
   stop logs and webhooks.
+- **Show Optional Broadcasts:** shows cron center messages marked
+  `allowClientHide: true`. Turn it off to hide these tips, independently of event
+  notifications. Unmarked broadcasts and other game messages are unaffected.
 
 Hold **Alt while clicking Start** to open the normal world/server selection.
-Restart after editing the CFG. The notification toggle also applies immediately
-when changed through Configuration Manager.
+Restart after editing the CFG. Both notification settings can be changed live
+through Configuration Manager. Optional broadcasts are filtered when received;
+an already displayed center message finishes normally.
 
 ### Optional-mod preview
 

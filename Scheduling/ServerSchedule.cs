@@ -6,6 +6,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using Cronos;
+using ServerManager.Events;
 using YamlDotNet.Core;
 using YamlDotNet.Core.Events;
 using YamlDotNet.RepresentationModel;
@@ -38,6 +39,8 @@ jobs: []
 #     schedule: '0 9 * * *'
 # Optional per job: chance: 1, useGameTime: false, log: true,
 # globalKeys: '', bannedGlobalKeys: ''. Keys are comma-separated strings.
+# allowClientHide: false by default. Set true only for jobs with broadcast center messages.
+# Only those center messages may be hidden by each client's optional-broadcast setting.
 # commands: [...] takes precedence over command. Game-time cron uses UTC from year 2000.
 # Comment out or remove a job to disable it. Identical job definitions are rejected.
 # Discord messages use ServerManager's discord.yml, not discordConnector.
@@ -117,7 +120,7 @@ jobs: []
             foreach (YamlNode entry in sequence.Children)
             {
                 Dictionary<string, YamlNode> job = Map(entry, "command", "commands", "schedule", "chance",
-                    "useGameTime", "log", "globalKeys", "bannedGlobalKeys");
+                    "useGameTime", "log", "globalKeys", "bannedGlobalKeys", "allowClientHide");
                 string[] cronFields = Text(Required(job, "schedule"), 256, true)
                     .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
                 string cron = string.Join(" ", cronFields);
@@ -130,6 +133,20 @@ jobs: []
                 List<string> commands = job.TryGetValue("commands", out YamlNode commandsNode)
                     ? Strings(commandsNode, 16, 2048) : new() { Text(Required(job, "command"), 2048) };
                 if (commands.Count == 0) throw Invalid("commands must contain at least one command");
+                bool allowClientHide = Boolean(job, "allowClientHide", false);
+                if (allowClientHide)
+                {
+                    bool hasCenterMessage = false;
+                    foreach (string command in commands)
+                    {
+                        if (!TryGetCenterBroadcast(command, out string message)) continue;
+                        hasCenterMessage = true;
+                        if (!EventDisplayCodec.IsValidOptionalCenterMessage(message))
+                            throw Invalid("optional center broadcasts require 1-" + EventDisplayCodec.MaximumMessageBytes + " UTF-8 bytes of message text");
+                    }
+                    if (!hasCenterMessage)
+                        throw Invalid("allowClientHide requires an unprefixed broadcast center message");
+                }
                 UpgradeWorldCommandKind[] kinds = commands.Select(UpgradeWorldScheduleCommands.GetKind).ToArray();
                 if (kinds.Any(kind => kind == UpgradeWorldCommandKind.Control || kind == UpgradeWorldCommandKind.Unsupported))
                     throw Invalid("an Upgrade World command is manual-only or is not verified for scheduled execution");
@@ -137,7 +154,8 @@ jobs: []
                 if (maintenance && commands.Where((command, index) => !UpgradeWorldScheduleCommands.IsMaintenance(kinds[index]))
                     .Any(command => !string.Equals(command.Trim(), "save", StringComparison.OrdinalIgnoreCase)))
                     throw Invalid("Upgrade World change jobs may only contain reviewed world changes and save");
-                if (commandAllowed != null && commands.Any(command => !commandAllowed(command)))
+                if (commandAllowed != null && commands.Any(command =>
+                    !(allowClientHide && TryGetCenterBroadcast(command, out _)) && !commandAllowed(command)))
                     throw Invalid("a command is not allowed for scheduled execution");
                 double chance = Number(job, "chance", 1, 0, 1);
                 bool gameTime = Boolean(job, "useGameTime", false);
@@ -146,7 +164,7 @@ jobs: []
                 string id = CreateId(cron, commands, chance, gameTime, gameTime ? "UTC" : timeZone.Id, requiredKeys, bannedKeys);
                 if (!ids.Add(id)) throw Invalid("identical job definitions are not supported");
                 jobs.Add(new ServerScheduleJob(id, cron, expression, commands,
-                    chance, gameTime, requiredKeys, bannedKeys, maintenance, Boolean(job, "log", logJobs)));
+                    chance, gameTime, requiredKeys, bannedKeys, maintenance, Boolean(job, "log", logJobs), allowClientHide));
             }
         }
         return new ServerScheduleSettings(timeZone, interval, logSkipped, jobs);
@@ -240,6 +258,28 @@ jobs: []
         string[] words = command.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         string verb = words.Length == 0 ? "" : words[0].Trim('\'', '"').ToLowerInvariant();
         return verb.StartsWith("sm:", StringComparison.Ordinal) ? verb.Substring(3) : verb;
+    }
+
+    // Match only the two command words. The remaining Valheim console text is
+    // literal: do not tokenize/rejoin it or interpret apostrophes, quotes or rich text.
+    // An empty suffix still matches so opted-in jobs reject malformed messages.
+    internal static bool TryGetCenterBroadcast(string command, out string message)
+    {
+        message = string.Empty;
+        if (string.IsNullOrEmpty(command)) return false;
+        int position = 0;
+        foreach (string expected in new[] { "broadcast", "center" })
+        {
+            while (position < command.Length && char.IsWhiteSpace(command[position])) ++position;
+            int start = position;
+            while (position < command.Length && !char.IsWhiteSpace(command[position])) ++position;
+            if (position - start != expected.Length ||
+                string.Compare(command, start, expected, 0, expected.Length, StringComparison.OrdinalIgnoreCase) != 0)
+                return false;
+        }
+        while (position < command.Length && char.IsWhiteSpace(command[position])) ++position;
+        message = command.Substring(position);
+        return true;
     }
 
     private sealed class BoundedParser : IParser
@@ -379,17 +419,19 @@ internal sealed class ServerScheduleJob
     public bool CatchUp => Maintenance;
     public bool Maintenance { get; }
     public bool Log { get; }
+    public bool AllowClientHide { get; }
     public IReadOnlyList<string> GlobalKeys { get; }
     public IReadOnlyList<string> BannedGlobalKeys { get; }
 
     internal ServerScheduleJob(string id, string cron, CronExpression expression, List<string> commands,
         double chance, bool gameTime, List<string> globalKeys, List<string> bannedGlobalKeys,
-        bool maintenance = false, bool log = true)
+        bool maintenance = false, bool log = true, bool allowClientHide = false)
     {
         Id = id; Cron = cron; Expression = expression; Commands = commands.AsReadOnly();
         Chance = chance; UseGameTime = gameTime;
         Maintenance = maintenance;
         Log = log;
+        AllowClientHide = allowClientHide;
         GlobalKeys = globalKeys.AsReadOnly(); BannedGlobalKeys = bannedGlobalKeys.AsReadOnly();
     }
 
@@ -442,7 +484,7 @@ internal sealed class ServerScheduleEngine
             if (_states.TryGetValue(job.Id, out State state) && job.SameAs(state.Job) &&
                 zone.Id == state.Zone.Id && zone.HasSameRules(state.Zone))
             {
-                // Logging is not execution identity. Publish changed logging while
+                // Logging/display preferences are not execution identity. Publish them while
                 // retaining the existing due boundary and any active claim.
                 state.Job = job;
                 next.Add(job.Id, state);

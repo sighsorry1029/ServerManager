@@ -16,7 +16,7 @@ namespace ServerManager;
 public sealed class ServerManagerPlugin : BaseUnityPlugin
 {
     internal const string ModName = "ServerManager";
-    internal const string ModVersion = "1.1.10";
+    internal const string ModVersion = "1.2.0";
     internal const string Author = "sighsorry";
     internal const string ModGuid = "sighsorry.ServerManager";
     internal const bool DefaultEnforceModPolicy = true;
@@ -29,6 +29,7 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
     internal static ConfigEntry<string> BrandingButtonText { get; private set; } = null!;
     internal static ConfigEntry<string> BrandingLogoPath { get; private set; } = null!;
     internal static ConfigEntry<bool> ShowEventNotifications { get; private set; } = null!;
+    internal static ConfigEntry<bool> ShowOptionalBroadcasts { get; private set; } = null!;
 
     internal static string DataRoot => ServerDataRoot.ActivePath;
     internal static string CharacterRoot => Path.Combine(DataRoot, "characters");
@@ -199,7 +200,7 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
             "use steam:<host Steam64 ID>, not a lobby ID or IP address. Optional preview requires " +
             "Steam friendship, a visible Valheim lobby and ServerManager on the host. Empty or invalid values leave the " +
             "vanilla Start flow unchanged. Client-local; restart after editing. " +
-            "Hold Alt while clicking Start for the world/server menu; this never bypasses server security.", 5);
+            "Hold Alt while clicking Start for the world/server menu; this never bypasses server security.", 6);
 
         BrandingServerPassword = Bind(
             "1 - Client",
@@ -207,14 +208,14 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
             string.Empty,
             "Optional password submitted through Valheim's normal handshake. Leave empty to " +
             "show the vanilla password prompt. A configured value is stored as plaintext in " +
-            "this BepInEx config file and is never synchronized by ServerManager.", 4);
+            "this BepInEx config file and is never synchronized by ServerManager.", 5);
 
         BrandingButtonText = Bind(
             "1 - Client",
             "Server Button Text",
             "Start Modded Valheim Server",
             "Literal text used for the main-menu Start button and the character Start button " +
-            "while the configured server flow is active. Restart the client after changing it.", 3);
+            "while the configured server flow is active. Restart the client after changing it.", 4);
 
         BrandingLogoPath = Bind(
             "1 - Client",
@@ -225,7 +226,7 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
             "background with a 30-second total timeout, an 8 MiB limit and a last-good cache " +
             "under Valheim's local save path/ServerManager/cache/logos. Failures keep the cached or vanilla logo. " +
             "Absolute file paths, escaping paths, HTTP URLs, URL credentials and fragments " +
-            "are rejected. Leave empty for the vanilla logo. Restart the client after changing it.", 2);
+            "are rejected. Leave empty for the vanilla logo. Restart the client after changing it.", 3);
 
         ShowEventNotifications = Bind(
             "1 - Client",
@@ -234,7 +235,16 @@ public sealed class ServerManagerPlugin : BaseUnityPlugin
             "Show ServerManager announcements, deaths, PvP and boss kills at the top center. " +
             "Client-local; Config Manager changes apply immediately. " +
             "Turning this off clears visible messages without affecting server logs, Discord " +
-            "webhooks or vanilla messages. Direct file edits require a client restart.", 1);
+            "webhooks or vanilla messages. Direct file edits require a client restart.", 2);
+
+        ShowOptionalBroadcasts = Bind(
+            "1 - Client",
+            "Show Optional Broadcasts",
+            true,
+            "Show scheduled center broadcasts that the server explicitly allows clients to hide. " +
+            "Client-local; Config Manager changes apply to subsequently received messages immediately. " +
+            "This does not hide required broadcasts, event notifications or other vanilla messages, " +
+            "and does not clear a message already on screen. Direct file edits require a client restart.", 1);
     }
 
     // Read by Configuration Manager through ConfigDescription.Tags; no hard dependency.

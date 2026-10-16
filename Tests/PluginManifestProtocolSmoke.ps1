@@ -133,8 +133,8 @@ $manifestPackage = $encode.Invoke($null, [object[]]@($manifest, $limits))
 $decodedManifest = Read-Packet $manifestPackage
 Assert-True ($decodedManifest.Success -and $decodedManifest.Packet.Kind.ToString() -eq 'ManifestResponse') `
     'Ordinary plugin manifest transmission was removed.'
-Assert-True ([int]$codec.GetField('WireVersion', $static).GetRawConstantValue() -eq 23) `
-    'Display-only character metadata must use wire version 23.'
+Assert-True ([int]$codec.GetField('WireVersion', $static).GetRawConstantValue() -eq 24) `
+    'Optional center displays must be gated by handshake wire version 24.'
 Assert-True ((Get-ReportedName $decodedManifest.Packet) -eq '') 'Absent display hints must remain empty.'
 $rawManifest = [byte[]]@(1, 2, 3)
 $manifestWithoutMetadata = [byte[]]$manifestPackage.GetArray()[0..($headerBytes + $rawManifest.Length - 1)]
@@ -181,12 +181,17 @@ foreach ($badUtf8 in @(
     Assert-InvalidEnvelope (New-NameEnvelope $badUtf8) 'Malformed UTF-8 in a display hint decoded.'
 }
 Assert-InvalidEnvelope ([byte[]]@($manifestPackage.GetArray() + 0)) 'Trailing manifest bytes decoded.'
-$oldWire = [byte[]]$manifestPackage.GetArray().Clone()
-$oldWire[4] = 22
-$oldWire[5] = 0
-$oldWireResult = Read-Packet (New-Package $oldWire)
-Assert-True (-not $oldWireResult.Success -and $oldWireResult.Rejection.Code.ToString() -eq 'ProtocolVersionMismatch') `
-    'A wire-22 client was not rejected before admission.'
+foreach ($previousVersion in @(22, 23)) {
+    foreach ($currentPackage in @($roundTrip.Package, $manifestPackage)) {
+        $oldWire = [byte[]]$currentPackage.GetArray().Clone()
+        $oldWire[4] = [byte]$previousVersion
+        $oldWire[5] = 0
+        $oldWireResult = Read-Packet (New-Package $oldWire)
+        Assert-True (-not $oldWireResult.Success -and $null -eq $oldWireResult.Packet -and
+            $oldWireResult.Rejection.Code.ToString() -eq 'ProtocolVersionMismatch') `
+            "Wire-$previousVersion was not rejected before Challenge/Manifest processing."
+    }
+}
 
 $unsafeName = "  ha`r`nlla`0" + [char]0x202E + [char]0x2028 + [char]0x2029 + [char]0xD800 + '  '
 $normalized = [string]$normalizeName.Invoke($null, [object[]]@($unsafeName))

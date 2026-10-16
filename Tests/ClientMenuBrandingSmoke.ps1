@@ -507,6 +507,7 @@ $expectedConfiguration = [ordered]@{
     BrandingButtonText = "System.String"
     BrandingLogoPath = "System.String"
     ShowEventNotifications = "System.Boolean"
+    ShowOptionalBroadcasts = "System.Boolean"
 }
 foreach ($entry in $expectedConfiguration.GetEnumerator()) {
     $property = $pluginType.Properties |
@@ -521,8 +522,8 @@ foreach ($entry in $expectedConfiguration.GetEnumerator()) {
 }
 Assert-True (@($pluginType.Properties | Where-Object {
     $_.PropertyType.FullName.StartsWith('BepInEx.Configuration.ConfigEntry`1<', [StringComparison]::Ordinal)
-}).Count -eq 5 -and $null -eq ($pluginType.Properties | Where-Object Name -eq 'EnableClientBranding' | Select-Object -First 1)) `
-    'The compiled plugin must expose exactly the five client entries without an Enabled toggle.'
+}).Count -eq 6 -and $null -eq ($pluginType.Properties | Where-Object Name -eq 'EnableClientBranding' | Select-Object -First 1)) `
+    'The compiled plugin must expose exactly the six client entries without an Enabled toggle.'
 
 $pluginSource = [IO.File]::ReadAllText($pluginSourcePath)
 foreach ($configKey in @(
@@ -530,7 +531,8 @@ foreach ($configKey in @(
     '"Server Password"',
     '"Server Button Text"',
     '"Logo Path"',
-    '"Show Event Notifications"')) {
+    '"Show Event Notifications"',
+    '"Show Optional Broadcasts"')) {
     Assert-True ($pluginSource.Contains($configKey)) `
         "Client-branding config key $configKey was not bound."
 }
