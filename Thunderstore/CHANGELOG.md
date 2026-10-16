@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.2
+
+- Fixed oversized Discord link text with CustomMainMenu by leaving its button styles unchanged while preserving ServerManager's quick-connect text and behavior.
+- Restored the original font size when releasing ServerManager's button styling, without restoring styles it never changed.
+- Added regression coverage for custom-menu button styling, style ownership and restoration. Restart Valheim after updating to recreate existing menu buttons.
+
 ## 1.2.1
 
 - Reduced routine scheduled-broadcast logging. `logJobs` now defaults to `false`, with per-job `log` overrides; existing explicit settings are preserved. Successful center-broadcast-only jobs can omit their audit-file entries while failures, other commands, Discord reports and saved schedule progress remain unchanged.

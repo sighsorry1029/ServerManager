@@ -46,10 +46,6 @@ internal static class ClientMenuBranding
         {
             Text = text;
             OriginalText = text.text;
-            OriginalEnableAutoSizing = text.enableAutoSizing;
-            OriginalWrappingMode = text.textWrappingMode;
-            OriginalFontSizeMin = text.fontSizeMin;
-            OriginalFontSizeMax = text.fontSizeMax;
 
             Localization? localization = Localization.instance;
             if (localization != null &&
@@ -67,13 +63,52 @@ internal static class ClientMenuBranding
 
         internal TMP_Text Text { get; }
         internal string OriginalText { get; }
-        internal bool OriginalEnableAutoSizing { get; }
-        internal TextWrappingModes OriginalWrappingMode { get; }
-        internal float OriginalFontSizeMin { get; }
-        internal float OriginalFontSizeMax { get; }
+        private bool StyleOverridden { get; set; }
+        private bool OriginalEnableAutoSizing { get; set; }
+        private TextWrappingModes OriginalWrappingMode { get; set; }
+        private float OriginalFontSize { get; set; }
+        private float OriginalFontSizeMin { get; set; }
+        private float OriginalFontSizeMax { get; set; }
         internal bool HadLocalizationSource { get; }
         internal string? LocalizationSource { get; }
         internal bool LocalizationDetached { get; set; }
+
+        internal void ApplyStyle(bool customMenuActive)
+        {
+            // CustomMainMenu clones the Start button for its Discord link.
+            // Leave the template's style alone so our auto-sizing is not copied.
+            if (customMenuActive)
+            {
+                RestoreStyle();
+                return;
+            }
+            if (Text == null) return;
+
+            // Capture only when taking ownership, not during text-only use.
+            if (!StyleOverridden)
+            {
+                OriginalEnableAutoSizing = Text.enableAutoSizing;
+                OriginalWrappingMode = Text.textWrappingMode;
+                OriginalFontSize = Text.fontSize;
+                OriginalFontSizeMin = Text.fontSizeMin;
+                OriginalFontSizeMax = Text.fontSizeMax;
+                StyleOverridden = true;
+            }
+            ConfigureLabelForLongText(Text);
+        }
+
+        internal void RestoreStyle()
+        {
+            if (!StyleOverridden) return;
+            StyleOverridden = false;
+            if (Text == null) return;
+
+            Text.enableAutoSizing = OriginalEnableAutoSizing;
+            Text.textWrappingMode = OriginalWrappingMode;
+            Text.fontSize = OriginalFontSize;
+            Text.fontSizeMin = OriginalFontSizeMin;
+            Text.fontSizeMax = OriginalFontSizeMax;
+        }
     }
 
     private static FejdStartup? _startup;
@@ -116,6 +151,8 @@ internal static class ClientMenuBranding
         bool active = IsCustomMenuActive();
         if (active == _customMenuActive) return;
         _customMenuActive = active;
+        _mainButtonLabel?.ApplyStyle(active);
+        _characterButtonLabel?.ApplyStyle(active);
         ResetMenuGuide();
         ApplyLogo(startup);
     }
@@ -1940,7 +1977,7 @@ internal static class ClientMenuBranding
             }
         }
 
-        ConfigureLabelForLongText(text);
+        current.ApplyStyle(_customMenuActive);
         text.text = label;
     }
 
@@ -1981,10 +2018,7 @@ internal static class ClientMenuBranding
             text.text = restored.OriginalText;
         }
 
-        text.enableAutoSizing = restored.OriginalEnableAutoSizing;
-        text.textWrappingMode = restored.OriginalWrappingMode;
-        text.fontSizeMin = restored.OriginalFontSizeMin;
-        text.fontSizeMax = restored.OriginalFontSizeMax;
+        restored.RestoreStyle();
     }
 
     private static void ApplyLogo(FejdStartup startup)

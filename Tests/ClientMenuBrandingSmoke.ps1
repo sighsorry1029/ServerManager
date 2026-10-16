@@ -200,6 +200,38 @@ function Get-NestedTypeDefinitions {
     }
 }
 
+function Get-BooleanGuardSuccessor {
+    param($Load, [bool]$Value)
+
+    # Evaluate only the compiler's single-boolean guard, not Unity code. Debug
+    # may spill the bool to a local; Release normally branches directly.
+    $stack = [Collections.Generic.Stack[int]]::new()
+    $stack.Push([int]$Value)
+    $locals = @{}
+    for ($instruction = $Load.Next; $null -ne $instruction; $instruction = $instruction.Next) {
+        $code = [string]$instruction.OpCode.Code
+        if ($code -eq 'Nop') { continue }
+        if ($code -match '^Ldc_I4_([01])$') { $stack.Push([int]$Matches[1]); continue }
+        if ($code -eq 'Ceq') {
+            $right = $stack.Pop(); $left = $stack.Pop()
+            $stack.Push([int]($left -eq $right)); continue
+        }
+        if ($code -match '^(Stloc|Ldloc)(?:_([0-3])|_S)?$') {
+            $key = if ($Matches[2]) { [int]$Matches[2] } else { $instruction.Operand.Index }
+            if ($Matches[1] -eq 'Stloc') { $locals[$key] = $stack.Pop() }
+            else { $stack.Push([int]$locals[$key]) }
+            continue
+        }
+        if ($code -match '^Br(true|false)(?:_S)?$') {
+            $takeBranch = ($stack.Pop() -ne 0) -eq ($Matches[1] -eq 'true')
+            if ($takeBranch) { return $instruction.Operand }
+            return $instruction.Next
+        }
+        throw ('Unexpected operation in the CMM label-style guard: ' + $code)
+    }
+    throw 'The CMM label-style guard has no conditional branch.'
+}
+
 function Test-ConstantIntSetter {
     param($Instructions, [string]$SetterName, [int]$Expected, [string]$DeclaringType = 'TMPro.TMP_Text')
 
@@ -757,6 +789,103 @@ Assert-True ($detectionStrings -contains 'rdmods.custommainmenu' -and
 Assert-True (@($customMenuDetection.Body.Instructions | Where-Object {
     $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -in @('Bind', 'Save', 'set_Value')
 }).Count -eq 0) 'Compatibility detection modifies the external configuration.'
+
+# CMM clones the Start button's TMP settings for its other menu buttons. Only
+# replace that label's text/localization when CMM owns its typography.
+$applyLabel = $brandingType.Methods | Where-Object Name -eq 'ApplyLabel' | Select-Object -First 1
+$configureLabel = $brandingType.Methods | Where-Object Name -eq 'ConfigureLabelForLongText' | Select-Object -First 1
+$labelOverride = $brandingType.NestedTypes | Where-Object Name -eq 'LabelOverride' | Select-Object -First 1
+$labelCapture = $labelOverride.Methods | Where-Object IsConstructor | Select-Object -First 1
+$applyStyle = $labelOverride.Methods | Where-Object Name -eq 'ApplyStyle' | Select-Object -First 1
+$restoreStyle = $labelOverride.Methods | Where-Object Name -eq 'RestoreStyle' | Select-Object -First 1
+$applyStyleCall = Get-MethodCall $applyLabel $labelOverride.FullName 'ApplyStyle'
+$styleCall = Get-MethodCall $applyStyle $brandingType.FullName 'ConfigureLabelForLongText'
+$restoreStyleCall = Get-MethodCall $applyStyle $labelOverride.FullName 'RestoreStyle'
+$labelTextCall = Get-MethodCall $applyLabel 'TMPro.TMP_Text' 'set_text'
+$labelDetachCall = Get-MethodCall $applyLabel 'Localization' 'RemoveTextFromCache'
+$labelStyleGuard = $applyStyle.Body.Instructions | Where-Object {
+    $_.OpCode.Code -eq [Mono.Cecil.Cil.Code]::Ldarg_1
+} | Select-Object -First 1
+Assert-True ($null -ne $labelStyleGuard -and $null -ne $styleCall -and
+    $null -ne $labelTextCall -and $null -ne $labelDetachCall -and $null -ne $applyStyleCall -and
+    $labelDetachCall.Offset -lt $applyStyleCall.Offset -and $applyStyleCall.Offset -lt $labelTextCall.Offset -and
+    $applyStyleCall.Previous.Operand -is [Mono.Cecil.FieldReference] -and
+    $applyStyleCall.Previous.Operand.Name -eq '_customMenuActive') `
+    'CMM compatibility lost its label-only guard or detached localization after choosing a style.'
+$customStyleStart = Get-BooleanGuardSuccessor $labelStyleGuard $true
+$vanillaStyleStart = Get-BooleanGuardSuccessor $labelStyleGuard $false
+Assert-True (-not (Test-InstructionReaches $customStyleStart $styleCall) -and
+    (Test-InstructionReaches $customStyleStart $restoreStyleCall) -and
+    -not (Test-InstructionReaches $vanillaStyleStart $restoreStyleCall) -and
+    (Test-InstructionReaches $vanillaStyleStart $styleCall) -and
+    (Test-InstructionReaches $applyStyleCall.Next $labelTextCall)) `
+    'CMM still inherits ServerManager autosizing, or the vanilla/text replacement path was disabled.'
+$styleSetters = @('set_enableAutoSizing', 'set_textWrappingMode', 'set_fontSizeMin', 'set_fontSizeMax')
+foreach ($setter in $styleSetters) {
+    Assert-True ($null -ne (Get-MethodCall $configureLabel 'TMPro.TMP_Text' $setter)) `
+        ('The ordinary menu lost long-label handling: ' + $setter)
+}
+Assert-True (@($applyLabel.Body.Instructions | Where-Object {
+    $_.Operand -is [Mono.Cecil.MethodReference] -and
+    $_.Operand.DeclaringType.FullName -eq 'TMPro.TMP_Text' -and
+    $_.Operand.Name.StartsWith('set_', [StringComparison]::Ordinal) -and $_.Operand.Name -ne 'set_text'
+}).Count -eq 0) 'ApplyLabel writes TMP styling outside the CMM-guarded helper.'
+
+$labelRestore = $brandingType.Methods | Where-Object Name -eq 'RestoreLabel' | Select-Object -First 1
+Assert-True ($null -ne (Get-MethodCall $labelRestore $labelOverride.FullName 'RestoreStyle')) `
+    'Label lifecycle cleanup no longer delegates its owned typography restoration.'
+$captureOwnership = Get-MethodCall $applyStyle $labelOverride.FullName 'get_StyleOverridden'
+$restoreOwnership = Get-MethodCall $restoreStyle $labelOverride.FullName 'get_StyleOverridden'
+Assert-True ($null -ne $captureOwnership -and $null -ne $restoreOwnership) `
+    'Label typography lacks explicit override ownership.'
+$alreadyOwnedStart = Get-BooleanGuardSuccessor $captureOwnership $true
+$captureNewStart = Get-BooleanGuardSuccessor $captureOwnership $false
+$unownedRestoreStart = Get-BooleanGuardSuccessor $restoreOwnership $false
+$ownedRestoreStart = Get-BooleanGuardSuccessor $restoreOwnership $true
+foreach ($state in @(
+    @{ Tmp = 'fontSize'; Original = 'OriginalFontSize' },
+    @{ Tmp = 'fontSizeMin'; Original = 'OriginalFontSizeMin' },
+    @{ Tmp = 'fontSizeMax'; Original = 'OriginalFontSizeMax' },
+    @{ Tmp = 'enableAutoSizing'; Original = 'OriginalEnableAutoSizing' },
+    @{ Tmp = 'textWrappingMode'; Original = 'OriginalWrappingMode' })) {
+    $captureCall = Get-MethodCall $applyStyle 'TMPro.TMP_Text' ('get_' + $state.Tmp)
+    $restoreCall = Get-MethodCall $restoreStyle 'TMPro.TMP_Text' ('set_' + $state.Tmp)
+    Assert-True ($null -ne $captureCall -and $null -ne $captureCall.Next -and
+        (($captureCall.Next.OpCode.Code -eq [Mono.Cecil.Cil.Code]::Stfld -and
+          $captureCall.Next.Operand.Name -eq ('<' + $state.Original + '>k__BackingField')) -or
+         ($captureCall.Next.Operand -is [Mono.Cecil.MethodReference] -and
+          $captureCall.Next.Operand.Name -eq ('set_' + $state.Original))) -and
+        $null -ne $restoreCall -and $null -ne $restoreCall.Previous -and
+        $restoreCall.Previous.Operand -is [Mono.Cecil.MethodReference] -and
+        $restoreCall.Previous.Operand.DeclaringType.FullName -eq $labelOverride.FullName -and
+        $restoreCall.Previous.Operand.Name -eq ('get_' + $state.Original)) `
+        ('Label typography is not captured and restored from the same original value: ' + $state.Tmp)
+    Assert-True ($null -eq (Get-MethodCall $labelCapture 'TMPro.TMP_Text' ('get_' + $state.Tmp)) -and
+        -not (Test-InstructionReaches $customStyleStart $captureCall) -and
+        -not (Test-InstructionReaches $alreadyOwnedStart $captureCall) -and
+        (Test-InstructionReaches $captureNewStart $captureCall) -and
+        -not (Test-InstructionReaches $unownedRestoreStart $restoreCall) -and
+        (Test-InstructionReaches $ownedRestoreStart $restoreCall)) `
+        ('CMM text-only labels snapshot/restore unowned typography or repeated application loses its baseline: ' + $state.Tmp)
+}
+Assert-True (Test-ConstantIntSetter @($applyStyle.Body.Instructions) 'set_StyleOverridden' 1 $labelOverride.FullName) `
+    'Taking a typography snapshot does not mark it as owned.'
+Assert-True (Test-ConstantIntSetter @($restoreStyle.Body.Instructions) 'set_StyleOverridden' 0 $labelOverride.FullName) `
+    'Restoring typography does not release its ownership.'
+$refreshCompatibility = $brandingType.Methods | Where-Object Name -eq 'RefreshMenuCompatibility' | Select-Object -First 1
+$refreshStyleCalls = @($refreshCompatibility.Body.Instructions | Where-Object {
+    $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.DeclaringType.FullName -eq $labelOverride.FullName -and
+    $_.Operand.Name -eq 'ApplyStyle'
+})
+$refreshFieldNames = @($refreshCompatibility.Body.Instructions | Where-Object {
+    $_.Operand -is [Mono.Cecil.FieldReference]
+} | ForEach-Object { $_.Operand.Name })
+Assert-True ($refreshStyleCalls.Count -eq 2 -and $refreshFieldNames -contains '_mainButtonLabel' -and
+    $refreshFieldNames -contains '_characterButtonLabel' -and
+    @($refreshCompatibility.Body.Instructions | Where-Object {
+        $_.Operand -is [Mono.Cecil.MethodReference] -and
+        $_.Operand.Name -in @('FindMainStartButtonText', 'ApplyMainButtonText', 'ApplyCharacterButtonText', 'ApplyLabel')
+    }).Count -eq 0) 'Changing CMM ownership no longer updates both existing labels without rediscovering or replacing them.'
 foreach ($guardedMethod in @(
     ($menuGuideType.Methods | Where-Object Name -eq 'CaptureTargets' | Select-Object -First 1),
     ($brandingType.Methods | Where-Object Name -eq 'ApplyLogo' | Select-Object -First 1))) {
