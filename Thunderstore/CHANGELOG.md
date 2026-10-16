@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.10
+
+- Improved connection compatibility by accepting bounded server-side PeerInfo extensions instead of disconnecting with "PeerInfo contained trailing data." Original packet data is preserved for Valheim and mod handlers.
+- Kept existing packet-size, required-field and client-to-server validation safeguards. Added regression coverage for extensions, truncated packets and unchanged packet forwarding.
+- Added a once-per-connection diagnostic reporting extension size without logging packet contents.
+- Update ServerManager on both the server and all clients.
+
 ## 1.1.9
 
 - Added Valheim 1.0.20 character-format support, preserving new drop counters and item-upgrade state. Existing pre-update Deep North character files and backups remain readable.

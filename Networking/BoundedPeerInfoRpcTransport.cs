@@ -60,6 +60,7 @@ namespace ServerManager
                 MaximumPeerInfoBytes,
                 limits.MaxPeerInfoBytes);
             bool receivingOnServer = znet.IsServer();
+            bool extensionReported = false;
             RawProtocolRpcTransport.RegisterPreflight(
                 rpc,
                 PeerInfoMethodName,
@@ -69,13 +70,36 @@ namespace ServerManager
                     int offset,
                     int length,
                     out ProtocolRejection rejection) =>
-                    TryPreflightPeerInfoEnvelope(
+                {
+                    bool accepted = TryPreflightPeerInfoEnvelope(
                         source,
                         offset,
                         length,
                         receivingOnServer,
                         maximumBytes,
-                        out rejection),
+                        out rejection,
+                        out int extensionBytes);
+                    if (accepted && extensionBytes > 0 && !extensionReported)
+                    {
+                        extensionReported = true;
+                        try
+                        {
+                            // Counts only, once per connection. Never log packet
+                            // contents, identity, credentials or extension bytes.
+                            ServerManagerPlugin.Log?.LogInfo(
+                                "Accepted server PeerInfo with " + extensionBytes +
+                                " unparsed extension bytes (package=" +
+                                (length - OuterLengthPrefixBytes) +
+                                " bytes); passing the original packet to Valheim and mod handlers.");
+                        }
+                        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+                        {
+                            // An optional log listener must not turn an accepted
+                            // packet into a failed connection.
+                        }
+                    }
+                    return accepted;
+                },
                 errorHandler);
             Installed.Add(rpc, new object());
         }
@@ -86,8 +110,10 @@ namespace ServerManager
             int length,
             bool receivingOnServer,
             int maximumPeerInfoBytes,
-            out ProtocolRejection rejection)
+            out ProtocolRejection rejection,
+            out int extensionBytes)
         {
+            extensionBytes = 0;
             if (length < OuterLengthPrefixBytes)
             {
                 return Malformed(
@@ -135,7 +161,8 @@ namespace ServerManager
                 offset + OuterLengthPrefixBytes,
                 declaredLength,
                 receivingOnServer,
-                out rejection);
+                out rejection,
+                out extensionBytes);
         }
 
         private static bool TryPreflightPeerInfo(
@@ -143,8 +170,10 @@ namespace ServerManager
             int offset,
             int length,
             bool receivingOnServer,
-            out ProtocolRejection rejection)
+            out ProtocolRejection rejection,
+            out int extensionBytes)
         {
+            extensionBytes = 0;
             BoundedReader reader = new BoundedReader(source, offset, length);
 
             if (!reader.TrySkip(sizeof(long)))
@@ -270,7 +299,7 @@ namespace ServerManager
                 }
             }
 
-            if (!reader.AtEnd)
+            if (receivingOnServer && !reader.AtEnd)
             {
                 rejection = new ProtocolRejection(
                     ProtocolRejectCode.TrailingPacketData,
@@ -278,6 +307,11 @@ namespace ServerManager
                 return false;
             }
 
+            // A server may append data for its client-side mods. Validate all
+            // vanilla fields and the bounded, exact outer framing, then leave
+            // that suffix untouched for the original receiver and its patches.
+            // Client-to-server admission remains strict, including ticket data.
+            extensionBytes = reader.RemainingBytes;
             rejection = null;
             return true;
         }
@@ -362,6 +396,11 @@ namespace ServerManager
             internal bool AtEnd
             {
                 get { return position == end; }
+            }
+
+            internal int RemainingBytes
+            {
+                get { return end - position; }
             }
 
             internal bool TrySkip(int byteCount)
