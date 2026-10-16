@@ -466,10 +466,10 @@ try {
             $fields = [Collections.Generic.Dictionary[string,string]]::new()
             $fields.Add('message', 'private security evidence')
             $runtimePublish.Invoke($null, [object[]]@(
-                $kind, 'observed', $localEvent.Actor, $null, $fields, $null)) | Out-Null
+                $kind, 'observed', $localEvent.Actor, $null, $fields, $null, $false)) | Out-Null
         }
         Assert-True ($queue.Count -eq 8 -and $dispatchQueue.Count -eq 0) `
-            'Security kinds escaped through direct runtime/integration Publish or failed local audit routing.'
+            'Security kinds escaped through direct runtime/integration Publish or allowed the command-only audit flag to suppress local audit.'
         Invoke-ConnectionAudit
         $publicPublish.Invoke($null, [object[]]@($queue.ToArray()[-1])) | Out-Null
         Assert-True ($dispatchQueue.Count -eq 0) 'Connection diagnostics escaped through the public integration API.'
@@ -587,18 +587,26 @@ try {
     $consoleEvent.AddEventHandler($console, $throwingListener)
     $pluginLogProperty.SetValue($null, $console)
     try {
-        foreach ($evidenceName in @('ProcessDetectorUnavailable', 'MaximumHealthLimitExceeded')) {
+        foreach ($evidenceName in @('ProcessDetectorUnavailable', 'MaximumHealthLimitExceeded', 'AssemblyInspectionIncomplete')) {
+            $reportDetail = if ($evidenceName -eq 'AssemblyInspectionIncomplete') {
+                'stage=types;assembly=YamlDotNet;exception=ReflectionTypeLoadException'
+            } else { '' }
             $report = $reportType.GetConstructors($instanceFlags)[0].Invoke([object[]]@(
                 [byte[]]::new(16), [byte[]]::new(32), [uint32]1,
-                [Enum]::Parse($evidenceType, $evidenceName), '', [uint32]1))
+                [Enum]::Parse($evidenceType, $evidenceName), $reportDetail, [uint32]1))
             $logDetection.Invoke($null, [object[]]@(
                 $peerIdentity, $report, [Enum]::Parse($responseType, 'Log'),
                 'accepted snapshot; logger failure probe', 'snapshot_received')) | Out-Null
         }
-        Assert-True ($script:throwingConsoleCalls -eq 2 -and $queue.Count -eq 2 -and
-            @($queue.ToArray() | Where-Object { $_.Fields['outcome'] -eq 'diagnostic' }).Count -eq 1 -and
+        Assert-True ($script:throwingConsoleCalls -eq 3 -and $queue.Count -eq 3 -and
+            @($queue.ToArray() | Where-Object { $_.Fields['outcome'] -eq 'diagnostic' }).Count -eq 2 -and
             @($queue.ToArray() | Where-Object { $_.Fields['outcome'] -eq 'observed' }).Count -eq 1) `
             'A throwing Info/Warning listener escaped LogDetection or cancelled its local audit event.'
+        $assemblyDiagnostic = @($queue.ToArray() | Where-Object { $_.Fields['evidence'] -eq 'AssemblyInspectionIncomplete' })
+        Assert-True ($assemblyDiagnostic.Count -eq 1 -and
+            $assemblyDiagnostic[0].Fields['detail'] -ceq 'stage=types;assembly=YamlDotNet;exception=ReflectionTypeLoadException' -and
+            $assemblyDiagnostic[0].Fields['response'] -eq 'Log' -and $assemblyDiagnostic[0].Fields['outcome'] -eq 'diagnostic') `
+            'Partial inspection diagnostics lost their canonical context or became actionable findings.'
     }
     finally {
         $pluginLogProperty.SetValue($null, $originalConsole)

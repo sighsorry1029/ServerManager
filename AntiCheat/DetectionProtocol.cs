@@ -46,18 +46,21 @@ namespace ServerManager
             }
 
             detail ??= string.Empty;
-            if (!DetectionReportCodec.IsValidDetail(detail))
+            if (!(DetectionEvidenceCatalog.IsAssemblyDiagnostic(evidence)
+                    ? AssemblyDiagnosticDetail.IsValid(evidence, detail)
+                    : DetectionReportCodec.IsValidDetail(detail)))
             {
                 throw new ArgumentException(
-                    "Detection detail was not a bounded command token.",
+                    "Detection detail did not match its bounded evidence format.",
                     nameof(detail));
             }
 
             if (evidence != DetectionEvidence.CheatCommand &&
+                !DetectionEvidenceCatalog.IsAssemblyDiagnostic(evidence) &&
                 detail.Length != 0)
             {
                 throw new ArgumentException(
-                    "Only command reports may contain detail.",
+                    "Only command and assembly diagnostic reports may contain detail.",
                     nameof(detail));
             }
 
@@ -85,8 +88,9 @@ namespace ServerManager
     internal static class DetectionReportCodec
     {
         private const int Magic = 0x54444D53; // "SMDT" as little-endian bytes.
-        private const ushort WireVersion = 2;
+        private const ushort WireVersion = 3;
         internal const int MaximumDetailBytes = 48;
+        internal const int MaximumDiagnosticDetailBytes = AssemblyDiagnosticDetail.MaximumLength;
         internal const int FixedBytes =
             sizeof(int) +
             sizeof(ushort) +
@@ -97,7 +101,7 @@ namespace ServerManager
             sizeof(ushort) +
             sizeof(byte);
         internal const int MaximumPacketBytes =
-            FixedBytes + MaximumDetailBytes;
+            FixedBytes + MaximumDiagnosticDetailBytes;
 
         internal static ZPackage Encode(DetectionReport report)
         {
@@ -112,7 +116,7 @@ namespace ServerManager
             }
 
             byte[] detail = Encoding.ASCII.GetBytes(report.Detail);
-            if (detail.Length > MaximumDetailBytes)
+            if (!IsValidReportDetail(report.Evidence, report.Detail))
             {
                 throw new ArgumentOutOfRangeException(nameof(report));
             }
@@ -233,7 +237,7 @@ namespace ServerManager
                         return false;
                     }
 
-                    if (detailLength > MaximumDetailBytes ||
+                    if (detailLength > MaximumDiagnosticDetailBytes ||
                         detailLength != stream.Length - stream.Position)
                     {
                         rejection = Malformed(
@@ -244,16 +248,15 @@ namespace ServerManager
                     byte[] detailBytes = ProtocolByteUtil.ReadExact(
                         reader,
                         detailLength);
-                    if (!IsValidDetail(detailBytes) ||
-                        (evidence != DetectionEvidence.CheatCommand &&
-                         detailBytes.Length != 0))
+                    string detail = Encoding.ASCII.GetString(detailBytes);
+                    if (!IsValidReportDetail(evidence, detail) ||
+                        Array.Exists(detailBytes, value => value > 127))
                     {
                         rejection = Malformed(
                             "The detection detail was invalid.");
                         return false;
                     }
 
-                    string detail = Encoding.ASCII.GetString(detailBytes);
                     report = new DetectionReport(
                         sessionId,
                         nonce,
@@ -294,17 +297,12 @@ namespace ServerManager
             return true;
         }
 
-        private static bool IsValidDetail(byte[] detail)
+        private static bool IsValidReportDetail(DetectionEvidence evidence, string detail)
         {
-            for (int index = 0; index < detail.Length; ++index)
-            {
-                if (!IsDetailCharacter((char)detail[index]))
-                {
-                    return false;
-                }
-            }
-
-            return true;
+            if (DetectionEvidenceCatalog.IsAssemblyDiagnostic(evidence))
+                return AssemblyDiagnosticDetail.IsValid(evidence, detail);
+            return IsValidDetail(detail) &&
+                (evidence == DetectionEvidence.CheatCommand || detail.Length == 0);
         }
 
         private static bool IsDetailCharacter(char value)

@@ -106,6 +106,7 @@ internal static class ServerScheduleRuntime
     private sealed class Run
     {
         internal readonly ServerScheduleOccurrence Occurrence;
+        internal readonly bool QuietCenterBroadcasts;
         internal readonly CancellationTokenSource Cancellation = new();
         internal int Index;
         internal Task<ServerManagerCommandResult>? Pending;
@@ -125,6 +126,12 @@ internal static class ServerScheduleRuntime
                 if (FirstVerb(commands[commands.Count - 1]) != "save") commands.Add("save");
             }
             Commands = commands.ToArray();
+            // Only a complete, display-only job can opt out of successful
+            // local audit entries. Mixed jobs and maintenance remain auditable.
+            QuietCenterBroadcasts = !occurrence.Job.Log && !occurrence.Job.Maintenance &&
+                commands.Count > 0 && commands.All(command =>
+                    ServerScheduleSettings.TryGetCenterBroadcast(command, out string message) &&
+                    !string.IsNullOrWhiteSpace(message));
         }
     }
 
@@ -477,7 +484,8 @@ internal static class ServerScheduleRuntime
 
         private static void Audit(Run run, ServerManagerCommandResult result) =>
             ServerEventRuntime.RecordCommand("cron", run.Occurrence.Job.Id, run.Occurrence.Job.Id,
-                run.Verb, "", result.Code, result.Success);
+                run.Verb, "", result.Code, result.Success,
+                writeAuditLog: !run.QuietCenterBroadcasts || !result.Success || run.Retired);
 
         private void EndRun(Run run, bool success, string code)
         {
@@ -490,7 +498,8 @@ internal static class ServerScheduleRuntime
             {
                 ServerEventRuntime.RecordCommand("cron", run.Occurrence.Job.Id, run.Occurrence.Job.Id,
                     run.Occurrence.Job.Maintenance ? "maintenance" : "schedule", "",
-                    review ? "cron_needs_review" : code, success, CronResultData(run));
+                    review ? "cron_needs_review" : code, success, CronResultData(run),
+                    writeAuditLog: !run.QuietCenterBroadcasts || !success || code != "cron_completed");
                 if (review) Warn("Job '" + run.Occurrence.Job.Id + "' needs review (" + code + "). No automatic replay.");
                 else if (!success) Warn("Job '" + run.Occurrence.Job.Id + "' stopped (" + code + ").");
                 else if (run.Occurrence.Job.Log && (code != "cron_skipped" || _settings!.LogSkipped))

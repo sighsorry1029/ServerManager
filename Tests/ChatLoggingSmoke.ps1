@@ -299,10 +299,12 @@ using System.Collections.Concurrent;
 public sealed class ServerManagerChatEventCollector
 {
     public readonly ConcurrentQueue<string> Kinds = new ConcurrentQueue<string>();
+    public readonly ConcurrentQueue<object> Events = new ConcurrentQueue<object>();
     public void OnEvent(object sender, object arguments)
     {
         object value = arguments.GetType().GetProperty("Event").GetValue(arguments, null);
         Kinds.Enqueue((string)value.GetType().GetProperty("Kind").GetValue(value, null));
+        Events.Enqueue(value);
     }
 }
 public static class ServerManagerFakeClanApi
@@ -502,7 +504,7 @@ try {
         $fields = [Collections.Generic.Dictionary[string, string]]::new()
         $fields.Add('message', "central $kind")
         $null = $publish.Invoke($null, [object[]]@(
-            $kind, 'client_reported', $actor, $null, $fields, [DateTime]::UtcNow))
+            $kind, 'client_reported', $actor, $null, $fields, [DateTime]::UtcNow, $false))
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     while ($collector.Kinds.Count -lt 2 -and [DateTime]::UtcNow -lt $deadline) {
@@ -518,7 +520,119 @@ try {
         'Private/local chat leaked to EventPublished, or public events stopped flowing.'
     $liveChatLines = [IO.File]::ReadAllLines((Join-Path $liveRoot 'logs\events-chat.log'))
     Assert-True ($liveChatLines.Length -eq 4) `
-        'The central publisher did not retain all four chat channels locally.'
+        'The command-only audit flag suppressed unrelated chat channels.'
+    Assert-True ([IO.File]::ReadAllText((Join-Path $liveRoot 'logs\events-audit.log')).Contains('central server.started')) `
+        'The command-only audit flag suppressed an unrelated server event.'
+
+    # Run the real file writer, public dispatcher and Discord summary router.
+    # The Discord session has no worker, Gateway or HTTP calls: inspect its queue.
+    $recordCommand = $runtimeType.GetMethod('RecordCommand', $staticFlags)
+    $commandParameters = $recordCommand.GetParameters()
+    Assert-True ($commandParameters.Length -eq 9 -and $commandParameters[8].IsOptional -and
+        $commandParameters[8].DefaultValue -eq $true -and
+        $publish.GetParameters().Length -eq 7 -and $publish.GetParameters()[6].DefaultValue -eq $true) `
+        'Command/publication audit defaults no longer preserve existing callers.'
+    $commandFlags = @{}
+    foreach ($name in @('_serverStarted', '_shutdownStarted')) {
+        $field = $runtimeType.GetField($name, $staticFlags)
+        $commandFlags[$name] = $field.GetValue($null)
+    }
+    $discordRuntimeType = $assembly.GetType('ServerManager.Discord.DiscordRuntime', $true)
+    $discordSessionType = $discordRuntimeType.GetNestedType('Session', $instanceFlags)
+    $discordSessionField = $discordRuntimeType.GetField('_session', $staticFlags)
+    $previousDiscordSession = $discordSessionField.GetValue($null)
+    $settingsType = $assembly.GetType('ServerManager.Discord.DiscordSettings', $true)
+    $routeType = $assembly.GetType('ServerManager.Discord.DiscordWebhookRoute', $true)
+    $webhookType = $assembly.GetType('ServerManager.Discord.DiscordWebhooks', $true)
+    $httpType = $assembly.GetType('ServerManager.Discord.DiscordHttp', $true)
+    $commandSettings = [Activator]::CreateInstance($settingsType, $true)
+    $commandRoute = [Activator]::CreateInstance($routeType, $true)
+    $routeType.GetProperty('Name').SetValue($commandRoute, 'Offline command audit smoke')
+    $routeType.GetProperty('Url').SetValue($commandRoute, 'https://discord.com/api/webhooks/123/offline_Test-token1')
+    $routeType.GetProperty('Events').GetValue($commandRoute).Add('cron.executed') | Out-Null
+    $routeType.GetProperty('Events').GetValue($commandRoute).Add('command.executed') | Out-Null
+    $settingsType.GetProperty('WebhookRoutes').GetValue($commandSettings).Add($commandRoute)
+    $inertHttp = [Runtime.Serialization.FormatterServices]::GetUninitializedObject($httpType)
+    $commandWebhooks = $webhookType.GetConstructors()[0].Invoke([object[]]@($commandSettings, $inertHttp, $null))
+    $commandWebhookQueue = $webhookType.GetField('_queue', $instanceFlags).GetValue($commandWebhooks)
+    $inertDiscordSession = [Runtime.Serialization.FormatterServices]::GetUninitializedObject($discordSessionType)
+    $discordSessionType.GetField('_webhooks', $instanceFlags).SetValue($inertDiscordSession, $commandWebhooks)
+    $commandCollector = [ServerManagerChatEventCollector]::new()
+    $commandHandler = [Delegate]::CreateDelegate($publishedEvent.EventHandlerType,
+        $commandCollector, $commandCollector.GetType().GetMethod('OnEvent'))
+    [string]$commandRoot = Join-Path $testRoot 'command-audit'
+    # id, source, action, success, requested file policy, expected file, expected webhook, optional result.
+    $commandCases = @(
+        @('quiet-broadcast', 'cron', 'broadcast', $true, $false, $false, $false),
+        @('quiet-summary', 'cron', 'schedule', $true, $false, $false, $true),
+        @('default-broadcast', 'cron', 'broadcast', $true, [Type]::Missing, $true, $false),
+        @('explicit-broadcast', 'cron', 'broadcast', $true, $true, $true, $false),
+        @('failed-broadcast', 'cron', 'broadcast', $false, $false, $true, $false),
+        @('failed-summary', 'cron', 'schedule', $false, $false, $true, $true),
+        @('cancelled-summary', 'cron', 'schedule', $false, $false, $true, $true, 'cron_cancelled'),
+        @('manual-broadcast', 'ingame', 'broadcast', $true, $false, $true, $true),
+        @('discord-broadcast', 'discord', 'broadcast', $true, $false, $true, $true),
+        @('cron-maintenance', 'cron', 'maintenance', $true, $false, $true, $true),
+        @('cron-save', 'cron', 'save', $true, $false, $true, $false),
+        @('cron-ban', 'cron', 'ban', $true, $false, $true, $false),
+        @('cron-restore', 'cron', 'characterrestore', $true, $false, $true, $false),
+        @('source-case', 'Cron', 'broadcast', $true, $false, $true, $true)
+    )
+    try {
+        $runtimeType.GetField('_serverStarted', $staticFlags).SetValue($null, $true)
+        $runtimeType.GetField('_shutdownStarted', $staticFlags).SetValue($null, $false)
+        $discordSessionField.SetValue($null, $inertDiscordSession)
+        $writerType.GetMethod('Start', $instanceFlags).Invoke($liveWriter, [object[]]@($commandRoot))
+        $writerStarted = $true
+        $publishedEvent.AddEventHandler($null, $commandHandler)
+        $apiType.GetMethod('StartDispatcher', $staticFlags).Invoke($null, $null)
+        $dispatcherStarted = $true
+        foreach ($case in $commandCases) {
+            $beforeWebhooks = $commandWebhookQueue.Count
+            [string]$result = if ($case.Length -gt 7) { $case[7] } elseif ($case[3]) { 'cron_completed' } else { 'test_failed' }
+            $recordCommand.Invoke($null, [object[]]@(
+                $case[1], $case[0], $case[0], $case[2], '', $result, $case[3], $null, $case[4])) | Out-Null
+            Assert-True ($commandWebhookQueue.Count -eq $beforeWebhooks + [int][bool]$case[6]) `
+                "Local audit policy changed Discord delivery for $($case[0])."
+        }
+        $apiType.GetMethod('StopDispatcher', $staticFlags).Invoke($null, $null)
+        $dispatcherStarted = $false
+        $writerType.GetMethod('Stop', $instanceFlags).Invoke($liveWriter, $null)
+        $writerStarted = $false
+        $commandLines = [IO.File]::ReadAllLines((Join-Path $commandRoot 'logs\events-audit.log'))
+        $publicCommands = $commandCollector.Events.ToArray()
+        Assert-True ($publicCommands.Length -eq $commandCases.Length) `
+            'Quiet command auditing suppressed or duplicated public integration events.'
+        Assert-True ($commandLines.Length -eq @($commandCases | Where-Object { $_[5] }).Count) `
+            'The command file policy wrote an unexpected number of audit records.'
+        foreach ($case in $commandCases) {
+            $matchingLines = @($commandLines | Where-Object { $_.Contains("actor_id=$($case[0]);") })
+            Assert-True ($matchingLines.Count -eq [int][bool]$case[5]) `
+                "File audit suppression failed its fail-safe boundary for $($case[0])."
+            $publicEvent = @($publicCommands | Where-Object { $_.Actor.Id -ceq $case[0] })
+            Assert-True ($publicEvent.Count -eq 1 -and $publicEvent[0].Kind -eq 'command.executed' -and
+                $publicEvent[0].Fields['source'] -ceq $case[1] -and
+                $publicEvent[0].Fields['command'] -ceq $case[2] -and
+                $publicEvent[0].Fields['success'] -eq ([bool]$case[3]).ToString().ToLowerInvariant()) `
+                "File audit policy changed public command facts for $($case[0])."
+        }
+    }
+    finally {
+        if ($dispatcherStarted) {
+            $apiType.GetMethod('StopDispatcher', $staticFlags).Invoke($null, $null)
+            $dispatcherStarted = $false
+        }
+        if ($writerStarted) {
+            $writerType.GetMethod('Stop', $instanceFlags).Invoke($liveWriter, $null)
+            $writerStarted = $false
+        }
+        $publishedEvent.RemoveEventHandler($null, $commandHandler)
+        $discordSessionField.SetValue($null, $previousDiscordSession)
+        $commandWebhooks.Dispose()
+        foreach ($name in $commandFlags.Keys) {
+            $runtimeType.GetField($name, $staticFlags).SetValue($null, $commandFlags[$name])
+        }
+    }
 }
 finally {
     if ($dispatcherStarted) {

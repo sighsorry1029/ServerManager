@@ -3068,7 +3068,7 @@ try {
 }
 catch {
     $longDetailRejected =
-        $_.Exception.Message -like "*bounded command token*"
+        $_.Exception.Message -like "*bounded*"
 }
 
 Assert-True $longDetailRejected `
@@ -3083,8 +3083,9 @@ try {
     $null = $reportConstructor.Invoke($reportArguments)
 }
 catch {
-    $nonCommandDetailRejected =
-        $_.Exception.Message -like "*Only command reports*"
+    $detailError = $_.Exception
+    while ($null -ne $detailError.InnerException) { $detailError = $detailError.InnerException }
+    $nonCommandDetailRejected = $detailError -is [ArgumentException]
 }
 
 Assert-True $nonCommandDetailRejected `
@@ -3135,8 +3136,7 @@ foreach ($valheavenEvidenceCode in @(201, 202)) {
     catch {
         $detailError = $_.Exception
         while ($null -ne $detailError.InnerException) { $detailError = $detailError.InnerException }
-        $valheavenDetailRejected = $detailError -is [ArgumentException] -and
-            $detailError.Message.Contains('Only command reports')
+        $valheavenDetailRejected = $detailError -is [ArgumentException]
     }
     Assert-True $valheavenDetailRejected "Valheaven evidence $valheavenEvidenceCode accepted arbitrary report detail."
 
@@ -3155,6 +3155,70 @@ foreach ($valheavenEvidenceCode in @(201, 202)) {
 $evidenceCatalogType = $pluginAssembly.GetType("ServerManager.DetectionEvidenceCatalog", $true)
 $isClientReportable = $evidenceCatalogType.GetMethod("IsClientReportable", $staticNonPublic)
 $isSnapshotStatLimit = $evidenceCatalogType.GetMethod("IsSnapshotStatLimit", $staticNonPublic)
+$isDiagnostic = $evidenceCatalogType.GetMethod('IsDiagnostic', $staticNonPublic)
+$isAssemblyDiagnostic = $evidenceCatalogType.GetMethod('IsAssemblyDiagnostic', $staticNonPublic)
+foreach ($diagnosticCode in @(902, 903)) {
+    $diagnosticEvidence = [Enum]::ToObject($evidenceType, [ushort]$diagnosticCode)
+    Assert-True ($isDiagnostic.Invoke($null, [object[]]@($diagnosticEvidence)) -and
+        $isAssemblyDiagnostic.Invoke($null, [object[]]@($diagnosticEvidence)) -and
+        $isClientReportable.Invoke($null, [object[]]@($diagnosticEvidence))) `
+        'Assembly infrastructure/partial diagnostics must remain reportable diagnostic-only evidence.'
+    $stages = if ($diagnosticCode -eq 902) { @('subscribe', 'enumerate') } else { @('name', 'types', 'namespace') }
+    $diagnosticName = if ($diagnosticCode -eq 902) { 'unknown' } else { 'YamlDotNet' }
+    $validDiagnostics = @($stages | ForEach-Object { "stage=$_;assembly=$diagnosticName;exception=ReflectionTypeLoadException" })
+    $longName = if ($diagnosticCode -eq 902) { 'unknown' } else { 'A' * 64 }
+    $validDiagnostics += 'stage=' + $stages[0] + ';assembly=' + $longName + ';exception=' + ('E' * 64)
+    foreach ($diagnosticDetail in $validDiagnostics) {
+        $diagnosticArguments = [object[]]$reportArguments.Clone()
+        $diagnosticArguments[3] = $diagnosticEvidence
+        $diagnosticArguments[4] = $diagnosticDetail
+        $diagnosticReport = $reportConstructor.Invoke($diagnosticArguments)
+        $diagnosticPackage = $encodeDetection.Invoke($null, [object[]]@($diagnosticReport))
+        $diagnosticDecoded = Decode-DetectionReport $diagnosticPackage
+        Assert-True ($diagnosticDecoded.Succeeded -and
+            $reportType.GetProperty('Detail', $instanceNonPublic).GetValue($diagnosticDecoded.Report, $null) -ceq $diagnosticDetail) `
+            'Canonical bounded diagnostic detail did not round-trip exactly.'
+        [byte[]]$diagnosticWire = $zPackageGetArray.Invoke($diagnosticPackage, $null)
+        Assert-True ([BitConverter]::ToUInt16($diagnosticWire, 4) -eq 3 -and
+            $diagnosticWire.Length -eq 65 + $diagnosticDetail.Length) 'Diagnostic wire version/size changed unexpectedly.'
+        [byte[]]$priorDiagnosticWire = $diagnosticWire.Clone(); $priorDiagnosticWire[4] = 2
+        Assert-True (-not (Decode-DetectionReport (New-ZPackage $priorDiagnosticWire)).Succeeded) `
+            'The previous detection wire version was accepted.'
+    }
+    foreach ($invalidDetail in @('', 'plain printable text', ('A' * 193), "bad`ntext", "bad`ttext", [string][char]0, [string][char]127, '한글', 'ａ',
+        ('stage=' + $stages[0] + ';assembly=' + ('N' * 65) + ';exception=TypeLoadException'),
+        ('stage=' + $stages[0] + ';assembly=C:\PRIVATE\plugin.dll;exception=TypeLoadException'),
+        ('stage=' + $stages[0] + ';assembly=unknown;exception=TypeLoadException;message=SECRET'))) {
+        $diagnosticArguments[4] = $invalidDetail
+        $invalidRejected = $false
+        try { $null = $reportConstructor.Invoke($diagnosticArguments) } catch { $invalidRejected = $true }
+        Assert-True $invalidRejected 'A diagnostic constructor accepted noncanonical, unsafe or over-bound detail.'
+    }
+    foreach ($rawDiagnosticDetail in @([byte[]](10), [byte[]](13), [byte[]](9), [byte[]](0),
+        [byte[]](127), [byte[]](128), [byte[]](255), [byte[]]::new(193))) {
+        [byte[]]$forgedDiagnostic = [byte[]]::new(65 + $rawDiagnosticDetail.Length)
+        [Array]::Copy($diagnosticWire, $forgedDiagnostic, 64)
+        $forgedDiagnostic[64] = [byte]$rawDiagnosticDetail.Length
+        [Array]::Copy($rawDiagnosticDetail, 0, $forgedDiagnostic, 65, $rawDiagnosticDetail.Length)
+        Assert-True (-not (Decode-DetectionReport (New-ZPackage $forgedDiagnostic)).Succeeded) `
+            'The decoder accepted control/non-ASCII/oversized raw diagnostic bytes.'
+    }
+    [byte[]]$commandForgery = $diagnosticWire.Clone()
+    $commandCode = [int][Enum]::Parse($evidenceType, 'CheatCommand')
+    $commandForgery[62] = [byte]($commandCode -band 255); $commandForgery[63] = [byte]($commandCode -shr 8)
+    Assert-True (-not (Decode-DetectionReport (New-ZPackage $commandForgery)).Succeeded) `
+        'Diagnostic detail relaxation leaked into the command-token grammar.'
+    [byte[]]$positiveForgery = $diagnosticWire.Clone()
+    $positiveForgery[62] = 200; $positiveForgery[63] = 0
+    Assert-True (-not (Decode-DetectionReport (New-ZPackage $positiveForgery)).Succeeded) `
+        'Diagnostic detail relaxation leaked into positive cheat evidence.'
+    [byte[]]$otherDiagnosticForgery = $diagnosticWire.Clone()
+    $otherCode = if ($diagnosticCode -eq 902) { 903 } else { 902 }
+    $otherDiagnosticForgery[62] = [byte]($otherCode -band 255)
+    $otherDiagnosticForgery[63] = [byte]($otherCode -shr 8)
+    Assert-True (-not (Decode-DetectionReport (New-ZPackage $otherDiagnosticForgery)).Succeeded) `
+        'A forged diagnostic stage crossed the unavailable/incomplete evidence boundary.'
+}
 foreach ($serverEvidenceSpec in @(
     @{ Name = 'MalformedGameplayTraffic'; Value = 402; Snapshot = $false },
     @{ Name = 'MaximumHealthLimitExceeded'; Value = 403; Snapshot = $true },
@@ -3248,7 +3312,7 @@ Assert-True (-not (Decode-DetectionReport (
     New-ZPackage $trailing)).Succeeded) `
     "Trailing detection bytes were accepted."
 
-$oversize = [byte[]]::new(114)
+$oversize = [byte[]]::new(258)
 Assert-True (-not (Decode-DetectionReport (
     New-ZPackage $oversize)).Succeeded) `
     "An oversized detection report was accepted."
@@ -3435,8 +3499,8 @@ $allStatic = [Reflection.BindingFlags]"Static,Public,NonPublic"
 $protocolWireVersion = $protocolCodecType.GetField(
     "WireVersion",
     [Reflection.BindingFlags]"Static,Public").GetRawConstantValue()
-Assert-True ($protocolWireVersion -eq 24) `
-    "The main protocol wire version was not bumped to 24 for optional center displays."
+Assert-True ($protocolWireVersion -eq 25) `
+    "The main protocol wire version was not bumped to 25 for bounded detector diagnostics."
 
 $limitsArguments = [object[]]::new(6)
 $limitsArguments[0] = 512 * 1024
@@ -3483,10 +3547,10 @@ $challengePackage = $createChallenge.Invoke($null, $createArguments)
 
 $decodedPacket = Decode-ProtocolPacket $challengePackage $limits
 Assert-True $decodedPacket.Succeeded `
-    "A valid wire-v24 challenge packet was rejected."
+    "A valid wire-v25 challenge packet was rejected."
 $decodedChallenge = Decode-ChallengeOptions $decodedPacket.Packet
 Assert-True $decodedChallenge.Succeeded `
-    "Valid wire-v24 challenge options were rejected."
+    "Valid wire-v25 challenge options were rejected."
 
 $createFinalSaveBegin = $protocolCodecType.GetMethod(
     "CreateFinalSaveBegin",
@@ -3496,7 +3560,7 @@ $createFinalSaveReady = $protocolCodecType.GetMethod(
     $allStatic)
 Assert-True ($null -ne $createFinalSaveBegin -and
     $null -ne $createFinalSaveReady) `
-    "The wire-v24 final-save gate packet factories were missing."
+    "The wire-v25 final-save gate packet factories were missing."
 $finalControlArguments = [object[]]@($sessionId, $nonce, $limits)
 $finalBeginPacket = Decode-ProtocolPacket (
     $createFinalSaveBegin.Invoke($null, $finalControlArguments)) $limits
@@ -3953,7 +4017,7 @@ foreach ($gatingCase in @(
     $gatingArguments[6] = $gatingCase.Managed
     $gatingPolicy = $challengeType.GetConstructors()[0].Invoke($gatingArguments)
     $gatingState = $gatingStateConstructor.Invoke([object[]]@($gatingPolicy, $gatingLogAction, $gatingLogAction, 3, 10))
-    foreach ($gatingEvidenceCode in @(200, 201, 202, 902)) {
+    foreach ($gatingEvidenceCode in @(200, 201, 202, 902, 903)) {
         $gatingEvidence = [Enum]::ToObject($evidenceType, [ushort]$gatingEvidenceCode)
         $expectedEnabled = if ($gatingEvidenceCode -eq 202) { $gatingCase.External } else { $gatingCase.Managed }
         Assert-True ($expectedEvidenceMethod.Invoke($null, [object[]]@($gatingState, $gatingEvidence)) -eq $expectedEnabled) `
@@ -4552,6 +4616,11 @@ $valheavenDetectedProperty = $assemblyResultType.GetProperty(
     'ValheavenDetected', $instanceNonPublic)
 $inspectionIncompleteProperty = $assemblyResultType.GetProperty(
     'InspectionIncomplete', $instanceNonPublic)
+$failureStageProperty = $assemblyResultType.GetProperty('FailureStage', $instanceNonPublic)
+$failureExceptionProperty = $assemblyResultType.GetProperty('FailureException', $instanceNonPublic)
+$inspectionNameProperty = $assemblyResultType.GetProperty('AssemblyName', $instanceNonPublic)
+Assert-True ($null -ne $failureStageProperty -and $null -ne $failureExceptionProperty -and
+    $null -ne $inspectionNameProperty) 'The inspector must retain the first local diagnostic context.'
 
 $benignResult = $inspectAssembly.Invoke(
     $null,
@@ -4614,6 +4683,9 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Reflection;
 namespace ServerManager.Tests {
+    public sealed class ThrowingMessageException : Exception {
+        public override string Message { get { throw new InvalidOperationException("Synthetic message getter failure"); } }
+    }
     public sealed class InspectionAssembly : Assembly {
         public string SimpleName = "Neutral";
         public Type[] Types = new Type[0];
@@ -4651,6 +4723,10 @@ Assert-True ($toolerDetectedProperty.GetValue($partialResult, $null) -and
     $valheavenDetectedProperty.GetValue($partialResult, $null) -and
     $inspectionIncompleteProperty.GetValue($partialResult, $null)) `
     'A partial type-load failure discarded positive evidence or its diagnostic.'
+Assert-True ($failureStageProperty.GetValue($partialResult, $null) -ceq 'types' -and
+    [object]::ReferenceEquals($failureExceptionProperty.GetValue($partialResult, $null), $partialAssembly.TypesError) -and
+    $inspectionNameProperty.GetValue($partialResult, $null) -ceq 'Neutral') `
+    'A partial type load did not preserve the original ReflectionTypeLoadException and assembly name.'
 
 $nameFailureAssembly = [ServerManager.Tests.InspectionAssembly]::new()
 $nameFailureAssembly.NameError = [InvalidOperationException]::new('Synthetic name failure.')
@@ -4660,6 +4736,16 @@ Assert-True ($toolerDetectedProperty.GetValue($nameFailureResult, $null) -and
     $valheavenDetectedProperty.GetValue($nameFailureResult, $null) -and
     $inspectionIncompleteProperty.GetValue($nameFailureResult, $null)) `
     'Assembly-name failure prevented type inspection.'
+Assert-True ($failureStageProperty.GetValue($nameFailureResult, $null) -ceq 'name' -and
+    [object]::ReferenceEquals($failureExceptionProperty.GetValue($nameFailureResult, $null), $nameFailureAssembly.NameError)) `
+    'Assembly-name inspection lost the exact first exception.'
+$multipleFailures = [ServerManager.Tests.InspectionAssembly]::new()
+$multipleFailures.NameError = [InvalidOperationException]::new('FIRST_SYNTHETIC_FAILURE')
+$multipleFailures.TypesError = [TypeLoadException]::new('LATER_SYNTHETIC_FAILURE')
+$firstFailure = $inspectAssembly.Invoke($null, [object[]]@($multipleFailures))
+Assert-True ($failureStageProperty.GetValue($firstFailure, $null) -ceq 'name' -and
+    [object]::ReferenceEquals($failureExceptionProperty.GetValue($firstFailure, $null), $multipleFailures.NameError)) `
+    'A later inspection failure replaced the first stage/exception.'
 
 foreach ($matchingName in @('Neutral', 'ValheimTooler', 'ValheavenModMenu')) {
     $typesFailureAssembly = [ServerManager.Tests.InspectionAssembly]::new()
@@ -4680,6 +4766,9 @@ Assert-True (-not $toolerDetectedProperty.GetValue($namespaceFailureResult, $nul
     $valheavenDetectedProperty.GetValue($namespaceFailureResult, $null) -and
     $inspectionIncompleteProperty.GetValue($namespaceFailureResult, $null)) `
     'A namespace getter failure prevented inspection of later types.'
+Assert-True ($failureStageProperty.GetValue($namespaceFailureResult, $null) -ceq 'namespace' -and
+    [object]::ReferenceEquals($failureExceptionProperty.GetValue($namespaceFailureResult, $null), $badNamespace.Error)) `
+    'The original namespace-access exception was not retained.'
 foreach ($failureLocation in @('NameError', 'TypesError', 'Namespace')) {
     $fatalAssembly = [ServerManager.Tests.InspectionAssembly]::new()
     $syntheticFatal = [OutOfMemoryException]::new('Synthetic fatal: no memory exhaustion was induced.')
@@ -4703,6 +4792,27 @@ foreach ($failureLocation in @('NameError', 'TypesError', 'Namespace')) {
 # Both tools share one reflection pass, one bounded loader queue and generation
 # cache. Event callbacks enqueue only; inspection runs in TickAssemblyDetector.
 $assemblyAgentType = $pluginAssembly.GetType('ServerManager.ClientDetectionAgent', $true)
+$formatAssemblyDiagnostic = $assemblyAgentType.GetMethod('FormatAssemblyDiagnosticLog', $staticNonPublic)
+$originalStack = $partialAssembly.TypesError.StackTrace
+$stackDiagnostic = [string]$formatAssemblyDiagnostic.Invoke($null,
+    [object[]]@('types', 'SyntheticAssembly', $partialAssembly.TypesError))
+Assert-True (-not [string]::IsNullOrWhiteSpace($originalStack) -and
+    $originalStack.Contains('InspectionAssembly.GetTypes') -and $stackDiagnostic.Contains('InspectionAssembly.GetTypes')) `
+    'The first caught reflection error lost its original throw location in the bounded local diagnostic.'
+$loaderErrors = [Exception[]]@(1..6 | ForEach-Object { [TypeLoadException]::new("LOADER_FAULT_$_") })
+$richFailure = [Reflection.ReflectionTypeLoadException]::new([Type[]]@($null), $loaderErrors)
+$formattedDiagnostic = [string]$formatAssemblyDiagnostic.Invoke($null,
+    [object[]]@('types', 'SyntheticAssembly', $richFailure))
+Assert-True ($formattedDiagnostic.Contains('SyntheticAssembly') -and
+    $formattedDiagnostic.Contains('ReflectionTypeLoadException') -and
+    $formattedDiagnostic.Contains('LOADER_FAULT_1') -and $formattedDiagnostic.Contains('LOADER_FAULT_4') -and
+    -not $formattedDiagnostic.Contains('LOADER_FAULT_5') -and -not $formattedDiagnostic.Contains('LOADER_FAULT_6')) `
+    'Local diagnostics must retain the initial error and a bounded first four loader exceptions.'
+$hugeFailure = [InvalidOperationException]::new(('SYNTHETIC_LOCAL_DETAIL_' * 10000))
+$boundedDiagnostic = [string]$formatAssemblyDiagnostic.Invoke($null,
+    [object[]]@('types', 'SyntheticAssembly', $hugeFailure))
+Assert-True ($boundedDiagnostic.Length -lt 20000 -and $boundedDiagnostic.Contains('InvalidOperationException')) `
+    'A single loader failure produced unbounded local diagnostic output.'
 $assemblyAgent = [Activator]::CreateInstance($assemblyAgentType, $true)
 $assemblyPolicyArguments = [object[]]$challengeArguments.Clone()
 foreach ($index in @(3,4,5)) { $assemblyPolicyArguments[$index] = $false }
@@ -4737,6 +4847,74 @@ try {
     $null = $assemblyAgentType.GetMethod('TickAssemblyDetector', $instanceNonPublic).Invoke($assemblyAgent, $null)
     Assert-True ($lateAssembly.NameReads -eq 1 -and $lateAssembly.TypeReads -eq 1) `
         'A later assembly-load event was not inspected by the shared tick path.'
+
+    # Partial failure is a separate diagnostic, never an infrastructure outage
+    # or a positive match; repeated inspection cannot flood its report queue.
+    while ($dequeueAssemblySignal.Invoke($assemblyAgent, $assemblySignalArguments)) { }
+    $failingAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+    $failingAssembly.TypesError = [TypeLoadException]::new('LOCAL_ONLY_EXCEPTION_DETAIL')
+    $null = $inspectOnce.Invoke($assemblyAgent, [object[]]@($failingAssembly))
+    $null = $inspectOnce.Invoke($assemblyAgent, [object[]]@($failingAssembly))
+    $diagnosticSignals = [Collections.Generic.List[object]]::new()
+    while ($dequeueAssemblySignal.Invoke($assemblyAgent, $assemblySignalArguments)) {
+        $diagnosticSignals.Add($assemblySignalArguments[0])
+    }
+    Assert-True ($diagnosticSignals.Count -eq 1 -and
+        [int]$signalType.GetProperty('Evidence', $instanceNonPublic).GetValue($diagnosticSignals[0], $null) -eq 903 -and
+        $failingAssembly.TypeReads -eq 1) 'Repeated partial scans flooded diagnostics or used unavailable evidence.'
+    $diagnosticSignalDetail = [string]$signalType.GetProperty('Detail', $instanceNonPublic).GetValue($diagnosticSignals[0], $null)
+    Assert-True ($diagnosticSignalDetail.Contains('stage=types') -and $diagnosticSignalDetail.Contains('TypeLoadException') -and
+        -not $diagnosticSignalDetail.Contains('LOCAL_ONLY_EXCEPTION_DETAIL') -and $diagnosticSignalDetail.Length -le 192) `
+        'Remote diagnostics must carry only bounded stage/assembly/type context, never exception messages.'
+    $reportAssemblyDiagnostic = $assemblyAgentType.GetMethod('ReportAssemblyDiagnostic', $instanceNonPublic)
+    $diagnosticCountField = $assemblyAgentType.GetField('_assemblyDiagnosticLogCount', $instanceNonPublic)
+    $diagnosticLimitField = $assemblyAgentType.GetField('_assemblyDiagnosticLogLimitReported', $instanceNonPublic)
+    foreach ($stage in @('subscribe', 'subscribe', 'enumerate')) {
+        $null = $reportAssemblyDiagnostic.Invoke($assemblyAgent,
+            [object[]]@($stage, 'unknown', [InvalidOperationException]::new('LOCAL_INFRA_DETAIL'), $null))
+    }
+    foreach ($index in 1..12) {
+        $syntheticFailure = [ServerManager.Tests.InspectionAssembly]::new()
+        $null = $reportAssemblyDiagnostic.Invoke($assemblyAgent,
+            [object[]]@('types', 'SyntheticAssembly', [TypeLoadException]::new('LOCAL_FAULT'), $syntheticFailure))
+    }
+    Assert-True ($diagnosticCountField.GetValue($assemblyAgent) -eq 8 -and
+        $diagnosticLimitField.GetValue($assemblyAgent)) 'Distinct assembly failures escaped the eight-log connection cap.'
+    $null = $assemblyAgentType.GetMethod('UpdateGameplayLimits', $instanceNonPublic).Invoke(
+        $assemblyAgent, [object[]]@([uint32]2, [single]2000, [single]9999))
+    Assert-True ($diagnosticCountField.GetValue($assemblyAgent) -eq 8 -and
+        $diagnosticLimitField.GetValue($assemblyAgent)) 'A live policy reload reset the connection-scoped diagnostic cap.'
+    $infrastructureSignals = [Collections.Generic.List[int]]::new()
+    while ($dequeueAssemblySignal.Invoke($assemblyAgent, $assemblySignalArguments)) {
+        $infrastructureSignals.Add([int]$signalType.GetProperty('Evidence', $instanceNonPublic).GetValue($assemblySignalArguments[0], $null))
+    }
+    Assert-True ($infrastructureSignals.Count -eq 1 -and $infrastructureSignals[0] -eq 902) `
+        'Repeated infrastructure and partial failures flooded the sticky diagnostic queue.'
+    $null = $assemblyAgentType.GetMethod('Reset', $instanceNonPublic).Invoke($assemblyAgent, $null)
+    Assert-True ($diagnosticCountField.GetValue($assemblyAgent) -eq 0 -and
+        -not $diagnosticLimitField.GetValue($assemblyAgent)) 'Disconnect retained the local diagnostic log cap.'
+    $null = $assemblyAgentType.GetMethod('Configure', $instanceNonPublic).Invoke($assemblyAgent, [object[]]@($assemblyPolicy))
+    $null = $inspectOnce.Invoke($assemblyAgent, [object[]]@($failingAssembly))
+    $afterReset = [Collections.Generic.List[int]]::new()
+    while ($dequeueAssemblySignal.Invoke($assemblyAgent, $assemblySignalArguments)) {
+        $afterReset.Add([int]$signalType.GetProperty('Evidence', $instanceNonPublic).GetValue($assemblySignalArguments[0], $null))
+    }
+    Assert-True (@($afterReset | Where-Object { $_ -eq 903 }).Count -eq 1 -and $failingAssembly.TypeReads -eq 2) `
+        'A new connection did not reset the partial-inspection diagnostic and scan cache.'
+
+    $null = $assemblyAgentType.GetMethod('Reset', $instanceNonPublic).Invoke($assemblyAgent, $null)
+    $null = $assemblyAgentType.GetMethod('Configure', $instanceNonPublic).Invoke($assemblyAgent, [object[]]@($assemblyPolicy))
+    $throwingMessageAssembly = [ServerManager.Tests.InspectionAssembly]::new()
+    $throwingMessageAssembly.SimpleName = 'ValheavenModMenu'
+    $throwingMessageAssembly.TypesError = [ServerManager.Tests.ThrowingMessageException]::new()
+    $null = $inspectOnce.Invoke($assemblyAgent, [object[]]@($throwingMessageAssembly))
+    $formatFailureSignals = [Collections.Generic.List[int]]::new()
+    while ($dequeueAssemblySignal.Invoke($assemblyAgent, $assemblySignalArguments)) {
+        $formatFailureSignals.Add([int]$signalType.GetProperty('Evidence', $instanceNonPublic).GetValue($assemblySignalArguments[0], $null))
+    }
+    Assert-True (@($formatFailureSignals | Where-Object { $_ -eq 201 }).Count -eq 1 -and
+        @($formatFailureSignals | Where-Object { $_ -eq 903 }).Count -eq 1) `
+        'A throwing exception Message getter or missing logger erased a positive detection or partial diagnostic.'
 }
 finally {
     $null = $assemblyAgentType.GetMethod('Reset', $instanceNonPublic).Invoke($assemblyAgent, $null)
@@ -5293,11 +5471,11 @@ $quietPolicy = $challengeType.GetConstructors()[0].Invoke($quietArguments)
 $null = $reloadDetectorType.GetMethod('Configure', $instanceNonPublic).Invoke($reloadDetector, [object[]]@($quietPolicy))
 $emitReloadSignal = $reloadDetectorType.GetMethod('Emit', $instanceNonPublic)
 $reloadEvidence = [Enum]::Parse($evidenceType, 'CarryWeightLimitExceeded')
-$null = $emitReloadSignal.Invoke($reloadDetector, [object[]]@($reloadEvidence, [uint32]0))
+$null = $emitReloadSignal.Invoke($reloadDetector, [object[]]@($reloadEvidence, [uint32]0, ''))
 $updateDetector = $reloadDetectorType.GetMethod('UpdateGameplayLimits', $instanceNonPublic)
 $null = $updateDetector.Invoke($reloadDetector, [object[]]@([uint32]2, [single]2000, [single]9999))
-$null = $emitReloadSignal.Invoke($reloadDetector, [object[]]@($reloadEvidence, [uint32]0))
-$null = $emitReloadSignal.Invoke($reloadDetector, [object[]]@($reloadEvidence, [uint32]0))
+$null = $emitReloadSignal.Invoke($reloadDetector, [object[]]@($reloadEvidence, [uint32]0, ''))
+$null = $emitReloadSignal.Invoke($reloadDetector, [object[]]@($reloadEvidence, [uint32]0, ''))
 $dequeueReloadSignal = $reloadDetectorType.GetMethod('TryDequeue', $instanceNonPublic)
 $reloadSignalType = $pluginAssembly.GetType('ServerManager.ClientDetectionSignal', $true)
 foreach ($expectedGeneration in @(1,2)) {
@@ -5360,5 +5538,5 @@ Assert-True ($staleObservationOffset -ge 0 -and $processObservationOffset -gt $s
     $fixedRuntimeSource.Substring($staleObservationOffset, $processObservationOffset - $staleObservationOffset).Contains(
         'LogDetection(identity, report, DetectionAction.Log, "stale_policy_observation")')) 'Old observations can inherit new terminal responses.'
 
-Write-Output ("Fixed 120-second/30-second timeout wiring and separate 10 MiB server/32 MiB client character bounds, unified responses, server-only snapshot stat evidence, post-ACK guarded stat sanctions/audit, anti-cheat wire-v24, authenticated hot policy updates, generation-bound reports, generic security rejection, gameplay limits, first-join/two-phase final-save gate, report-codec, exact-name/module, assembly, " +
+Write-Output ("Fixed 120-second/30-second timeout wiring and separate 10 MiB server/32 MiB client character bounds, unified responses, server-only snapshot stat evidence, post-ACK guarded stat sanctions/audit, anti-cheat wire-v25, authenticated hot policy updates, generation-bound reports, generic security rejection, gameplay limits, first-join/two-phase final-save gate, report-codec, exact-name/module, assembly, " +
     "admin-entitlement, event-integration, flood-cap, and command-queue smoke tests passed.")

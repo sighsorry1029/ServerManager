@@ -5302,7 +5302,7 @@ internal static partial class ServerManagerRuntime
     {
         if (DetectionEvidenceCatalog.IsDiagnostic(evidence))
         {
-            if (evidence == DetectionEvidence.AssemblyDetectorUnavailable)
+            if (DetectionEvidenceCatalog.IsAssemblyDiagnostic(evidence))
             {
                 return state.Policy.DetectInjectedCheatAssemblies;
             }
@@ -6247,7 +6247,9 @@ internal static partial class ServerManagerRuntime
             action,
             DetectionEvidenceCatalog.IsDiagnostic(report.Evidence) ? "diagnostic" :
                 action == DetectionAction.Log ? "observed" : "response_requested",
-            reason + "; detail=" + detail);
+            DetectionEvidenceCatalog.IsAssemblyDiagnostic(report.Evidence)
+                ? report.Detail
+                : reason + "; detail=" + detail);
 
         try
         {

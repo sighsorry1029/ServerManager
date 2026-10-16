@@ -47,7 +47,8 @@ internal enum DetectionEvidence : ushort
 
     ProcessDetectorUnsupported = 900,
     ProcessDetectorUnavailable = 901,
-    AssemblyDetectorUnavailable = 902
+    AssemblyDetectorUnavailable = 902,
+    AssemblyInspectionIncomplete = 903
 }
 
 internal readonly struct ClientDetectionSignal
@@ -98,8 +99,12 @@ internal static class DetectionEvidenceCatalog
     {
         return evidence == DetectionEvidence.ProcessDetectorUnsupported ||
                evidence == DetectionEvidence.ProcessDetectorUnavailable ||
-               evidence == DetectionEvidence.AssemblyDetectorUnavailable;
+               IsAssemblyDiagnostic(evidence);
     }
+
+    internal static bool IsAssemblyDiagnostic(DetectionEvidence evidence) =>
+        evidence == DetectionEvidence.AssemblyDetectorUnavailable ||
+        evidence == DetectionEvidence.AssemblyInspectionIncomplete;
 
     internal static bool IsGenericProcessName(DetectionEvidence evidence)
     {
@@ -141,6 +146,81 @@ internal static class DetectionEvidenceCatalog
                evidence == DetectionEvidence.MaximumStaminaLimitExceeded ||
                evidence == DetectionEvidence.MaximumEitrLimitExceeded;
     }
+}
+
+// A small diagnostic contract, not an arbitrary exception/log text channel.
+// Only assembly simple names and exception type names belong here, never paths,
+// exception messages, stack traces, or assembly-qualified identities.
+internal static class AssemblyDiagnosticDetail
+{
+    internal const int MaximumLength = 192;
+    private const int MaximumIdentifierLength = 64;
+    private const string Unknown = "unknown";
+
+    internal static string Format(string stage, string assemblyName, string exceptionType)
+    {
+        bool infrastructure = stage == "subscribe" || stage == "enumerate";
+        if (!infrastructure && stage != "name" && stage != "types" && stage != "namespace")
+            throw new ArgumentException("Unknown assembly diagnostic stage.", nameof(stage));
+        return "stage=" + stage + ";assembly=" +
+            (infrastructure ? Unknown : SanitizeIdentifier(assemblyName)) +
+            ";exception=" + SanitizeIdentifier(exceptionType);
+    }
+
+    internal static bool IsValid(DetectionEvidence evidence, string detail) =>
+        TryParse(evidence, detail, out _, out _, out _);
+
+    internal static bool TryParse(DetectionEvidence evidence, string detail,
+        out string stage, out string assemblyName, out string exceptionType)
+    {
+        stage = assemblyName = exceptionType = string.Empty;
+        if (!DetectionEvidenceCatalog.IsAssemblyDiagnostic(evidence) ||
+            string.IsNullOrEmpty(detail) || detail.Length > MaximumLength)
+            return false;
+        string[] parts = detail.Split(';');
+        if (parts.Length != 3 || !parts[0].StartsWith("stage=", StringComparison.Ordinal) ||
+            !parts[1].StartsWith("assembly=", StringComparison.Ordinal) ||
+            !parts[2].StartsWith("exception=", StringComparison.Ordinal))
+            return false;
+
+        string parsedStage = parts[0].Substring(6);
+        string parsedAssembly = parts[1].Substring(9);
+        string parsedException = parts[2].Substring(10);
+        bool infrastructure = evidence == DetectionEvidence.AssemblyDetectorUnavailable;
+        if ((infrastructure
+                ? parsedStage != "subscribe" && parsedStage != "enumerate"
+                : parsedStage != "name" && parsedStage != "types" && parsedStage != "namespace") ||
+            !IsIdentifier(parsedAssembly) || !IsIdentifier(parsedException) ||
+            (infrastructure && parsedAssembly != Unknown))
+            return false;
+
+        stage = parsedStage;
+        assemblyName = parsedAssembly;
+        exceptionType = parsedException;
+        return true;
+    }
+
+    private static string SanitizeIdentifier(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return Unknown;
+        int length = Math.Min(value.Length, MaximumIdentifierLength);
+        char[] result = new char[length];
+        for (int index = 0; index < length; ++index)
+            result[index] = IsIdentifierCharacter(value[index]) ? value[index] : '_';
+        return new string(result);
+    }
+
+    private static bool IsIdentifier(string value)
+    {
+        if (value.Length == 0 || value.Length > MaximumIdentifierLength) return false;
+        foreach (char character in value)
+            if (!IsIdentifierCharacter(character)) return false;
+        return true;
+    }
+
+    private static bool IsIdentifierCharacter(char value) =>
+        (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+        (value >= '0' && value <= '9') || value == '.' || value == '_' || value == '-';
 }
 
 internal static class DetectionRateLimiter

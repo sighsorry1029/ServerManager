@@ -91,7 +91,7 @@ try {
     if ($localRender.Count -ne 1 -or @($broadcast.Body.Instructions | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] -and
         $_.Operand.Name -eq 'ShowEventDisplay' }).Count -ne 1) { throw 'Remote clients and the listen host must share the same local-language display path.' }
     if (($runtime.Fields | Where-Object Name -eq 'EventDisplayRpcName').Constant -cne 'sighsorry.ServerManager.EventDisplay.v3' -or
-        ($assembly.MainModule.GetType('ServerManager.ProtocolPacketCodec').Fields | Where-Object Name -eq 'WireVersion').Constant -ne 24) {
+        ($assembly.MainModule.GetType('ServerManager.ProtocolPacketCodec').Fields | Where-Object Name -eq 'WireVersion').Constant -ne 25) {
         throw 'Localized event displays require the new display endpoint and handshake wire version, without legacy fallback.'
     }
     $webhooks = $assembly.MainModule.GetType('ServerManager.Discord.DiscordWebhooks')

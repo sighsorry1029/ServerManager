@@ -1088,9 +1088,14 @@ namespace ServerManager.Events
         internal static void RecordCommand(
             string source, string actorId, string actorName,
             string action, string target, string result, bool success,
-            IReadOnlyDictionary<string, string> data = null)
+            IReadOnlyDictionary<string, string> data = null,
+            bool writeAuditLog = true)
         {
             if (!_serverStarted || _shutdownStarted) return;
+            // Only successful scheduled broadcast/summary records can opt out
+            // of the file sink. Errors, manual and important commands stay audited.
+            writeAuditLog = writeAuditLog || source != "cron" || !success ||
+                (action != "broadcast" && action != "schedule");
             Dictionary<string, string> fields = Fields("title", "Administrative command", "source", Safe(source, 32),
                     "command", Safe(action, 64), "target", Safe(target, 96),
                     "result_code", Safe(result, 64), "success", success ? "true" : "false",
@@ -1103,7 +1108,8 @@ namespace ServerManager.Events
                     .WithPlayerAccount(source == "ingame" ? CharacterSteamIdentity.AccountPrefix + actorId : string.Empty),
                 string.IsNullOrEmpty(target) ? null :
                     new ServerManagerActor(Safe(target, 96), Safe(target, 96), "command_target")
-                        .WithPlayerAccount(CommandTargetPlayerAccount(action, target, success, data)), fields);
+                        .WithPlayerAccount(CommandTargetPlayerAccount(action, target, success, data)), fields,
+                writeAuditLog: writeAuditLog);
         }
 
         private static string CommandTargetPlayerAccount(string action, string target, bool success,
@@ -2106,7 +2112,8 @@ namespace ServerManager.Events
             ServerManagerActor actor,
             ServerManagerActor target,
             Dictionary<string, string> fields,
-            DateTime? occurredAtUtc = null)
+            DateTime? occurredAtUtc = null,
+            bool writeAuditLog = true)
         {
             ServerManagerEvent value = new(
                 Guid.NewGuid().ToString("N"),
@@ -2122,7 +2129,10 @@ namespace ServerManager.Events
                 TryQueueOperatorAudit(value, null);
                 return value;
             }
-            LogWriter.TryWrite(value);
+            if (writeAuditLog || kind != "command.executed")
+            {
+                LogWriter.TryWrite(value);
+            }
             // These channels are intentionally log-only. Keep this boundary
             // ahead of every public subscriber and in-game broadcast path.
             if (IsLogOnlyChatKind(kind))

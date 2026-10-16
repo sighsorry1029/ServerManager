@@ -80,6 +80,7 @@ internal static class DiscordTransportSmoke
         await AnonymousSafeSummaryAndCapacity();
         await RaidCoordinatePrivacy();
         await OperatorSummariesAndLimits();
+        await AssemblyDiagnosticCards();
         await ConnectionRejectionIdentityDisplay();
         await ExplicitWebhookTestRouting();
         await QueueAndStop();
@@ -1924,6 +1925,52 @@ internal static class DiscordTransportSmoke
         DiscordSettings settings = Settings(kinds);
         settings.WebhookRoutes[0].AnonymousPrefix = prefix;
         return settings;
+    }
+
+    private static async Task AssemblyDiagnosticCards()
+    {
+        foreach (bool anonymous in new[] { false, true })
+        using (FakeHandler handler = new FakeHandler())
+        using (DiscordHttp http = new DiscordHttp("", delegate { }, handler))
+        using (DiscordWebhooks webhooks = new DiscordWebhooks(anonymous
+            ? AnonymousSettings("Guest", "security.detection") : Settings("security.detection"), http, delegate { }))
+        {
+            string[] evidence = { "AssemblyInspectionIncomplete", "AssemblyDetectorUnavailable", "AssemblyDetectorUnavailable", "AssemblyInspectionIncomplete" };
+            string[] details = {
+                "stage=types;assembly=YamlDotNet;exception=ReflectionTypeLoadException",
+                "stage=subscribe;assembly=unknown;exception=InvalidOperationException",
+                "stage=enumerate;assembly=unknown;exception=NotSupportedException",
+                "stage=types;assembly=C:\\PRIVATE_PATH\\plugin.dll;exception=TypeLoadException;message=PRIVATE_EXCEPTION"
+            };
+            for (int index = 0; index < evidence.Length; ++index)
+            {
+                var value = AnonymousEvent("security.detection");
+                value.Fields["evidence"] = evidence[index]; value.Fields["detail"] = details[index];
+                value.Fields["response"] = "Log"; value.Fields["outcome"] = "diagnostic";
+                value.Fields["reason_code"] = "assembly_fixture_" + index;
+                Check(webhooks.Enqueue(value), "Assembly diagnostic card is admitted as a log-only security event.");
+            }
+            Task run = webhooks.RunAsync(CancellationToken.None);
+            await webhooks.StopAsync(TimeSpan.FromSeconds(3)); await run;
+            Check(handler.Requests.Count == evidence.Length, "Each diagnostic is sent exactly once by the fake HTTP transport.");
+            string[] labels = { "Assembly inspection incomplete (partial; log only)",
+                "Assembly-load monitoring unavailable (log only)", "Assembly enumeration unavailable (log only)",
+                "Assembly inspection incomplete (partial; log only)" };
+            for (int index = 0; index < evidence.Length; ++index)
+            {
+                string body = handler.Requests[index].Body!;
+                string description = ((string)JObject.Parse(body)["embeds"]![0]!["description"]!)
+                    .Replace("\\(", "(").Replace("\\)", ")");
+                Check(description.Contains(labels[index]), "Assembly diagnostic labels distinguish partial inspection from infrastructure failure.");
+                Check(!body.Contains("PRIVATE_PATH") && !body.Contains("PRIVATE_EXCEPTION"), "Webhook summaries never copy invalid path/message fields.");
+                if (anonymous)
+                    Check(!body.Contains("YamlDotNet") && !body.Contains("ReflectionTypeLoadException") && !body.Contains("Stage:"),
+                        "Anonymous diagnostics show only the safe finite label, not assembly context.");
+                else if (index == 0)
+                    Check(body.Contains("Stage: types; assembly: YamlDotNet; exception: ReflectionTypeLoadException"),
+                        "Private diagnostic summaries show validated stage, simple assembly name and exception type.");
+            }
+        }
     }
 
     private static async Task AnonymousSafeSummaryAndCapacity()

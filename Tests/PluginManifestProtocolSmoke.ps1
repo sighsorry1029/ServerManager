@@ -133,8 +133,8 @@ $manifestPackage = $encode.Invoke($null, [object[]]@($manifest, $limits))
 $decodedManifest = Read-Packet $manifestPackage
 Assert-True ($decodedManifest.Success -and $decodedManifest.Packet.Kind.ToString() -eq 'ManifestResponse') `
     'Ordinary plugin manifest transmission was removed.'
-Assert-True ([int]$codec.GetField('WireVersion', $static).GetRawConstantValue() -eq 24) `
-    'Optional center displays must be gated by handshake wire version 24.'
+Assert-True ([int]$codec.GetField('WireVersion', $static).GetRawConstantValue() -eq 25) `
+    'Bounded detector diagnostics must be gated by handshake wire version 25.'
 Assert-True ((Get-ReportedName $decodedManifest.Packet) -eq '') 'Absent display hints must remain empty.'
 $rawManifest = [byte[]]@(1, 2, 3)
 $manifestWithoutMetadata = [byte[]]$manifestPackage.GetArray()[0..($headerBytes + $rawManifest.Length - 1)]

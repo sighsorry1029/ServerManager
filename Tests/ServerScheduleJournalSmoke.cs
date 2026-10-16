@@ -22,7 +22,7 @@ internal static class ServerScheduleJournalSmoke
     {
         try
         {
-            PersistedIdentityCompatibility(); CanonicalFileName(); LiveAliases(); Resume(); Interrupted(); Mutation(); CompletionCoverage(); Integrity(); ClocksAndBounds();
+            PersistedIdentityCompatibility(); LoggingPolicyPreservesHistory(); CanonicalFileName(); LiveAliases(); Resume(); Interrupted(); Mutation(); CompletionCoverage(); Integrity(); ClocksAndBounds();
             Console.WriteLine("PASS: durable cron journal " + _checks + " assertions; isolated temporary files only."); return 0;
         }
         catch (Exception error) { Console.Error.WriteLine(error); return 1; }
@@ -51,6 +51,27 @@ internal static class ServerScheduleJournalSmoke
                 "Persisted job identity must retain the pre-refactor format: " + item.Command);
         }
     }
+    private static void LoggingPolicyPreservesHistory()
+    {
+        const string yaml = "timezone: UTC\njobs:\n  - schedule: '0 * * * * *'\n    command: broadcast center Notice\n";
+        ServerScheduleSettings previous = ServerScheduleSettings.Parse("logJobs: true\n" + yaml);
+        ServerScheduleSettings current = ServerScheduleSettings.Parse(yaml);
+        ServerScheduleJob oldJob = previous.Jobs.Single(), newJob = current.Jobs.Single();
+        Check(oldJob.Log && !newJob.Log && oldJob.Id == newJob.Id && oldJob.SameAs(newJob) &&
+            ServerScheduleJournal.Fingerprint(previous, oldJob) == ServerScheduleJournal.Fingerprint(current, newJob),
+            "New omitted-false logging preserves the prior explicit-true job ID and durable fingerprint");
+        string path = Fresh("logging-history");
+        using ServerScheduleJournal journal = ServerScheduleJournal.Open(path, "world");
+        journal.Reconcile(previous, Now, Game);
+        journal.RecordPending(oldJob, Now.AddMinutes(1), Now.AddMinutes(1));
+        journal.MarkRunning(oldJob); journal.MarkFinished(oldJob, true, coveredThrough: Now.AddMinutes(2)); journal.Flush();
+        string file = Path.Combine(path, ServerScheduleJournal.FileName);
+        byte[] retained = File.ReadAllBytes(file);
+        journal.Reconcile(current, Now.AddHours(1), Game); journal.Flush();
+        Check(File.ReadAllBytes(file).SequenceEqual(retained),
+            "Changing only effective logging leaves existing cron_last.yml progress bytes untouched");
+    }
+
     private static void CanonicalFileName()
     {
         Check(ServerScheduleJournal.FileName == "cron_last.yml", "The canonical journal filename is cron_last.yml");

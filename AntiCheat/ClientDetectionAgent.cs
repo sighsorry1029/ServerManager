@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace ServerManager;
@@ -16,6 +17,7 @@ internal sealed class ClientDetectionAgent
     private const int MaximumQueuedAssemblies = 128;
     private const int MaximumAssemblyCandidatesPerTick = 16;
     private const int ReservedEventCandidatesPerTick = 8;
+    private const int MaximumAssemblyDiagnosticLogs = 8;
     private const int CarryWeightFailureWarningThreshold = 3;
     private static readonly long CarryWeightScanIntervalTicks =
         Stopwatch.Frequency;
@@ -26,6 +28,10 @@ internal sealed class ClientDetectionAgent
     private readonly Queue<ClientDetectionSignal> _signals = new();
     private readonly Dictionary<Assembly, uint> _inspectedAssemblies = new();
     private readonly Dictionary<DetectionEvidence, uint> _stickyEvidence = new();
+    private readonly HashSet<Assembly> _loggedAssemblyDiagnostics = new();
+    private readonly HashSet<string> _loggedInfrastructureDiagnostics = new();
+    private int _assemblyDiagnosticLogCount;
+    private bool _assemblyDiagnosticLogLimitReported;
 
     private ProtocolChallengeOptions? _policy;
     private Task<ExternalProcessScanResult>? _processScanTask;
@@ -91,6 +97,10 @@ internal sealed class ClientDetectionAgent
 
         StopAssemblyDetector();
         _inspectedAssemblies.Clear();
+        _loggedAssemblyDiagnostics.Clear();
+        _loggedInfrastructureDiagnostics.Clear();
+        _assemblyDiagnosticLogCount = 0;
+        _assemblyDiagnosticLogLimitReported = false;
         _assemblyReconciliation = Array.Empty<Assembly>();
         _assemblyReconciliationIndex = 0;
         _assemblyReconciliationPass = 0;
@@ -379,7 +389,7 @@ internal sealed class ClientDetectionAgent
                 _acceptAssemblyLoadEvents = false;
             }
 
-            Emit(DetectionEvidence.AssemblyDetectorUnavailable);
+            ReportAssemblyDiagnostic("subscribe", "unknown", exception);
         }
 
         BeginAssemblyReconciliation(initialPass: true);
@@ -527,7 +537,8 @@ internal sealed class ClientDetectionAgent
 
         if (result.InspectionIncomplete)
         {
-            Emit(DetectionEvidence.AssemblyDetectorUnavailable);
+            ReportAssemblyDiagnostic(result.FailureStage, result.AssemblyName,
+                result.FailureException!, assembly);
         }
     }
 
@@ -581,8 +592,121 @@ internal sealed class ClientDetectionAgent
             _assemblyReconciliation = Array.Empty<Assembly>();
             _assemblyReconciliationIndex = 0;
             _assemblyReconciliationPass = 0;
-            Emit(DetectionEvidence.AssemblyDetectorUnavailable);
+            ReportAssemblyDiagnostic("enumerate", "unknown", exception);
         }
+    }
+
+    private void ReportAssemblyDiagnostic(
+        string stage, string assemblyName, Exception exception, Assembly? assembly = null)
+    {
+        // This runs on the main thread, never inside the assembly-load callback.
+        // Only identifiers cross the wire; exception text and local paths stay
+        // in the client's log. Reporting is independent of optional log sinks.
+        DetectionEvidence evidence = assembly == null
+            ? DetectionEvidence.AssemblyDetectorUnavailable
+            : DetectionEvidence.AssemblyInspectionIncomplete;
+        Emit(evidence, detail: AssemblyDiagnosticDetail.Format(
+            stage, assemblyName, exception.GetType().Name));
+
+        if (assembly == null ? _loggedInfrastructureDiagnostics.Contains(stage)
+            : _loggedAssemblyDiagnostics.Contains(assembly)) return;
+        if (_assemblyDiagnosticLogCount >= MaximumAssemblyDiagnosticLogs)
+        {
+            if (!_assemblyDiagnosticLogLimitReported)
+            {
+                _assemblyDiagnosticLogLimitReported = true;
+                TryLogAssemblyDiagnostic("Further assembly inspection diagnostics are suppressed " +
+                    "for this connection (limit: 8). Inspection and detection reporting continue.");
+            }
+            return;
+        }
+
+        if (assembly == null) _loggedInfrastructureDiagnostics.Add(stage);
+        else _loggedAssemblyDiagnostics.Add(assembly);
+        _assemblyDiagnosticLogCount++;
+        try
+        {
+            TryLogAssemblyDiagnostic(FormatAssemblyDiagnosticLog(stage, assemblyName, exception));
+        }
+        catch (Exception loggingException) when (!IntegrityCanonical.IsFatal(loggingException))
+        {
+            // Exception properties can themselves be supplied by a plugin.
+            // Failed formatting must not erase the already queued diagnostic.
+            TryLogAssemblyDiagnostic("Assembly inspection diagnostic formatting failed. stage=" +
+                DetectionLog.QuoteValue(stage, 24) + " assembly=" +
+                DetectionLog.QuoteValue(assemblyName, 160) + " exception=" +
+                exception.GetType().Name);
+        }
+    }
+
+    private static void TryLogAssemblyDiagnostic(string message)
+    {
+        try { ServerManagerPlugin.Log.LogWarning(message); }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        {
+            // A failing/absent log listener must not affect detection or login.
+        }
+    }
+
+    internal static string FormatAssemblyDiagnosticLog(
+        string stage, string assemblyName, Exception exception)
+    {
+        StringBuilder text = new();
+        text.Append("Assembly inspection diagnostic (not a cheat detection). stage=")
+            .Append(DetectionLog.QuoteValue(stage, 24)).Append(" assembly=")
+            .Append(DetectionLog.QuoteValue(assemblyName, 160)).AppendLine();
+        // Avoid Exception.ToString(): ReflectionTypeLoadException can embed an
+        // unbounded loader-error list. Keep the first exception's stack and a
+        // small explicit sample of its underlying causes instead.
+        AppendDiagnosticException(text, exception);
+        Exception? inner = exception.InnerException;
+        for (int index = 0; inner != null && index < 2; index++, inner = inner.InnerException)
+        {
+            text.AppendLine("Inner exception:");
+            AppendDiagnosticException(text, inner);
+        }
+        if (inner != null) text.AppendLine("[Further inner exceptions omitted]");
+        if (exception is ReflectionTypeLoadException loader)
+        {
+            Exception?[] errors = loader.LoaderExceptions ?? Array.Empty<Exception>();
+            int count = Math.Min(errors.Length, 4);
+            for (int index = 0; index < count; index++)
+            {
+                text.Append("Loader exception ").Append(index + 1).AppendLine(":");
+                if (errors[index] != null) AppendDiagnosticException(text, errors[index]!);
+            }
+            if (errors.Length > count)
+                text.Append("[").Append(errors.Length - count).AppendLine(" loader exceptions omitted]");
+        }
+        const int maximumCharacters = 12000;
+        if (text.Length > maximumCharacters)
+        {
+            text.Length = maximumCharacters;
+            text.AppendLine().Append("[Diagnostic truncated]");
+        }
+        return text.ToString();
+    }
+
+    private static void AppendDiagnosticException(StringBuilder text, Exception exception)
+    {
+        // On some runtimes even Message expands every LoaderException. Avoid
+        // that getter too, so the explicit four-entry sample is a real bound.
+        string message = exception is ReflectionTypeLoadException
+            ? "One or more types could not be loaded; see the loader exception sample."
+            : exception.Message;
+        text.Append(exception.GetType().FullName).Append(": ")
+            .AppendLine(DetectionLog.QuoteValue(message, 768));
+        string stack = exception.StackTrace ?? "<stack unavailable>";
+        int length = Math.Min(stack.Length, 4096);
+        // Preserve stack line breaks, but not terminal-control characters.
+        for (int index = 0; index < length; index++)
+        {
+            char value = stack[index];
+            text.Append(char.IsControl(value) && value != '\r' && value != '\n' && value != '\t'
+                ? '?' : value);
+        }
+        if (stack.Length > length) text.Append(" [Stack truncated]");
+        text.AppendLine();
     }
 
     private static bool RequiresProcessScan(ProtocolChallengeOptions policy)
@@ -592,7 +716,7 @@ internal sealed class ClientDetectionAgent
                policy.DetectGenericProcessNames;
     }
 
-    private void Emit(DetectionEvidence evidence, uint policyGeneration = 0)
+    private void Emit(DetectionEvidence evidence, uint policyGeneration = 0, string detail = "")
     {
         lock (_signalGate)
         {
@@ -608,7 +732,7 @@ internal sealed class ClientDetectionAgent
                 _stickyEvidence[evidence] = observedGeneration;
 
             _signals.Enqueue(new ClientDetectionSignal(evidence,
-                policyGeneration: observedGeneration));
+                detail, policyGeneration: observedGeneration));
         }
     }
 }

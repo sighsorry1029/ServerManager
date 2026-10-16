@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.1
+
+- Reduced routine scheduled-broadcast logging. `logJobs` now defaults to `false`, with per-job `log` overrides; existing explicit settings are preserved. Successful center-broadcast-only jobs can omit their audit-file entries while failures, other commands, Discord reports and saved schedule progress remain unchanged.
+- Improved assembly-inspection diagnostics with the first exception and stack in the affected client's log, plus short audit and webhook summaries. Partial inspection failures are distinguished from assembly-load monitoring and enumeration failures; these diagnostics remain log-only.
+- Bounded repeated diagnostic output and kept exception messages, stacks and local paths out of transmitted summaries. Existing detection checks continue when part of an inspection fails.
+- Added regression coverage for quiet scheduled jobs, diagnostic limits, partial inspection, protocol validation and webhook privacy.
+- Update ServerManager on both the server and all clients; the connection protocol has changed.
+
 ## 1.2.0
 
 - Added per-job `allowClientHide` for scheduled `broadcast center` messages. It defaults to `false`, preserving existing notices; set it to `true` for repeated tips players may hide.

@@ -12,7 +12,7 @@ internal static class ServerScheduleHarness
     {
         try
         {
-            Parser(); OptionalCenterBroadcasts(); Identity(); DefaultMaintenanceExample(); UpgradeWorldCatalog(); Scheduling(); Reload(); Zones(); AcknowledgeTimer();
+            Parser(); LoggingDefaults(); OptionalCenterBroadcasts(); Identity(); DefaultMaintenanceExample(); UpgradeWorldCatalog(); Scheduling(); Reload(); Zones(); AcknowledgeTimer();
             Console.WriteLine("PASS: cron parser/engine " + _checks + " assertions; no Unity, commands, network or user data.");
             return 0;
         }
@@ -58,7 +58,7 @@ internal static class ServerScheduleHarness
         Check(empty.Jobs.Count == 0 && empty.IntervalSeconds == 10 && empty.LogSkipped, "Root defaults");
         Check(empty.TimeZone.Id == TimeZoneInfo.Local.Id, "Omitted zone uses local");
         ServerScheduleJob job = Config().Jobs.Single();
-        Check(job.Id.StartsWith("save-", StringComparison.Ordinal) && job.Id.Length <= 64 && job.Log && job.Commands.Single() == "save" && job.Enabled && job.Chance == 1 &&
+        Check(job.Id.StartsWith("save-", StringComparison.Ordinal) && job.Id.Length <= 64 && !job.Log && job.Commands.Single() == "save" && job.Enabled && job.Chance == 1 &&
             !job.UseGameTime && !job.AllowClientHide && job.GlobalKeys.Count == 0 && job.BannedGlobalKeys.Count == 0, "Defaults");
         job = Config(extra: "    log: false\n    chance: 0.25\n    useGameTime: true\n    globalKeys: 'b, a, a'\n    bannedGlobalKeys: c\n").Jobs.Single();
         Check(job.Enabled && !job.Log && job.Chance == .25 && job.UseGameTime && job.GlobalKeys.SequenceEqual(new[] { "a", "b" }) &&
@@ -142,6 +142,31 @@ internal static class ServerScheduleHarness
         Bad("#" + new string('x', ServerScheduleSettings.MaximumFileBytes) + "\n{}");
         Bad("#" + new string('한', ServerScheduleSettings.MaximumFileBytes / 2) + "\n{}");
         Bad("#\ud800\n{}");
+    }
+
+    private static void LoggingDefaults()
+    {
+        string defaults = ServerScheduleSettings.DefaultYaml.Replace("\r\n", "\n");
+        Check(defaults.Contains("\nlogJobs: false\n") && defaults.Contains("\nlogSkipped: true\n"),
+            "New schedules default job logging off while retaining skipped-event policy");
+        ServerScheduleSettings baseline = Config();
+        ServerScheduleJob original = baseline.Jobs.Single();
+        foreach (bool? rootLog in new bool?[] { null, false, true })
+        foreach (bool? jobLog in new bool?[] { null, false, true })
+        {
+            string root = rootLog.HasValue ? "logJobs: " + rootLog.Value.ToString().ToLowerInvariant() + "\n" : "";
+            string extra = jobLog.HasValue ? "    log: " + jobLog.Value.ToString().ToLowerInvariant() + "\n" : "";
+            ServerScheduleSettings settings = ServerScheduleSettings.Parse(root + "timezone: UTC\njobs:\n" + Job(extra: extra));
+            ServerScheduleJob actual = settings.Jobs.Single();
+            Check(actual.Log == (jobLog ?? rootLog ?? false) && settings.LogSkipped,
+                "Per-job logging overrides root logging; both omitted mean false; logSkipped remains true");
+            Check(actual.Id == original.Id && actual.SameAs(original) &&
+                ServerScheduleJournal.Fingerprint(settings, actual) == ServerScheduleJournal.Fingerprint(baseline, original),
+                "Logging hierarchy never changes job identity or journal fingerprint");
+        }
+        ServerScheduleJob constructed = new(original.Id, original.Cron, original.Expression, original.Commands.ToList(),
+            original.Chance, original.UseGameTime, original.GlobalKeys.ToList(), original.BannedGlobalKeys.ToList());
+        Check(!constructed.Log, "Direct model construction uses the same default-off logging policy");
     }
 
     private static void OptionalCenterBroadcasts()
@@ -397,7 +422,7 @@ internal static class ServerScheduleHarness
         engine.Apply(ServerScheduleSettings.Parse(b), Now.AddSeconds(10), Game);
         Check(engine.ClaimDue(Now.AddSeconds(10), Game).Count == 2, "Reordering uses stable IDs, not index");
         engine.Reset();
-        ServerScheduleSettings logged = Config(), quiet = Config(extra: "    log: false\n");
+        ServerScheduleSettings logged = Config(extra: "    log: true\n"), quiet = Config(extra: "    log: false\n");
         engine.Apply(logged, Now, Game);
         engine.Apply(quiet, Now.AddSeconds(10), Game);
         ServerScheduleOccurrence changedLog = engine.ClaimDue(Now.AddSeconds(10), Game).Single();

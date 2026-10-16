@@ -8,18 +8,30 @@ internal readonly struct InjectedCheatAssemblyInspection
     internal InjectedCheatAssemblyInspection(
         bool valheimToolerDetected,
         bool valheavenDetected,
-        bool inspectionIncomplete)
+        string assemblyName,
+        string failureStage,
+        Exception? failureException)
     {
         ValheimToolerDetected = valheimToolerDetected;
         ValheavenDetected = valheavenDetected;
-        InspectionIncomplete = inspectionIncomplete;
+        AssemblyName = assemblyName;
+        FailureStage = failureStage;
+        FailureException = failureException;
     }
 
     internal bool ValheimToolerDetected { get; }
 
     internal bool ValheavenDetected { get; }
 
-    internal bool InspectionIncomplete { get; }
+    internal bool InspectionIncomplete => FailureException != null;
+
+    internal string AssemblyName { get; }
+
+    internal string FailureStage { get; }
+
+    // Transient result only: retain the original exception/stack, including
+    // loader exceptions, until the main-thread agent writes its bounded log.
+    internal Exception? FailureException { get; }
 }
 
 internal static class InjectedCheatAssemblyInspector
@@ -38,11 +50,14 @@ internal static class InjectedCheatAssemblyInspector
 
         bool valheimToolerDetected = false;
         bool valheavenDetected = false;
-        bool inspectionIncomplete = false;
+        string assemblyName = "unknown";
+        string failureStage = string.Empty;
+        Exception? failureException = null;
 
         try
         {
             string? name = assembly.GetName().Name;
+            assemblyName = string.IsNullOrEmpty(name) ? "unknown" : name!;
             valheimToolerDetected = MatchesName(name, ValheimToolerName);
             valheavenDetected = MatchesName(name, ValheavenName) ||
                 MatchesName(name, ValheavenMenuName) ||
@@ -51,7 +66,8 @@ internal static class InjectedCheatAssemblyInspector
         catch (Exception exception)
             when (!IntegrityCanonical.IsFatal(exception))
         {
-            inspectionIncomplete = true;
+            failureStage = "name";
+            failureException = exception;
         }
 
         Type?[] types;
@@ -65,7 +81,11 @@ internal static class InjectedCheatAssemblyInspector
             // The diagnostic tells the server that this inspection had blind
             // spots while still allowing a positive partial match through.
             types = exception.Types;
-            inspectionIncomplete = true;
+            if (failureException == null)
+            {
+                failureStage = "types";
+                failureException = exception;
+            }
         }
         catch (Exception exception)
             when (!IntegrityCanonical.IsFatal(exception))
@@ -73,7 +93,9 @@ internal static class InjectedCheatAssemblyInspector
             return new InjectedCheatAssemblyInspection(
                 valheimToolerDetected,
                 valheavenDetected,
-                true);
+                assemblyName,
+                failureException == null ? "types" : failureStage,
+                failureException ?? exception);
         }
 
         foreach (Type? type in types)
@@ -91,7 +113,11 @@ internal static class InjectedCheatAssemblyInspector
             catch (Exception exception)
                 when (!IntegrityCanonical.IsFatal(exception))
             {
-                inspectionIncomplete = true;
+                if (failureException == null)
+                {
+                    failureStage = "namespace";
+                    failureException = exception;
+                }
                 continue;
             }
 
@@ -107,7 +133,9 @@ internal static class InjectedCheatAssemblyInspector
         return new InjectedCheatAssemblyInspection(
             valheimToolerDetected,
             valheavenDetected,
-            inspectionIncomplete);
+            assemblyName,
+            failureStage,
+            failureException);
     }
 
     private static bool MatchesName(string? value, string signature) =>

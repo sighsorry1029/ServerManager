@@ -38,6 +38,7 @@ try {
         (Join-Path $ProjectRoot 'Discord\DiscordSettings.cs'),
         (Join-Path $ProjectRoot 'Discord\DiscordHttp.cs'),
         (Join-Path $ProjectRoot 'Discord\DiscordWebhooks.cs'),
+        (Join-Path $ProjectRoot 'AntiCheat\DetectionModels.cs'),
         (Join-Path $ProjectRoot 'Events\EventMessageText.cs'),
         (Join-Path $ProjectRoot 'Tests\DiscordTransportSmoke.cs')
     )

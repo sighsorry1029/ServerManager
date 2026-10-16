@@ -187,6 +187,12 @@ cannot make a client cheat-proof.
 Defensive client checks use `cheatDetection.action` and `security.alert`.
 Admin status does not exempt cheat-tool detections.
 
+Assembly-inspection diagnostics are log-only, not proof of cheating. They are
+separate from the `required`/`optional` folders. The audit log and `security.alert`
+webhook show a short failure summary; the affected client's `BepInEx/LogOutput.log`
+contains the original exception and stack (up to 8 detailed reports per connection).
+Update both server and clients together when installing a new protocol build.
+
 Keep ServerManager updated on both the server and clients. These checks can be
 bypassed by a modified client and do not establish the cause of a server freeze
 or protect against every form of object duplication or network abuse.
@@ -617,6 +623,22 @@ Use `command` for one command or `commands` for an ordered list.
 Use flat ServerManager command names without `sm:`, or other installed
 server-console commands. They run with server authority, not as shell commands.
 
+### Scheduled-job logging
+
+`logJobs` defaults to **false**. A job's `log` overrides it; when both are omitted,
+`log` is **false**. Existing `logJobs: true` settings are respected.
+
+For jobs containing only `broadcast center` messages, **false** omits successful
+command and job-completion entries from `events-audit.log`. Set `log: true` to keep
+them. Failed, cancelled and skipped jobs remain audited. Other commands, including
+mixed batches, saves and world maintenance, keep their audit records regardless
+of this setting. Discord's `cron.executed` reports and `cron_last.yml` progress
+are unchanged.
+
+The setting also controls successful job messages in the BepInEx console.
+`logSkipped` controls skipped console messages only when the job's `log` is true.
+These settings reload live with `cron.yml`.
+
 A failed step stops its batch. Scheduled `save` waits for a confirmed checkpoint;
 other mods’ commands may finish their background work later. Ordinary jobs skip
 time missed while offline. See the generated comments for conditions such as
@@ -635,9 +657,11 @@ jobs:
   - command: broadcast center <color=yellow>Server restart in two minutes.</color>
     schedule: "28 5,17 * * *"
     allowClientHide: false
+    log: true
   - command: broadcast center <color=yellow><size=32>Use the hammer to save a house blueprint.</size></color>
     schedule: "14-59/30 * * * *"
     allowClientHide: true
+    log: false
 ```
 
 `allowClientHide` defaults to **false**. With **true**, ServerManager delivers

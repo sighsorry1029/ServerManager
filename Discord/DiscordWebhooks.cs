@@ -688,11 +688,40 @@ namespace ServerManager.Discord
         private static string Diagnostic(ServerManagerEvent value, bool anonymous, string fallback)
         {
             string evidence = OperatorToken(value.Fields, "evidence", 96);
+            if (evidence == nameof(DetectionEvidence.AssemblyDetectorUnavailable) ||
+                evidence == nameof(DetectionEvidence.AssemblyInspectionIncomplete))
+            {
+                return AssemblyDiagnostic(value, anonymous,
+                    evidence == nameof(DetectionEvidence.AssemblyDetectorUnavailable)
+                        ? DetectionEvidence.AssemblyDetectorUnavailable
+                        : DetectionEvidence.AssemblyInspectionIncomplete);
+            }
             string reason = OperatorToken(value.Fields, "reason_code", 96);
             string known = DiagnosticLabel(evidence);
             if (known.Length == 0) known = DiagnosticLabel(reason);
             return known.Length > 0 ? known : anonymous ? fallback :
                 reason.Length > 0 ? reason : evidence.Length > 0 ? evidence : fallback;
+        }
+
+        private static string AssemblyDiagnostic(ServerManagerEvent value, bool anonymous,
+            DetectionEvidence evidence)
+        {
+            string label = evidence == DetectionEvidence.AssemblyInspectionIncomplete
+                ? "Assembly inspection incomplete (partial; log only)"
+                : "Assembly detector infrastructure diagnostic (log only)";
+            if (!value.Fields.TryGetValue("detail", out string? detail) ||
+                !AssemblyDiagnosticDetail.TryParse(evidence, detail,
+                    out string stage, out string assembly, out string exception))
+                return label;
+
+            if (evidence == DetectionEvidence.AssemblyDetectorUnavailable)
+                label = stage == "subscribe"
+                    ? "Assembly-load monitoring unavailable (log only)"
+                    : "Assembly enumeration unavailable (log only)";
+            // Anonymous routes retain the diagnostic category, not client module
+            // identities. Never relay arbitrary client detail or exception text.
+            return anonymous ? label : label + "\nStage: " + stage +
+                "; assembly: " + assembly + "; exception: " + exception;
         }
 
         private static string DiagnosticLabel(string code)
@@ -716,7 +745,8 @@ namespace ServerManager.Discord
                 case "InvalidGameplayValue": return "Invalid gameplay value";
                 case "ProcessDetectorUnsupported": return "Process detector unsupported";
                 case "ProcessDetectorUnavailable": return "Process detector unavailable";
-                case "AssemblyDetectorUnavailable": return "Assembly detector unavailable";
+                case "AssemblyDetectorUnavailable": return "Assembly detector infrastructure diagnostic (log only)";
+                case "AssemblyInspectionIncomplete": return "Assembly inspection incomplete (partial; log only)";
                 case "forbidden_prefab": return "Forbidden item";
                 case "used_cheats": return "Profile used-cheats flag";
                 case "character_validation_failed": case "character_validation": return "Character validation failed";

@@ -30,14 +30,17 @@ internal sealed class ServerScheduleSettings
 # Keep Upgrade World changes in their own jobs (only save may accompany them; see README).
 timezone: local
 interval: 10
-logJobs: true
+logJobs: false
 logSkipped: true
 jobs: []
 # To use an example, replace jobs: [] with its uncommented jobs block.
 # jobs:
 #   - command: 'announce Good morning!'
 #     schedule: '0 9 * * *'
-# Optional per job: chance: 1, useGameTime: false, log: true,
+# Optional per job: chance: 1, useGameTime: false, log: false,
+# Omitted log inherits logJobs (default false); controls success console messages.
+# With log: false, center-broadcast-only jobs also omit successful audit-file entries.
+# Failures, skipped jobs and other commands stay audited. Discord reports are independent.
 # globalKeys: '', bannedGlobalKeys: ''. Keys are comma-separated strings.
 # allowClientHide: false by default. Set true only for jobs with broadcast center messages.
 # Only those center messages may be hidden by each client's optional-broadcast setting.
@@ -103,7 +106,7 @@ jobs: []
         catch (TimeZoneNotFoundException) { throw Invalid("timezone is not installed on this server"); }
         catch (InvalidTimeZoneException) { throw Invalid("timezone data is invalid"); }
         double interval = Number(root, "interval", 10, 1, 3600);
-        bool logJobs = Boolean(root, "logJobs", true), logSkipped = Boolean(root, "logSkipped", true);
+        bool logJobs = Boolean(root, "logJobs", false), logSkipped = Boolean(root, "logSkipped", true);
         if (Boolean(root, "discordConnector", false))
             throw Invalid("discordConnector is not supported; configure ServerManager's discord.yml instead");
         foreach (string unsupported in new[] { "zone", "join" })
@@ -425,7 +428,7 @@ internal sealed class ServerScheduleJob
 
     internal ServerScheduleJob(string id, string cron, CronExpression expression, List<string> commands,
         double chance, bool gameTime, List<string> globalKeys, List<string> bannedGlobalKeys,
-        bool maintenance = false, bool log = true, bool allowClientHide = false)
+        bool maintenance = false, bool log = false, bool allowClientHide = false)
     {
         Id = id; Cron = cron; Expression = expression; Commands = commands.AsReadOnly();
         Chance = chance; UseGameTime = gameTime;
