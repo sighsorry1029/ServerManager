@@ -217,6 +217,14 @@ compatibility fix.
 
 ### Joining and saving
 
+Steam authentication must finish before ServerManager loads a server character.
+After an authentication timeout, wait at least 30 seconds before reconnecting.
+The server closes the previous Steam session and discards callbacks received
+during this wait; further callbacks or early reconnect attempts extend it.
+Each retry still needs a successful ticket check and final Steam approval.
+No server restart or character restore is normally needed. If socket cleanup
+fails, the server logs it and retries cleanup every 30 seconds.
+
 With `loadServerCharacterOnJoin: true`:
 
 - Returning players receive the server’s latest accepted character state.

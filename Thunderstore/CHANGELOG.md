@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.3
+
+- Fixed temporary Steam authentication failures blocking an account until the server restarted. Players can retry after the previous session is cleaned up and a short waiting period has passed.
+- Kept Steam authentication required for every connection. Improved session cleanup and bounded cleanup retries to avoid processing many failed sockets in one server update.
+- Added regression coverage for reconnects, delayed responses, cleanup failures, hosted and dedicated servers, and temporary capacity limits.
+- Update ServerManager on the server and clients, then restart to load the update. Later authentication failures no longer normally require a server restart; wait at least 30 seconds before reconnecting.
+
 ## 1.2.2
 
 - Fixed oversized Discord link text with CustomMainMenu by leaving its button styles unchanged while preserving ServerManager's quick-connect text and behavior.

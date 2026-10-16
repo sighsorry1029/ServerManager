@@ -11,7 +11,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $buildRoot = Join-Path $projectRoot "bin\$Configuration"
 if ([string]::IsNullOrWhiteSpace($PluginPath)) { $PluginPath = Join-Path $buildRoot 'ServerManager.dll' }
 $managedRoot = Join-Path $GamePath 'valheim_Data\Managed'
-[Reflection.Assembly]::LoadFrom((Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll')) | Out-Null
+[Reflection.Assembly]::Load([IO.File]::ReadAllBytes((Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll'))) | Out-Null
 if (-not $DependenciesLoaded) {
 foreach ($name in @('UnityEngine.CoreModule.dll', 'UnityEngine.PhysicsModule.dll', 'UnityEngine.dll',
     'assembly_utils.dll', 'SoftReferenceableAssets.dll', 'com.rlabrecque.steamworks.net.dll',
@@ -30,15 +30,18 @@ Add-Type -ReferencedAssemblies @((Join-Path $managedRoot 'assembly_valheim.dll')
     (Join-Path $managedRoot 'assembly_utils.dll'),
     (Join-Path $managedRoot 'com.rlabrecque.steamworks.net.dll')) -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.Serialization;
 using Steamworks;
 public static class SteamAuthenticationEnvironment {
     public static object Server, Peer, PeerRpc, RawSocket, RegisteredPeers;
     public static ulong SteamId;
-    public static bool Dedicated, Connected = true, ThrowFactory;
+    public static bool Dedicated, Connected = true, ThrowFactory, ThrowClose, SkipClose;
     public static long Now;
-    public static int ClientFactories, ServerFactories, Disposals, Completed, Rejected, Disconnected;
+    public static int ClientFactories, ServerFactories, Disposals, Completed, Rejected, Disconnected, CloseAttempts;
+    public static readonly HashSet<object> KnownSockets = new HashSet<object>();
+    public static readonly HashSet<object> ClosedSockets = new HashSet<object>();
     public static string RejectionCode, UnregisteredReason;
     public static object CompletedRpc, RejectedRpc;
     public static Callback<ValidateAuthTicketResponse_t> Registration;
@@ -46,8 +49,9 @@ public static class SteamAuthenticationEnvironment {
     public static Action<object> OnComplete;
     public static void Reset() {
         Server = null; Peer = null; PeerRpc = null; RawSocket = null; RegisteredPeers = null; SteamId = 0;
-        Dedicated = false; Connected = true; ThrowFactory = false; Now = 0;
-        ClientFactories = ServerFactories = Disposals = Completed = Rejected = Disconnected = 0;
+        Dedicated = false; Connected = true; ThrowFactory = ThrowClose = SkipClose = false; Now = 0;
+        ClientFactories = ServerFactories = Disposals = Completed = Rejected = Disconnected = CloseAttempts = 0;
+        KnownSockets.Clear(); ClosedSockets.Clear();
         RejectionCode = UnregisteredReason = null; CompletedRpc = RejectedRpc = null;
         Registration = null; Handler = null; OnComplete = null;
     }
@@ -86,14 +90,20 @@ public static class SteamAuthenticationEnvironment {
         return Peer != null && ReferenceEquals(PeerRpc, rpc) ? Peer : null;
     }
     public static bool IsConnected(object socket) {
-        if (!ReferenceEquals(socket, RawSocket)) throw new InvalidOperationException("Unreserved native socket.");
-        return Connected;
+        if (!KnownSockets.Contains(socket)) throw new InvalidOperationException("Unreserved native socket.");
+        return !ClosedSockets.Contains(socket) && Connected;
     }
     public static CSteamID GetPeerID(object socket) {
-        if (!ReferenceEquals(socket, RawSocket)) throw new InvalidOperationException("Unreserved native identity.");
-        return new CSteamID(SteamId);
+        if (!KnownSockets.Contains(socket)) throw new InvalidOperationException("Unreserved native identity.");
+        return new CSteamID(ClosedSockets.Contains(socket) ? 0 : SteamId);
     }
     public static string GetEndPointString(object socket) { return "fixture-endpoint"; }
+    public static void Close(object socket) {
+        if (!KnownSockets.Contains(socket)) throw new InvalidOperationException("Cleanup closed an unreserved or wrapped socket.");
+        ++CloseAttempts;
+        if (ThrowClose) throw new InvalidOperationException("Fixture native cleanup failure.");
+        if (!SkipClose) ClosedSockets.Add(socket);
+    }
     public static string GetHostName(object socket) {
         if (!ReferenceEquals(socket, RawSocket)) throw new InvalidOperationException("A wrapper supplied character identity.");
         return SteamId.ToString();
@@ -176,7 +186,7 @@ try {
                 elseif ($call.Name -eq 'CreateGameServer') { $replacement = 'CreateServer' }
                 elseif ($call.Name -eq 'Dispose') { $replacement = 'DisposeCallback' }
             } elseif ($call.DeclaringType.FullName -eq 'ZSteamSocket' -and
-                $call.Name -in @('IsConnected', 'GetPeerID', 'GetEndPointString')) {
+                $call.Name -in @('IsConnected', 'GetPeerID', 'GetEndPointString', 'Close')) {
                 $replacement = $call.Name
             } elseif ($call.DeclaringType.FullName -eq 'ZNet') {
                 if ($call.Name -in @('IsServer', 'IsDedicated', 'GetPeers')) { $replacement = $call.Name }
@@ -233,7 +243,7 @@ function Reset-Fixture([bool]$Dedicated = $true) {
     [ZNet].GetField('m_onlineBackend', $script:static).SetValue($null, [Enum]::Parse([OnlineBackendType], 'Steamworks'))
     Set-RuntimeField 'SteamAuthenticationGate' ([object]::new())
     foreach ($name in @('SteamAuthenticationsByRpc', 'SteamAuthenticationsById', 'RetiredSteamIds',
-        'QuarantinedIncompleteSteamIds', 'SteamAuthenticationCallbacks', 'WorldBuffers')) {
+        'SteamAuthenticationCallbacks', 'WorldBuffers')) {
         $field = $script:runtime.GetField($name, $script:static)
         $field.SetValue($null, [Activator]::CreateInstance($field.FieldType))
     }
@@ -241,9 +251,9 @@ function Reset-Fixture([bool]$Dedicated = $true) {
     Set-RuntimeField '_shuttingDown' $false
     Set-RuntimeField '_steamAuthenticationCallback' $null
     Set-RuntimeField '_steamAuthenticationCallbackUnavailable' $false
-    Set-RuntimeField '_steamAuthenticationGenerationCapacityExhausted' $false
     Set-RuntimeField '_queuedSteamAuthenticationCallbackCount' 0
     Set-RuntimeField 'RetiredSteamIdQuietTicks' ([long](2 * [Diagnostics.Stopwatch]::Frequency))
+    Set-RuntimeField 'IncompleteSteamIdQuietTicks' ([long](30 * [Diagnostics.Stopwatch]::Frequency))
     $limits = $script:limitsType.GetConstructors()[0].Invoke([object[]]@(524288, 262144, 262144, 512,
         [TimeSpan]::FromSeconds(120), [TimeSpan]::FromSeconds(120)))
     Set-RuntimeField '_connectionLimits' $limits
@@ -254,6 +264,7 @@ function New-Connection([uint64]$SteamId = 76561198000000001) {
     $script:rpc = New-Uninitialized ([ZRpc])
     $script:peer = New-Uninitialized ([ZNetPeer])
     $script:rawSocket = New-Uninitialized ([ZSteamSocket])
+    [SteamAuthenticationEnvironment]::KnownSockets.Add($script:rawSocket) | Out-Null
     $script:peer.m_rpc = $script:rpc; $script:peer.m_socket = $script:rawSocket
     [ZRpc].GetField('m_socket', $script:instance).SetValue($script:rpc, $script:rawSocket)
     [SteamAuthenticationEnvironment]::Peer = $script:peer
@@ -414,7 +425,7 @@ Assert-Denied 'HandshakeTimedOut' 'A late final callback bypassed the deadline.'
 # Steam may publish later lifetime status callbacks for an already active
 # session. A repeated OK after the handshake deadline must stay attached to
 # the same generation, while a later negative response must revoke it without
-# misclassifying the completed generation as an incomplete-auth quarantine.
+# misclassifying the completed generation as an incomplete-auth retirement.
 Reset-Fixture
 Prepare-Join
 [SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
@@ -433,14 +444,11 @@ Assert-True ((Get-Property $attempt 'Phase').ToString() -eq 'Active' -and
     [SteamAuthenticationEnvironment]::Rejected -eq 0) `
     'A repeated active-session OK was treated as a late or duplicate handshake callback.'
 Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
-$quarantinedIds = $script:runtime.GetField(
-    'QuarantinedIncompleteSteamIds', $script:static).GetValue($null)
-Assert-True ($null -ne $quarantinedIds -and
-    -not ($quarantinedIds.Contains($script:steamId.m_SteamID))) `
-    ('A cleanly removed active authentication generation was quarantined as incomplete. ' +
-     'reachedActive=' + (Get-Property $attempt 'ReachedActive') +
-     '; phase=' + (Get-Property $attempt 'Phase') +
-     '; quarantined=' + ($quarantinedIds -join ','))
+$retirement = (Get-RuntimeField 'RetiredSteamIds')[$script:steamId.m_SteamID]
+Assert-True ($null -ne $retirement -and (Get-Property $retirement 'CleanupCompleted') -and
+    (Get-Property $retirement 'QuietPeriodTicks') -eq (2 * [Diagnostics.Stopwatch]::Frequency) -and
+    [SteamAuthenticationEnvironment]::ClosedSockets.Contains($rawSocket)) `
+    'A cleanly removed active generation did not close its original socket and use the short drain period.'
 [SteamAuthenticationEnvironment]::Now += (3 * [Diagnostics.Stopwatch]::Frequency)
 Assert-True (New-Connection) 'A completed authentication generation could not reconnect after the callback drain window.'
 
@@ -457,11 +465,10 @@ Assert-True ((Get-Property $attempt 'Phase').ToString() -eq 'Rejected' -and
     [SteamAuthenticationEnvironment]::RejectionCode -eq 'PeerInfoAuthenticationIncomplete') `
     'A negative active-session Steam status did not revoke the session.'
 Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
-$quarantinedIds = $script:runtime.GetField(
-    'QuarantinedIncompleteSteamIds', $script:static).GetValue($null)
-Assert-True ($null -ne $quarantinedIds -and
-    -not ($quarantinedIds.Contains($script:steamId.m_SteamID))) `
-    'A revoked but previously active authentication generation was quarantined as incomplete.'
+$retirement = (Get-RuntimeField 'RetiredSteamIds')[$script:steamId.m_SteamID]
+Assert-True ((Get-Property $retirement 'CleanupCompleted') -and
+    (Get-Property $retirement 'QuietPeriodTicks') -eq (2 * [Diagnostics.Stopwatch]::Frequency)) `
+    'A revoked but previously active authentication generation used the incomplete-authentication drain period.'
 [SteamAuthenticationEnvironment]::Now += (3 * [Diagnostics.Stopwatch]::Frequency)
 Assert-True (New-Connection) 'A previously active revoked generation could not reconnect after the callback drain window.'
 
@@ -473,7 +480,7 @@ Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
 Assert-True ([SteamAuthenticationEnvironment]::Completed -eq 0 -and
     (Get-RuntimeField '_queuedSteamAuthenticationCallbackCount') -eq 0) 'A queued callback survived removal of its connection generation.'
 Assert-True (-not (New-Connection) -and
-    [SteamAuthenticationEnvironment]::UnregisteredReason -eq 'steam_identity_quarantined') 'An incomplete old callback generation authenticated a reconnect.'
+    [SteamAuthenticationEnvironment]::UnregisteredReason -eq 'steam_authentication_retired') 'An incomplete old callback generation authenticated a reconnect during retirement.'
 
 Reset-Fixture
 Prepare-Join
@@ -483,6 +490,213 @@ Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 0 -and
     (Get-RuntimeField 'SteamAuthenticationsById').Count -eq 0 -and
     (Get-RuntimeField '_queuedSteamAuthenticationCallbackCount') -eq 0 -and
     [SteamAuthenticationEnvironment]::Completed -eq 0) 'Callback disposal left a pending authentication or queued completion.'
+Assert-True ([SteamAuthenticationEnvironment]::ClosedSockets.Contains($rawSocket) -and
+    (Get-RuntimeField 'RetiredSteamIds').ContainsKey($steamId.m_SteamID)) `
+    'Callback disposal failed to close the original socket or discarded its incomplete-authentication drain record.'
+Assert-True (Ensure-Callback) 'Callback registration did not recover after incomplete-session disposal.'
+Assert-True (-not (New-Connection) -and
+    [SteamAuthenticationEnvironment]::UnregisteredReason -eq 'steam_authentication_retired') `
+    'A callback lifecycle reset bypassed the prior incomplete authentication drain window.'
+[SteamAuthenticationEnvironment]::Now += (30 * [Diagnostics.Stopwatch]::Frequency)
+Assert-True (New-Connection) 'An incomplete-session lifecycle reset permanently prevented reconnection.'
+Enter-PeerInfo
+Begin-Ticket
+Finish-PeerInfo
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::Completed -eq 0 -and
+    (Get-Property $attempt 'Phase').ToString() -eq 'VanillaAccepted') `
+    'A completion queued before callback disposal authenticated the new generation.'
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+Assert-Activated 'A fresh final OK did not admit the post-disposal replacement session.'
+
+# A timed-out BeginAuth no longer locks the account for the server process.
+# Native cleanup and a full quiet window are both required, then the new
+# reservation must pass vanilla BeginAuth and its own final callback again.
+foreach ($dedicated in @($true, $false)) {
+    Reset-Fixture $dedicated
+    Prepare-Join
+    $timedOutRpc = $rpc
+    $timedOutSocket = $rawSocket
+    [SteamAuthenticationEnvironment]::Now = (Get-Property $attempt 'DeadlineTimestamp') + 1
+    Invoke-Runtime 'ExpireSteamAuthentications' | Out-Null
+    Assert-Denied 'HandshakeTimedOut' 'Timeout recovery admitted the timed-out generation.'
+    # Disconnect is an outbound I/O fixture boundary. Invoke its actual
+    # authentication cleanup independently, as the production disconnect does.
+    Invoke-Runtime 'RemoveSteamAuthentication' @($timedOutRpc) | Out-Null
+    $retirement = (Get-RuntimeField 'RetiredSteamIds')[$steamId.m_SteamID]
+    Assert-True ((Get-Property $retirement 'CleanupCompleted') -and
+        $null -eq (Get-Property $retirement 'Socket') -and
+        (Get-Property $retirement 'QuietPeriodTicks') -eq (30 * [Diagnostics.Stopwatch]::Frequency) -and
+        [SteamAuthenticationEnvironment]::ClosedSockets.Contains($timedOutSocket) -and
+        -not (Get-RuntimeField 'SteamAuthenticationsByRpc').ContainsKey($timedOutRpc)) `
+        "Timeout cleanup did not close/unlink the old session before recovery (dedicated=$dedicated)."
+    $retryAt = (Get-Property $retirement 'QuietUntilTimestamp')
+    [SteamAuthenticationEnvironment]::Now = $retryAt - 1
+    Assert-True (-not (New-Connection) -and
+        [SteamAuthenticationEnvironment]::UnregisteredReason -eq 'steam_authentication_retired') `
+        'The timeout drain period allowed an early reconnect.'
+    [SteamAuthenticationEnvironment]::Now = Get-Property $retirement 'QuietUntilTimestamp'
+    Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+    Assert-True (-not (Get-RuntimeField 'RetiredSteamIds').ContainsKey($steamId.m_SteamID)) `
+        'A successfully cleaned and quiet timed-out identity was not pruned.'
+    Assert-True (New-Connection) "Timed-out identity still required a server restart (dedicated=$dedicated)."
+    Enter-PeerInfo
+    Begin-Ticket
+    Finish-PeerInfo
+    [SteamAuthenticationEnvironment]::Rejected = 0
+    Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+    Assert-True ([SteamAuthenticationEnvironment]::Completed -eq 0 -and
+        (Get-Property $attempt 'Phase').ToString() -eq 'VanillaAccepted') `
+        'Recovery admitted a new session without a fresh final Steam callback.'
+    [SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+    Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+    Assert-Activated "Timeout recovery did not accept a fresh valid authentication (dedicated=$dedicated)."
+}
+
+# A queued old OK retains its generation reference. A callback received while
+# retired is discarded and restarts that retirement's own quiet period.
+Reset-Fixture
+Prepare-Join
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
+$retirement = (Get-RuntimeField 'RetiredSteamIds')[$steamId.m_SteamID]
+$initialRetryAt = Get-Property $retirement 'QuietUntilTimestamp'
+[SteamAuthenticationEnvironment]::Now += (15 * [Diagnostics.Stopwatch]::Frequency)
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+Assert-True ((Get-Property $retirement 'QuietUntilTimestamp') -eq
+    ([SteamAuthenticationEnvironment]::Now + 30 * [Diagnostics.Stopwatch]::Frequency) -and
+    (Get-RuntimeField '_queuedSteamAuthenticationCallbackCount') -eq 1) `
+    'A callback during incomplete retirement did not extend its 30-second drain period or was enqueued for a new generation.'
+[SteamAuthenticationEnvironment]::Now = $initialRetryAt
+Assert-True (-not (New-Connection)) 'A late retired callback did not delay reuse of the identity.'
+[SteamAuthenticationEnvironment]::Now = Get-Property $retirement 'QuietUntilTimestamp'
+Assert-True (New-Connection) 'An extended but now quiet retirement did not permit another attempt.'
+Enter-PeerInfo
+Begin-Ticket
+Finish-PeerInfo
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::Completed -eq 0 -and
+    (Get-Property $attempt 'EnqueuedCallbackCount') -eq 0 -and
+    (Get-RuntimeField '_queuedSteamAuthenticationCallbackCount') -eq 0) `
+    'A queued callback from the retired generation authenticated its replacement.'
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseAuthTicketInvalid)
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+Assert-Denied 'PeerInfoAuthenticationIncomplete' 'Recovery bypassed a fresh negative Steam response.'
+
+# A failed native Close must not start the quiet period or silently unlock an
+# account. Tick's bounded cleanup retry can recover without restarting ZNet.
+Reset-Fixture
+Prepare-Join
+$cleanupSocket = $rawSocket
+[SteamAuthenticationEnvironment]::ThrowClose = $true
+Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
+$retirement = (Get-RuntimeField 'RetiredSteamIds')[$steamId.m_SteamID]
+Assert-True (-not (Get-Property $retirement 'CleanupCompleted') -and
+    [object]::ReferenceEquals((Get-Property $retirement 'Socket'), $cleanupSocket) -and
+    [SteamAuthenticationEnvironment]::CloseAttempts -eq 1) `
+    'Native cleanup failure was treated as successful or dropped the original socket required for retry.'
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::CloseAttempts -eq 1) `
+    'A failed cleanup retried every Tick instead of respecting its bounded retry interval.'
+[SteamAuthenticationEnvironment]::Now += (3600 * [Diagnostics.Stopwatch]::Frequency)
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::CloseAttempts -eq 2 -and
+    -not (Get-Property $retirement 'CleanupCompleted') -and
+    -not (New-Connection) -and
+    [SteamAuthenticationEnvironment]::UnregisteredReason -eq 'steam_authentication_retired') `
+    'Elapsed time alone unlocked an identity whose native cleanup still fails.'
+[SteamAuthenticationEnvironment]::ThrowClose = $false
+[SteamAuthenticationEnvironment]::Now += (30 * [Diagnostics.Stopwatch]::Frequency)
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ((Get-Property $retirement 'CleanupCompleted') -and
+    $null -eq (Get-Property $retirement 'Socket') -and
+    [SteamAuthenticationEnvironment]::ClosedSockets.Contains($cleanupSocket) -and
+    (Get-Property $retirement 'QuietUntilTimestamp') -eq
+        ([SteamAuthenticationEnvironment]::Now + 30 * [Diagnostics.Stopwatch]::Frequency)) `
+    'Successful cleanup retry did not start a fresh complete drain period.'
+Assert-True (-not (New-Connection)) 'Cleanup success skipped the required callback drain period.'
+[SteamAuthenticationEnvironment]::Now = Get-Property $retirement 'QuietUntilTimestamp'
+Assert-True (New-Connection) 'Recovered native cleanup permanently prevented reconnection.'
+Enter-PeerInfo
+Begin-Ticket
+Finish-PeerInfo
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+Assert-Activated 'A fresh valid session could not recover after a temporary native cleanup failure.'
+
+# Native Close can block briefly. Multiple failed cleanups must advance over
+# separate Ticks, not stall one frame by retrying the entire bounded table.
+Reset-Fixture
+$batchRetirements = [Collections.Generic.List[object]]::new()
+[SteamAuthenticationEnvironment]::ThrowClose = $true
+foreach ($batchSteamId in @([uint64]76561198000000011, [uint64]76561198000000012)) {
+    Assert-True (New-Connection $batchSteamId) 'Could not reserve a batch-cleanup fixture identity.'
+    Enter-PeerInfo
+    Begin-Ticket
+    Finish-PeerInfo
+    Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
+    $batchRetirements.Add((Get-RuntimeField 'RetiredSteamIds')[$batchSteamId])
+}
+Assert-True ([SteamAuthenticationEnvironment]::CloseAttempts -eq 2 -and
+    (Get-RuntimeField 'RetiredSteamIds').Count -eq 2) `
+    'Batch cleanup did not retain both native cleanup failures.'
+[SteamAuthenticationEnvironment]::Now += (30 * [Diagnostics.Stopwatch]::Frequency)
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::CloseAttempts -eq 3 -and
+    @($batchRetirements | Where-Object {
+        (Get-Property $_ 'NextCleanupAttemptTimestamp') -gt [SteamAuthenticationEnvironment]::Now
+    }).Count -eq 1) `
+    'One Tick retried more than one failed native Close, or did not defer that failed identity.'
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::CloseAttempts -eq 4 -and
+    @($batchRetirements | Where-Object {
+        (Get-Property $_ 'NextCleanupAttemptTimestamp') -gt [SteamAuthenticationEnvironment]::Now
+    }).Count -eq 2) `
+    'The next Tick did not advance to the other due cleanup failure.'
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::CloseAttempts -eq 4) `
+    'Batch cleanup retried again before either per-identity retry interval elapsed.'
+[SteamAuthenticationEnvironment]::ThrowClose = $false
+[SteamAuthenticationEnvironment]::Now += (30 * [Diagnostics.Stopwatch]::Frequency)
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::CloseAttempts -eq 5 -and
+    @($batchRetirements | Where-Object { Get-Property $_ 'CleanupCompleted' }).Count -eq 1) `
+    'Successful batch cleanup recovery exceeded the one-native-Close-per-Tick limit.'
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ([SteamAuthenticationEnvironment]::CloseAttempts -eq 6 -and
+    @($batchRetirements | Where-Object { Get-Property $_ 'CleanupCompleted' }).Count -eq 2 -and
+    (Get-RuntimeField 'RetiredSteamIds').Count -eq 2) `
+    'Batch cleanup recovery did not finish on the next Tick or discarded quiet-period protection.'
+
+Reset-Fixture
+Prepare-Join
+[SteamAuthenticationEnvironment]::SkipClose = $true
+Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
+$retirement = (Get-RuntimeField 'RetiredSteamIds')[$steamId.m_SteamID]
+Assert-True (-not (Get-Property $retirement 'CleanupCompleted') -and
+    $null -ne (Get-Property $retirement 'Socket')) `
+    'A native Close returning without closing the socket or clearing its Steam identity was trusted.'
+[SteamAuthenticationEnvironment]::SkipClose = $false
+[SteamAuthenticationEnvironment]::Now += (30 * [Diagnostics.Stopwatch]::Frequency)
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ((Get-Property $retirement 'CleanupCompleted')) `
+    'A previously skipped native Close could not recover on the bounded cleanup retry.'
+
+Reset-Fixture
+Prepare-Join
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseOK)
+Invoke-Runtime 'ProcessSteamAuthenticationCallbacks' | Out-Null
+Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
+$retirement = (Get-RuntimeField 'RetiredSteamIds')[$steamId.m_SteamID]
+[SteamAuthenticationEnvironment]::Now += [Diagnostics.Stopwatch]::Frequency
+[SteamAuthenticationEnvironment]::Emit([Steamworks.EAuthSessionResponse]::k_EAuthSessionResponseAuthTicketCanceled)
+Assert-True ((Get-Property $retirement 'QuietUntilTimestamp') -eq
+    ([SteamAuthenticationEnvironment]::Now + 2 * [Diagnostics.Stopwatch]::Frequency) -and
+    (Get-RuntimeField '_queuedSteamAuthenticationCallbackCount') -eq 0) `
+    'An active generation retirement callback did not discard and extend using its short drain period.'
+[SteamAuthenticationEnvironment]::Now = Get-Property $retirement 'QuietUntilTimestamp'
+Assert-True (New-Connection) 'The short active-generation callback drain became a permanent or 30-second lockout.'
 
 # Exercise the production reservation maps at the expanded safety limit. This
 # is a state-only capacity fixture, not a 250-player Steam/network load test:
@@ -531,8 +745,8 @@ foreach ($entry in @($capacityEntries[0], $capacityEntries[250])) {
 }
 Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 510 -and
     (Get-RuntimeField 'SteamAuthenticationsById').Count -eq 510 -and
-    (Get-RuntimeField 'QuarantinedIncompleteSteamIds').Count -eq 0) `
-    'Capacity cleanup changed the incomplete-generation quarantine policy or failed to free two entries.'
+    (Get-RuntimeField 'RetiredSteamIds').Count -eq 2) `
+    'Capacity cleanup lost its drain records or failed to free two active reservation entries.'
 Assert-True (New-Connection ([uint64]76561198001000512)) 'The previously capacity-rejected identity could not use a freed reservation.'
 Assert-True (New-Connection ([uint64]76561198001000513)) 'A second new identity could not use the remaining freed reservation.'
 Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 512 -and
@@ -542,5 +756,37 @@ Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 0 -and
     (Get-RuntimeField 'SteamAuthenticationsById').Count -eq 0 -and
     (Get-RuntimeField '_queuedSteamAuthenticationCallbackCount') -eq 0) `
     'Shutdown cleanup left entries behind after the full-capacity fixture.'
+
+# Bound both live generations and retired identities without an irreversible
+# global "capacity exhausted" latch. Retiring a generation consumes the same
+# combined slot; only cleanup plus quiet expiry releases it.
+Reset-Fixture
+$retireAtCapacity = [Collections.Generic.List[object]]::new()
+for ($index = 0; $index -lt 512; ++$index) {
+    Assert-True (New-Connection ([uint64](76561198002000000 + $index))) `
+        'Could not fill the first half of the combined generation capacity fixture.'
+    $retireAtCapacity.Add($rpc)
+}
+foreach ($oldRpc in $retireAtCapacity) { Invoke-Runtime 'RemoveSteamAuthentication' @($oldRpc) | Out-Null }
+for ($index = 512; $index -lt 1024; ++$index) {
+    Assert-True (New-Connection ([uint64](76561198002000000 + $index))) `
+        'Combined capacity rejected a reservation before reaching 1024 tracked identities.'
+}
+Invoke-Runtime 'RemoveSteamAuthentication' @($rpc) | Out-Null
+Assert-True ((Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 511 -and
+    (Get-RuntimeField 'RetiredSteamIds').Count -eq 513) `
+    'Retirement did not preserve the combined tracked-identity count.'
+Assert-True (-not (New-Connection ([uint64]76561198002001024)) -and
+    [SteamAuthenticationEnvironment]::UnregisteredReason -eq 'steam_reservation_capacity_exceeded' -and
+    (Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 511 -and
+    (Get-RuntimeField 'RetiredSteamIds').Count -eq 513) `
+    'The 1024-entry combined bound evicted earlier records or allowed an extra identity below the separate live cap.'
+[SteamAuthenticationEnvironment]::Now += (2 * [Diagnostics.Stopwatch]::Frequency)
+Invoke-Runtime 'PruneRetiredSteamIds' | Out-Null
+Assert-True ((Get-RuntimeField 'RetiredSteamIds').Count -eq 0 -and
+    (Get-RuntimeField 'SteamAuthenticationsByRpc').Count -eq 511 -and
+    (New-Connection ([uint64]76561198002001024))) `
+    'Combined-capacity exhaustion did not recover after quiet retired entries were pruned.'
+Invoke-Runtime 'DisposeSteamAuthenticationCallback' | Out-Null
 
 Write-Host "Steam callback registration and authentication lifecycle smoke tests passed ($script:checks checks)."

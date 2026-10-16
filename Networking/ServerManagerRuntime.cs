@@ -50,9 +50,7 @@ internal static partial class ServerManagerRuntime
         SteamAuthenticationsByRpc = new();
     private static readonly Dictionary<ulong, SteamAuthenticationAttempt>
         SteamAuthenticationsById = new();
-    private static readonly Dictionary<ulong, long> RetiredSteamIds = new();
-    private static readonly HashSet<ulong>
-        QuarantinedIncompleteSteamIds = new();
+    private static readonly Dictionary<ulong, SteamAuthenticationRetirement> RetiredSteamIds = new();
     private static readonly ConcurrentQueue<SteamAuthenticationCallbackEvent>
         SteamAuthenticationCallbacks = new();
     private static readonly ConcurrentQueue<WorldSaveWorkerResult>
@@ -120,7 +118,7 @@ internal static partial class ServerManagerRuntime
     // plus bounded in-flight authentication headroom, even with another cap mod.
     private const int MaximumSteamAuthenticationReservations = 512;
     private const int MaximumPendingAdminManifests = 64;
-    private const int MaximumQuarantinedIncompleteSteamIds = 1024;
+    private const int MaximumTrackedSteamAuthentications = 1024;
     private const int MaximumQueuedSteamCallbacksPerAttempt = 2;
     private const int MaximumQueuedSteamAuthenticationCallbacks =
         MaximumSteamAuthenticationReservations *
@@ -141,6 +139,11 @@ internal static partial class ServerManagerRuntime
         TimeSpan.FromMinutes(45);
     private static readonly long RetiredSteamIdQuietTicks =
         checked(2L * Stopwatch.Frequency);
+    // A drain interval, not a Steam guarantee of maximum callback latency.
+    // Native responses identify only the Steam ID; queued responses below
+    // additionally retain the exact managed connection attempt that saw them.
+    private static readonly long IncompleteSteamIdQuietTicks =
+        checked(30L * Stopwatch.Frequency);
     private static readonly long DetectionKickAggregationTicks =
         Math.Max(1L, Stopwatch.Frequency / 4L);
     private static readonly long AdminEntitlementRefreshTicks =
@@ -167,7 +170,6 @@ internal static partial class ServerManagerRuntime
         checked((long)GracefulExitSaveTimeoutSeconds * Stopwatch.Frequency);
     private static readonly long OperationalKickSaveTimeoutTicks =
         checked((long)OperationalKickSaveTimeoutSeconds * Stopwatch.Frequency);
-    private static bool _steamAuthenticationGenerationCapacityExhausted;
     private static bool _continueLogoutPassThrough;
     private static bool _applicationQuitResumePending;
     private static bool _suppressClientSaveCapture;
@@ -282,6 +284,24 @@ internal static partial class ServerManagerRuntime
         internal bool BeginAuthObservedAtCapture { get; }
 
         internal long ReceivedTimestamp { get; }
+    }
+
+    private sealed class SteamAuthenticationRetirement
+    {
+        internal SteamAuthenticationRetirement(ZSteamSocket socket, long quietPeriodTicks, long now)
+        {
+            Socket = socket;
+            QuietPeriodTicks = quietPeriodTicks;
+            QuietUntilTimestamp = now + quietPeriodTicks;
+        }
+
+        // Keep only the native socket, not the peer/profile/buffer graph. Reuse
+        // is blocked until Close (including EndAuthSession) has completed.
+        internal ZSteamSocket? Socket { get; set; }
+        internal long QuietPeriodTicks { get; }
+        internal long QuietUntilTimestamp { get; set; }
+        internal long NextCleanupAttemptTimestamp { get; set; }
+        internal bool CleanupCompleted => Socket == null;
     }
 
     private sealed class SaveAdmissionWindow
@@ -1842,10 +1862,9 @@ internal static partial class ServerManagerRuntime
                     out SteamAuthenticationAttempt attempt) ||
                 attempt.Phase == SteamAuthenticationPhase.Rejected)
             {
-                if (RetiredSteamIds.ContainsKey(steamId))
+                if (RetiredSteamIds.TryGetValue(steamId, out SteamAuthenticationRetirement retired))
                 {
-                    RetiredSteamIds[steamId] =
-                        Stopwatch.GetTimestamp() + RetiredSteamIdQuietTicks;
+                    retired.QuietUntilTimestamp = receivedTimestamp + retired.QuietPeriodTicks;
                 }
 
                 // This may belong to another Steam consumer or a retired
@@ -1946,25 +1965,12 @@ internal static partial class ServerManagerRuntime
             deadline);
         SteamAuthenticationAttempt? conflicting = null;
         bool retired;
-        bool quarantined;
-        bool generationCapacityExhausted;
         bool capacityExceeded = false;
         lock (SteamAuthenticationGate)
         {
             PruneRetiredSteamIdsLocked(now);
-            generationCapacityExhausted =
-                _steamAuthenticationGenerationCapacityExhausted;
-            quarantined =
-                QuarantinedIncompleteSteamIds.Contains(
-                    steamId.m_SteamID);
-            retired =
-                RetiredSteamIds.TryGetValue(
-                    steamId.m_SteamID,
-                    out long quietUntil) &&
-                quietUntil > now;
-            if (!generationCapacityExhausted &&
-                !quarantined &&
-                !retired)
+            retired = RetiredSteamIds.ContainsKey(steamId.m_SteamID);
+            if (!retired)
             {
                 if (SteamAuthenticationsByRpc.TryGetValue(
                         rpc,
@@ -1979,7 +1985,9 @@ internal static partial class ServerManagerRuntime
                     conflicting = byId;
                 }
                 else if (SteamAuthenticationsByRpc.Count >=
-                         MaximumSteamAuthenticationReservations)
+                         MaximumSteamAuthenticationReservations ||
+                         SteamAuthenticationsByRpc.Count + RetiredSteamIds.Count >=
+                         MaximumTrackedSteamAuthentications)
                 {
                     capacityExceeded = true;
                 }
@@ -1993,38 +2001,23 @@ internal static partial class ServerManagerRuntime
             }
         }
 
-        if (generationCapacityExhausted)
-        {
-            ServerManagerPlugin.Log.LogError(
-                "Rejected a Steam connection because the bounded incomplete-" +
-                "authentication generation quarantine is exhausted. Restart " +
-                "the server process to establish a new callback generation.");
-            RecordUnregisteredConnectionRejection(rpc, peer, "steam_generation_capacity_exhausted",
-                "The incomplete-authentication generation quarantine is exhausted.");
-            DisposeUnregisteredPeer(peer);
-            return false;
-        }
-
-        if (quarantined)
-        {
-            ServerManagerPlugin.Log.LogWarning(
-                "Rejected a Steam reconnect whose previous BeginAuthSession " +
-                "did not reach Active with a generation-bound final OK. The " +
-                "ID is quarantined until the server process restarts.");
-            RecordUnregisteredConnectionRejection(rpc, peer, "steam_identity_quarantined",
-                "The previous authentication attempt did not reach a generation-bound final OK.");
-            DisposeUnregisteredPeer(peer);
-            return false;
-        }
-
         if (retired)
         {
             ServerManagerPlugin.Log.LogWarning(
-                "Rejected a Steam reconnect during the retired authentication " +
-                "callback drain window.");
+                "Rejected a Steam reconnect while the previous authentication " +
+                "session is closing or draining callbacks. Retry after 30 seconds.");
             RecordUnregisteredConnectionRejection(rpc, peer, "steam_authentication_retired",
-                "A reconnect arrived during the retired authentication callback drain window.");
+                "The previous Steam session is closing or draining callbacks. Retry after 30 seconds.");
             DisposeUnregisteredPeer(peer);
+            lock (SteamAuthenticationGate)
+            {
+                if (RetiredSteamIds.TryGetValue(steamId.m_SteamID, out SteamAuthenticationRetirement closing))
+                {
+                    // Even this rejected socket's vanilla Close ends auth for
+                    // the ID. Drain from that cleanup, not its arrival time.
+                    closing.QuietUntilTimestamp = Stopwatch.GetTimestamp() + closing.QuietPeriodTicks;
+                }
+            }
             return false;
         }
 
@@ -2036,7 +2029,7 @@ internal static partial class ServerManagerRuntime
                     "Rejected a Steam connection because the bounded " +
                     "authentication reservation table is full.");
                 RecordUnregisteredConnectionRejection(rpc, peer, "steam_reservation_capacity_exceeded",
-                    "The authentication reservation table is full.");
+                    "The bounded authentication/retry table is full. Try again shortly.");
                 DisposeUnregisteredPeer(peer);
                 return false;
             }
@@ -9067,6 +9060,25 @@ internal static partial class ServerManagerRuntime
 
     private static void PruneRetiredSteamIds()
     {
+        KeyValuePair<ulong, SteamAuthenticationRetirement>[] pending;
+        lock (SteamAuthenticationGate)
+        {
+            if (RetiredSteamIds.Count == 0)
+            {
+                return;
+            }
+            long now = Stopwatch.GetTimestamp();
+            // Vanilla Close can wait 100 ms. Bound exceptional cleanup retries
+            // so a group of broken sockets cannot stall a single server Tick.
+            pending = RetiredSteamIds.Where(pair =>
+                !pair.Value.CleanupCompleted && pair.Value.NextCleanupAttemptTimestamp <= now).Take(1).ToArray();
+        }
+
+        foreach (KeyValuePair<ulong, SteamAuthenticationRetirement> entry in pending)
+        {
+            TryCleanupRetiredSteamAuthentication(entry.Key, entry.Value);
+        }
+
         lock (SteamAuthenticationGate)
         {
             PruneRetiredSteamIdsLocked(Stopwatch.GetTimestamp());
@@ -9076,7 +9088,7 @@ internal static partial class ServerManagerRuntime
     private static void PruneRetiredSteamIdsLocked(long now)
     {
         foreach (ulong steamId in RetiredSteamIds
-                     .Where(pair => pair.Value <= now)
+                     .Where(pair => pair.Value.CleanupCompleted && pair.Value.QuietUntilTimestamp <= now)
                      .Select(pair => pair.Key)
                      .ToArray())
         {
@@ -9716,8 +9728,8 @@ internal static partial class ServerManagerRuntime
     {
         SteamAuthenticationAttempt? removed = null;
         bool rejectPending = false;
-        bool quarantinedIncomplete = false;
-        bool quarantineCapacityExhausted = false;
+        bool incomplete;
+        SteamAuthenticationRetirement retirement;
         SteamAuthenticationPhase phaseAtDisconnect;
         lock (SteamAuthenticationGate)
         {
@@ -9742,32 +9754,27 @@ internal static partial class ServerManagerRuntime
             rejectPending =
                 removed.Phase != SteamAuthenticationPhase.Active &&
                 removed.Phase != SteamAuthenticationPhase.Rejected;
-            quarantinedIncomplete =
-                QuarantineIncompleteSteamAuthenticationLocked(removed);
-            quarantineCapacityExhausted =
-                _steamAuthenticationGenerationCapacityExhausted;
+            incomplete = removed.BeginAuthInvocationObserved && !removed.ReachedActive;
             removed.Phase = SteamAuthenticationPhase.Rejected;
-            RetiredSteamIds[removed.SteamId.m_SteamID] =
-                Stopwatch.GetTimestamp() + RetiredSteamIdQuietTicks;
+            retirement = new SteamAuthenticationRetirement(removed.Socket,
+                incomplete ? IncompleteSteamIdQuietTicks : RetiredSteamIdQuietTicks,
+                Stopwatch.GetTimestamp());
+            RetiredSteamIds.Add(removed.SteamId.m_SteamID, retirement);
         }
 
-        if (quarantinedIncomplete)
+        // CleanupPeer is a Disconnect prefix. Do not assume vanilla has closed
+        // the socket yet, or trust a mod's wrapper Dispose to end native auth.
+        TryCleanupRetiredSteamAuthentication(removed.SteamId.m_SteamID, retirement);
+
+        if (incomplete)
         {
             ServerManagerPlugin.Log.LogWarning(
-                "Quarantined a Steam ID for the remainder of this server " +
-                "process because BeginAuthSession was invoked without reaching " +
-                "Active on a generation-bound final OK callback. Phase at disconnect=" +
+                "Retired incomplete Steam authentication for " + removed.SteamId +
+                "; reconnect is allowed after socket cleanup and 30 seconds " +
+                "without retired callbacks. Phase at disconnect=" +
                 phaseAtDisconnect + ", beginAccepted=" + removed.BeginAuthImmediateAccepted +
                 ", callbacksQueued=" + removed.EnqueuedCallbackCount +
                 ", callbacksProcessed=" + removed.ProcessedCallbackCount + ".");
-        }
-
-        if (quarantineCapacityExhausted)
-        {
-            ServerManagerPlugin.Log.LogFatal(
-                "The bounded incomplete Steam-authentication quarantine is " +
-                "exhausted. New Steam connections will remain fail-closed " +
-                "until the server process restarts.");
         }
 
         if (!rejectPending)
@@ -9791,57 +9798,70 @@ internal static partial class ServerManagerRuntime
         }
     }
 
-    private static bool QuarantineIncompleteSteamAuthenticationLocked(
-        SteamAuthenticationAttempt attempt)
+    private static void TryCleanupRetiredSteamAuthentication(
+        ulong steamId, SteamAuthenticationRetirement retirement)
     {
-        if (attempt.ReachedActive ||
-            !attempt.BeginAuthInvocationObserved)
+        ZSteamSocket? socket;
+        lock (SteamAuthenticationGate)
         {
-            return false;
+            if (!RetiredSteamIds.TryGetValue(steamId, out SteamAuthenticationRetirement current) ||
+                !ReferenceEquals(current, retirement) || retirement.CleanupCompleted)
+            {
+                return;
+            }
+            socket = retirement.Socket;
+            retirement.NextCleanupAttemptTimestamp = Stopwatch.GetTimestamp() + IncompleteSteamIdQuietTicks;
         }
 
-        ulong steamId = attempt.SteamId.m_SteamID;
-        if (QuarantinedIncompleteSteamIds.Contains(steamId))
+        try
         {
-            return true;
+            // Original client Close uses SteamUser.EndAuthSession; the dedicated
+            // game assembly uses SteamGameServer.EndAuthSession. Calling the
+            // original reserved socket also makes any later Dispose harmless.
+            // Never run native cleanup under SteamAuthenticationGate.
+            socket!.Close();
+            if (socket.IsConnected() || socket.GetPeerID().IsValid())
+            {
+                throw new InvalidOperationException("The retired Steam socket did not finish closing.");
+            }
+        }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        {
+            ServerManagerPlugin.Log.LogWarning("Steam authentication cleanup for " + steamId +
+                " did not complete; reconnect remains blocked and cleanup will retry in 30 seconds: " +
+                exception.GetType().Name + ": " + exception.Message);
+            return;
         }
 
-        if (QuarantinedIncompleteSteamIds.Count >=
-            MaximumQuarantinedIncompleteSteamIds)
+        lock (SteamAuthenticationGate)
         {
-            // An untracked delayed response could otherwise authenticate a
-            // future generation. Once the bounded table cannot represent that
-            // ambiguity, accepting any new reservation is unsafe.
-            _steamAuthenticationGenerationCapacityExhausted = true;
-            return true;
+            if (RetiredSteamIds.TryGetValue(steamId, out SteamAuthenticationRetirement current) &&
+                ReferenceEquals(current, retirement))
+            {
+                retirement.Socket = null;
+                retirement.QuietUntilTimestamp = Stopwatch.GetTimestamp() + retirement.QuietPeriodTicks;
+            }
         }
-
-        QuarantinedIncompleteSteamIds.Add(steamId);
-        return true;
     }
 
     private static void DisposeSteamAuthenticationCallback()
     {
         Callback<ValidateAuthTicketResponse_t>? callback;
+        ZRpc[] pending;
+        lock (SteamAuthenticationGate)
+        {
+            pending = SteamAuthenticationsByRpc.Keys.ToArray();
+        }
+        foreach (ZRpc rpc in pending)
+        {
+            RemoveSteamAuthentication(rpc);
+        }
+
         lock (SteamAuthenticationGate)
         {
             callback = _steamAuthenticationCallback;
             _steamAuthenticationCallback = null;
             _steamAuthenticationCallbackUnavailable = false;
-            foreach (SteamAuthenticationAttempt attempt in
-                     SteamAuthenticationsByRpc.Values)
-            {
-                QuarantineIncompleteSteamAuthenticationLocked(attempt);
-
-                attempt.Phase = SteamAuthenticationPhase.Rejected;
-                RetiredSteamIds[attempt.SteamId.m_SteamID] =
-                    Stopwatch.GetTimestamp() +
-                    RetiredSteamIdQuietTicks;
-            }
-
-            SteamAuthenticationsByRpc.Clear();
-            SteamAuthenticationsById.Clear();
-
             while (SteamAuthenticationCallbacks.TryDequeue(out _))
             {
             }
