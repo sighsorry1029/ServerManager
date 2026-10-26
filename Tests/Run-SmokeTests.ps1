@@ -143,6 +143,11 @@ $smokeTests = @(
         NeedsGamePath = $true
     },
     [pscustomobject]@{
+        Name = "Server-verified seed command permissions"
+        File = "SeedCommandPermissionsSmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
         Name = "Item-data presets and live reload"
         File = "ItemDataPresetsSmoke.ps1"
         NeedsGamePath = $false

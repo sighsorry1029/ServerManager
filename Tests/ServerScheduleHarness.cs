@@ -263,7 +263,7 @@ internal static class ServerScheduleHarness
             "Uncommented example is scheduled at 05:35 on the local wall clock");
         Check(job.Maintenance && job.CatchUp, "Example automatically derives verified maintenance and offline catch-up policies");
         Check(job.Commands.SequenceEqual(new[] {
-            "world_clean",
+            "world_clean start",
             "zones_reset safeZones=1 start",
             "vegetation_reset rock4_copper,silvervein terrain=20 safeZones=0 start",
             "locations_reset Hildir_crypt,Hildir_cave,Hildir_plainsfortress,SunkenCrypt4,Crypt2,Crypt3,Crypt4,MountainCave02,Mistlands_Giant1,Mistlands_Excavation1,Mistlands_DvergrTownEntrance1,Mistlands_DvergrTownEntrance2,Mistlands_DvergrBossEntrance1,CharredFortress force start"
@@ -284,8 +284,8 @@ internal static class ServerScheduleHarness
     private static void UpgradeWorldCatalog()
     {
         var groups = new[] {
-            (UpgradeWorldCommandKind.QueuedMutation, "chests_reset locations_add locations_remove locations_reset objects_edit objects_refresh objects_remove objects_swap world_reset vegetation_add vegetation_remove vegetation_reset zones_generate zones_reset zones_restore"),
-            (UpgradeWorldCommandKind.ImmediateMutation, "world_clean clean_chests clean_dungeons clean_duplicates clean_health clean_locations clean_objects clean_spawns clean_stands location_register locations_fix locations_swap time_change time_change_day time_set time_set_day"),
+            (UpgradeWorldCommandKind.QueuedMutation, "chests_reset locations_add locations_remove locations_reset objects_edit objects_refresh objects_remove objects_swap world_reset vegetation_add vegetation_remove vegetation_reset zones_generate zones_reset zones_restore world_clean clean_chests clean_dungeons clean_duplicates clean_health clean_locations clean_objects clean_spawns clean_stands"),
+            (UpgradeWorldCommandKind.ImmediateMutation, "location_register locations_fix locations_swap time_change time_change_day time_set time_set_day"),
             (UpgradeWorldCommandKind.Query, "biomes_count chests_search locations_count locations_list objects_count objects_list"),
             (UpgradeWorldCommandKind.Control, "start stop save_disable save_enable verbose uw_check"),
             (UpgradeWorldCommandKind.Unsupported, "location_unregister")
@@ -339,7 +339,7 @@ internal static class ServerScheduleHarness
         Check(UpgradeWorldScheduleCommands.GetKind("") == UpgradeWorldCommandKind.None &&
             ServerScheduleSettings.CommandVerb("   ") == "", "Empty classifier input is harmless");
         ServerScheduleJob combined = ServerScheduleSettings.Parse(
-            "jobs: [{schedule: '* * * * *', commands: [save, 'objects_remove start', world_clean, save]}]").Jobs[0];
+            "jobs: [{schedule: '* * * * *', commands: [save, 'objects_remove start', 'world_clean start', 'time_set 100', save]}]").Jobs[0];
         Check(combined.Maintenance && combined.CatchUp, "Queued and immediate changes share one verified maintenance batch");
         foreach (string other in new[] { "announce test", "quit", "objects_count", "uw_check", "sm:save", "save extra" })
             Bad("jobs: [{schedule: '* * * * *', commands: ['objects_remove start', '" + other + "']}]");

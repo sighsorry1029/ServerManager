@@ -523,6 +523,28 @@ $cronAudit.Clear()
 $auditFields.Invoke($null, @('maintenance', $cronMetadata, $cronAudit)) | Out-Null
 Assert-True (-not $cronAudit.ContainsKey('cron_command_count') -and $cronAudit['cron_verb'] -ceq 'badverbsecret') `
     'Cron audit canonicalizes its verb and rejects a noncanonical command count.'
+$partialMetadata = [Collections.Generic.Dictionary[string,string]]::new()
+$partialMetadata.Add('cron_failure_code', 'uw_partial_failure')
+$partialMetadata.Add('cron_partial_changes', 'persisted')
+$partialMetadata.Add('cron_save_result', 'checkpoint_completed')
+$partialMetadata.Add('path', 'DO_NOT_PUBLISH_PARTIAL_SAVE_PATH')
+$partialAudit = [Collections.Generic.Dictionary[string,string]]::new()
+$partialAudit.Add('message', 'cron maintenance; result_code=cron_needs_review; success=false')
+$auditFields.Invoke($null, @('maintenance', $partialMetadata, $partialAudit)) | Out-Null
+Assert-True ($partialAudit.Count -eq 4 -and $partialAudit['message'].Contains('success=false') -and
+    $partialAudit['message'].Contains('cron_partial_changes=persisted') -and
+    $partialAudit['message'].Contains('cron_save_result=checkpoint_completed') -and
+    -not (($partialAudit.Values -join '|').Contains('DO_NOT_PUBLISH'))) `
+    'Partial maintenance preserves its failed outcome and certified persistence in both structured and text audit without raw paths.'
+$partialMetadata['cron_partial_changes'] = 'anything'
+$partialMetadata['cron_save_result'] = "save failed`nsecret"
+$partialAudit.Clear()
+$auditFields.Invoke($null, @('maintenance', $partialMetadata, $partialAudit)) | Out-Null
+Assert-True ($partialAudit.Count -eq 1 -and $partialAudit['cron_failure_code'] -ceq 'uw_partial_failure') `
+    'Malformed persistence state and non-token save result cannot enter audit.'
+$partialAudit.Clear()
+$auditFields.Invoke($null, @('schedule', $partialMetadata, $partialAudit)) | Out-Null
+Assert-True ($partialAudit.Count -eq 0) 'Ordinary scheduled commands cannot acquire partial-maintenance result fields.'
 $metadata['backup_id'] = '0123456789ABCDEF0123456789ABCDEF'
 $metadata['previous_revision'] = '-1'
 $metadata['restored_revision'] = '9223372036854775808'

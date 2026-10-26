@@ -40,7 +40,7 @@ internal static class ServerScheduleRuntimeSmoke
         try
         {
             Lifecycle(); GuardsAndFiles(); AlternateConfiguration(); CanonicalJournalStartup(); RoutingAndBudget(); OptionalCenterBroadcasts(); CenterBroadcastAuditPolicy(); Gates(); PollingAndLogging(); Saves(); ReloadAndRetirement(); ReentrancyAndSuspension();
-            DurableDispatchAndCatchup(); AutomaticUpgradeWorldPolicies(); UpgradeWorldOwnership(); UntrackedUpgrade(); SynchronousMutationAbort(); MaintenanceSequence(); MaintenanceFailureAndRecovery(); MaintenanceReload(); MaintenanceReviewBarrier(); MaintenanceAdmission();
+            DurableDispatchAndCatchup(); AutomaticUpgradeWorldPolicies(); UpgradeWorldOwnership(); UntrackedUpgrade(); CommandCapabilities(); SynchronousMutationAbort(); MaintenanceSequence(); MaintenanceFailureAndRecovery(); MaintenancePartialPersistence(); MaintenanceTimeoutDrain(); MaintenanceReload(); MaintenanceReviewBarrier(); MaintenanceAdmission();
             Console.WriteLine("ServerScheduleRuntimeSmoke: PASS (" + _checks +
                 " assertions; source-linked runtime/parser/engine/journal; stub game/command/Upgrade World boundaries, no native game execution).");
             return 0;
@@ -686,7 +686,7 @@ internal static class ServerScheduleRuntimeSmoke
     {
         foreach (string command in new[] { "objects_remove start", "objects_edit data=x,1,int start", "chests_reset start",
             "locations_add start", "vegetation_add start", "zones_generate start", "world_reset start", "world_gen mistlands start",
-            "temple_gen ashlands start", "upgrade tarpits start", "clean_chests", "world_clean", "locations_swap old,new",
+            "temple_gen ashlands start", "upgrade tarpits start", "clean_chests start", "world_clean start", "locations_swap old,new",
             "location_register StartTemple 1,2,3", "locations_fix", "time_set 1000" })
         {
             Activate(Config(command)); Due();
@@ -695,6 +695,12 @@ internal static class ServerScheduleRuntimeSmoke
             ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
             Check(UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { command }) && ServerConsoleExecutor.Lines.SequenceEqual(new[] { command }),
                 "Reviewed mutation routes exactly once through the UW boundary: " + command);
+            if (UpgradeWorldScheduleCommands.GetKind(command) == UpgradeWorldCommandKind.QueuedMutation)
+            {
+                Tick();
+                Check(ServerEventRuntime.Saves.Count == 1 && JournalState() == "running",
+                    "Queued mutation, including clean callbacks, cannot start post-save before completion: " + command);
+            }
             UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed"); Tick();
             Check(ServerEventRuntime.Saves.Count == 2 && JournalState() == "running", "Mutation requests a single post-save without claiming completion: " + command);
             ServerEventRuntime.Status.LatestSave = Save("post", ServerManagerSaveState.CheckpointCompleted); Tick();
@@ -770,6 +776,29 @@ internal static class ServerScheduleRuntimeSmoke
         Check(UpgradeWorldScheduleBridge.Begun.Count == 0 && JournalState() == "needs_review", "Failed pre-save prevents resets and never reports maintenance success.");
     }
 
+    private static void CommandCapabilities()
+    {
+        Activate(Maintenance("world_clean"));
+        UpgradeWorldScheduleBridge.Unsupported.Add("world_clean"); Due();
+        Check(ServerEventRuntime.Saves.Count == 0 && ServerConsoleExecutor.Lines.SequenceEqual(new[] { "world_clean" }) &&
+            ServerEventRuntime.Audits.Last().Code == "cron_dispatched_untracked" && UpgradeWorldScheduleBridge.Disposals == 1,
+            "A command-specific unsupported contract keeps the single-command fallback and cleans its observer.");
+        Activate(Maintenance("zones_generate start", "world_clean"));
+        UpgradeWorldScheduleBridge.Unsupported.Add("world_clean"); Due();
+        Check(ServerEventRuntime.Saves.Count == 0 && ServerConsoleExecutor.Lines.Count == 0 && JournalState() == "ready",
+            "All batch capabilities are checked before pre-save or any world mutation.");
+        Activate(Maintenance("zones_generate start"));
+        UpgradeWorldScheduleBridge.Unsupported.Add("world_clean"); Due();
+        Check(ServerEventRuntime.Saves.Count == 1 && ServerConsoleExecutor.Lines.Count == 0,
+            "An unsupported clean capability does not disable a supported generation job.");
+        Activate(Maintenance("world_clean"));
+        UpgradeWorldScheduleBridge.Unsupported.Add("world_clean");
+        UpgradeWorldScheduleBridge.FailCleanup = true; Due();
+        Check(ServerEventRuntime.Saves.Count == 0 && ServerConsoleExecutor.Lines.Count == 0 &&
+            ServerEventRuntime.Audits.Any(a => a.Code == "uw_observer_cleanup_failed"),
+            "A capability fallback cannot dispatch after its observer fails to clean up.");
+    }
+
     private static void UpgradeWorldOwnership()
     {
         foreach (string command in new[] { "objects_remove start", "world_clean", "objects_count" })
@@ -817,18 +846,18 @@ internal static class ServerScheduleRuntimeSmoke
 
     private static void SynchronousMutationAbort()
     {
-        Activate(Config("world_clean", "clean_chests")); Due();
+        Activate(Config("locations_fix", "time_set 1000")); Due();
         ServerConsoleExecutor.NextResult = new(false, "rcon_failed", "failed");
         ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
-        Check(UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { "world_clean" }) && ServerEventRuntime.Saves.Count == 1 && JournalState() == "needs_review",
+        Check(UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { "locations_fix" }) && ServerEventRuntime.Saves.Count == 1 && JournalState() == "needs_review",
             "Synchronous mutation failure blocks its next mutation and post-save behind durable review.");
 
-        Activate(Config("world_clean", "clean_chests")); Due();
+        Activate(Config("locations_fix", "time_set 1000")); Due();
         var capturedSave = ServerEventRuntime.Saves.Single();
         ServerConsoleExecutor.OnExecute = ServerScheduleRuntime.Stop;
         ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
-        Check(Session == null && UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { "world_clean" }) &&
-            ServerConsoleExecutor.Lines.SequenceEqual(new[] { "world_clean" }) && ServerEventRuntime.Saves.Count == 1,
+        Check(Session == null && UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { "locations_fix" }) &&
+            ServerConsoleExecutor.Lines.SequenceEqual(new[] { "locations_fix" }) && ServerEventRuntime.Saves.Count == 1,
             "Synchronous world stop during UW dispatch cannot resume a disposed run, execute a tail, or enqueue a post-save.");
         Check(capturedSave.Cancellation.IsCancellationRequested && !capturedSave.Authorized() &&
             !ServerEventRuntime.Audits.Any(a => a.Verb == "maintenance" && a.Success) &&
@@ -873,6 +902,79 @@ internal static class ServerScheduleRuntimeSmoke
         Tick();
         Check(ack.Result.Success && guardCalls > 0 && JournalState() == "ready" && ServerEventRuntime.Saves.Count == calls,
             "Explicit acknowledgement clears after durable write without rerunning the interrupted command.");
+    }
+
+    private static void MaintenancePartialPersistence()
+    {
+        foreach (string outcome in new[] { "success", "failed", "partial", "timeout", "replaced" })
+        {
+            Activate(Maintenance("zones_generate start", "zones_reset start")); Due();
+            ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
+            UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Pending, "uw_partial_failure"); Tick();
+            Check(ServerEventRuntime.Saves.Count == 1 && UpgradeWorldScheduleBridge.Begun.Count == 1 && JournalState() == "running",
+                "Partial failure while UW is still executing neither saves nor advances the batch.");
+            UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure", true); Tick();
+            Check(ServerEventRuntime.Saves.Count == 2 && UpgradeWorldScheduleBridge.Begun.Count == 1 && JournalState() == "running" &&
+                Get(Session!, "_maintenanceOwner") != null && UpgradeWorldScheduleBridge.Disposals == 0,
+                "Certified normal partial termination requests one checkpoint while retaining ownership and skipping remaining mutations.");
+            if (outcome == "timeout") Set(Runs[0]!, "Deadline", 0L);
+            else if (outcome == "replaced")
+            {
+                ServerEventRuntime.Status.LatestSave = Save("partial-save", ServerManagerSaveState.InProgress); Tick();
+                ServerEventRuntime.Status.LatestSave = Save("unrelated-new-save", ServerManagerSaveState.CheckpointCompleted);
+            }
+            else
+            {
+                var save = Save("partial-save", outcome == "failed" ? ServerManagerSaveState.Failed : ServerManagerSaveState.CheckpointCompleted);
+                if (outcome == "partial") save.PendingCharacterCount = 1;
+                ServerEventRuntime.Status.LatestSave = save;
+            }
+            Tick();
+            var final = ServerEventRuntime.Audits.Last(a => a.Verb == "maintenance");
+            Check(JournalState() == "needs_review" && !final.Success && final.Code == "cron_needs_review" &&
+                final.Data["cron_failure_code"] == "uw_partial_failure" &&
+                final.Data["cron_partial_changes"] == (outcome == "success" ? "persisted" : "not_confirmed"),
+                "Partial result stays failed/reviewable; persistence is certified only by full checkpoint: " + outcome);
+            string expected = outcome == "success" ? "checkpoint_completed" : outcome == "failed" ? "save_failed" :
+                outcome == "partial" ? "checkpoint_partial" : outcome == "timeout" ? "save_unconfirmed" : "save_observation_lost";
+            Check(final.Data["cron_save_result"] == expected && UpgradeWorldScheduleBridge.Disposals == 1 &&
+                !ServerConsoleExecutor.Lines.Contains("zones_reset start"), "Original mutation and checkpoint outcomes remain distinct: " + outcome);
+            Due(); Check(ServerEventRuntime.Saves.Count == 2 && UpgradeWorldScheduleBridge.Begun.Count == 1,
+                "Neither partial mutation nor failed persistence is automatically replayed.");
+        }
+        Activate(Maintenance("zones_generate start")); Due();
+        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure", true); Tick();
+        Restart(60);
+        Check(JournalState() == "needs_review" && ServerEventRuntime.Saves.Count == 2 && UpgradeWorldScheduleBridge.Begun.Count == 1,
+            "Restart during partial persistence keeps durable review, never claims success or replays generation.");
+
+        Activate(Maintenance("zones_generate start")); Due();
+        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
+        Set(Runs[0]!, "Retired", true);
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure", true); Tick();
+        Check(JournalState() == "needs_review" && ServerEventRuntime.Saves.Count == 1,
+            "Retired authority never starts a new partial-result checkpoint.");
+    }
+
+    private static void MaintenanceTimeoutDrain()
+    {
+        Activate("jobs:\n" + Job("first", new[] { "zones_generate start" }) +
+            Job("second", new[] { "zones_reset start" }) + Job("ordinary", new[] { "echo after" }));
+        Due(); ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
+        object active = Runs.Cast<object>().Single(run => (bool)Get(run, "WaitingUpgrade")!);
+        Set(active, "Deadline", 0L); UpgradeWorldScheduleBridge.Idle = false; Tick(); Tick();
+        Check(UpgradeWorldScheduleBridge.TimeoutMarks == 1 && UpgradeWorldScheduleBridge.Disposals == 0 &&
+            JournalState() == "running" && Get(Session!, "_maintenanceOwner") != null &&
+            !ServerConsoleExecutor.Lines.Contains("echo after") && ServerEventRuntime.Saves.Count == 1,
+            "Deadline latches once without treating it as cancellation, releasing ownership, or running other scheduled mutations.");
+        Check(ServerEventRuntime.Audits.Count(a => a.Code == "uw_unconfirmed") == 1,
+            "Waiting for idle does not spam timeout audit entries.");
+        UpgradeWorldScheduleBridge.Idle = true;
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Indeterminate, "uw_unconfirmed"); Tick();
+        Check(JournalState() == "needs_review" && UpgradeWorldScheduleBridge.Begun.Count == 1 &&
+            ServerConsoleExecutor.Lines.Contains("echo after") && ServerEventRuntime.Saves.Count == 1,
+            "Confirmed idle releases ordinary scheduling but review still blocks other UW maintenance and no post-save is certified.");
     }
 
     private static void MaintenanceReload()
@@ -1090,26 +1192,34 @@ namespace ServerManager
     {
         internal UpgradeWorldScheduleState State { get; }
         internal string Code { get; }
-        internal UpgradeWorldScheduleObservation(UpgradeWorldScheduleState state, string code)
-        { State = state; Code = code; }
+        internal bool CanPersistPartialChanges { get; }
+        internal UpgradeWorldScheduleObservation(UpgradeWorldScheduleState state, string code, bool canPersistPartialChanges = false)
+        { State = state; Code = code; CanPersistPartialChanges = canPersistPartialChanges; }
     }
     internal sealed class UpgradeWorldScheduleBridge : IDisposable
     {
         internal static bool Available, Allowed, Idle;
+        internal static bool ObserverCleanupFailed, FailCleanup;
         internal static string FailureCode = "uw_unavailable";
         internal static readonly List<string> Begun = new();
+        internal static readonly HashSet<string> Unsupported = new();
         internal static UpgradeWorldScheduleObservation Observation;
         internal static Action? BeforeBegin;
-        internal static int Disposals;
+        internal static int Disposals, TimeoutMarks;
         internal static void Reset()
         {
             Available = Allowed = Idle = true; Begun.Clear(); BeforeBegin = null; Disposals = 0;
             FailureCode = "uw_unavailable";
+            Unsupported.Clear(); TimeoutMarks = 0;
+            ObserverCleanupFailed = FailCleanup = false;
             Observation = new(UpgradeWorldScheduleState.Pending, "uw_pending");
         }
         internal static bool IsMaintenanceCommand(string command) => UpgradeWorldScheduleCommands.IsMaintenance(command);
         internal static bool TryCreate(out UpgradeWorldScheduleBridge? bridge, out string code)
         { bridge = Available ? new UpgradeWorldScheduleBridge() : null; code = Available ? "uw_ready" : FailureCode; return Available; }
+        internal bool SupportsCommand(string command, out string code)
+        { bool supported = !Unsupported.Contains(command.Split(' ')[0]); code = supported ? "uw_available" : "uw_unsupported_contract"; return supported; }
+        internal void MarkTimedOut() => ++TimeoutMarks;
         internal bool TryGetIdle(out bool idle, out string code)
         { idle = Idle; code = "uw_idle"; return true; }
         internal bool CanRun(out string code)
@@ -1124,7 +1234,7 @@ namespace ServerManager
                 ? new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed") : Observation;
         }
         internal UpgradeWorldScheduleObservation Poll() => Observation;
-        public void Dispose() => ++Disposals;
+        public void Dispose() { ++Disposals; ObserverCleanupFailed |= FailCleanup; }
     }
     internal static class IntegrityCanonical
     { internal static bool IsFatal(Exception value) => value is OutOfMemoryException || value is StackOverflowException || value is AccessViolationException; }

@@ -176,6 +176,8 @@
         <None Include="Tests\ValheavenNativeLoaderSmoke.ps1"/>
         <None Include="Tests\PlayerLocalizationSmoke.ps1"/>
         <None Include="Tests\AdminStatCapSmoke.ps1"/>
+        <None Include="Tests\SeedCommandPermissionsSmoke.ps1"/>
+        <None Include="Tests\SeedCommandPermissionsSmoke.cs"/>
         <None Include="Tests\CecilControlFlow.ps1"/>
         <None Include="Tests\CecilControlFlowSmoke.ps1"/>
         <None Include="Tests\Valheim107Fixtures.ps1"/>

@@ -401,6 +401,29 @@ Assert-True ($null -ne $enqueueCall -and $null -ne $entitlementCall) `
     "The admin command-report path changed."
 Assert-True ($enqueueCall.Offset -lt $entitlementCall.Offset) `
     "Admin commands can bypass reporting before server revalidation."
+$seedPermissionCall = $guardPrefixCalls |
+    Where-Object {
+        $_.Operand.Name -eq "IsSeedCommand" -and
+        $_.Operand.DeclaringType.FullName -eq "ServerManager.ClientCommandPermissions"
+    } |
+    Select-Object -First 1
+Assert-True ($null -ne $seedPermissionCall -and
+    -not (Test-CecilReachable $guardPrefixDefinition.Body.Instructions[0] `
+        $enqueueCall @($seedPermissionCall))) `
+    "The cheat guard can enqueue printseeds before checking its separate permission boundary."
+$seedPermissionBranch = Get-FirstConditionalBranch $seedPermissionCall $enqueueCall
+Assert-True ($null -ne $seedPermissionBranch -and
+    $seedPermissionBranch.OpCode.Name -in @('brfalse', 'brfalse.s', 'brtrue', 'brtrue.s')) `
+    "The printseeds exclusion no longer has a direct Boolean branch."
+$seedMatchedPath = if ($seedPermissionBranch.OpCode.Name.StartsWith('brtrue')) {
+    $seedPermissionBranch.Operand
+} else { $seedPermissionBranch.Next }
+$otherCommandPath = if ($seedPermissionBranch.OpCode.Name.StartsWith('brtrue')) {
+    $seedPermissionBranch.Next
+} else { $seedPermissionBranch.Operand }
+Assert-True (-not (Test-CecilReachable $seedMatchedPath $enqueueCall) -and
+    (Test-CecilReachable $otherCommandPath $enqueueCall)) `
+    "Matching printseeds can become cheat evidence, or unrelated cheat commands skip reporting."
 
 $runtimeDefinition = $pluginDefinition.MainModule.Types |
     Where-Object FullName -eq "ServerManager.ServerManagerRuntime"
@@ -1998,6 +2021,33 @@ Assert-True (
         $refreshTimestampSetCall.Offset) `
     "The server entitlement trust checks or send ordering changed."
 
+# Admin membership is also used by ordinary permission-restricted commands.
+# Its authenticated status must be sent even when the cheat/stat bypass policy
+# is disabled; that policy may gate only the downstream numeric side effects.
+$refreshAdminPolicyCalls = @($refreshEntitlementCalls |
+    Where-Object { $_.Operand.Name -eq "get_AllowAdminCheatCommands" })
+Assert-True ($refreshAdminPolicyCalls.Count -gt 0 -and
+    @($refreshAdminPolicyCalls | Where-Object {
+        $_.Offset -lt $refreshAdminCall.Offset
+    }).Count -eq 0) `
+    "The cheat bypass policy prevents raw server admin membership from being evaluated."
+foreach ($refreshAdminPolicyCall in $refreshAdminPolicyCalls) {
+    $refreshAdminPolicyBranch = Get-FirstConditionalBranch `
+        $refreshAdminPolicyCall $refreshConstructorCall
+    Assert-True ($null -ne $refreshAdminPolicyBranch -and
+        (Test-CecilReachable $refreshAdminPolicyBranch.Operand $refreshConstructorCall) -and
+        (Test-CecilReachable $refreshAdminPolicyBranch.Next $refreshConstructorCall)) `
+        "Raw admin status cannot be issued with both enabled and disabled cheat bypass policies."
+}
+$periodicEntitlementDefinition = $runtimeDefinition.Methods |
+    Where-Object Name -eq "RefreshAdminCommandEntitlements"
+Assert-True (@($periodicEntitlementDefinition.Body.Instructions |
+    Where-Object {
+        $_.Operand -is [Mono.Cecil.MethodReference] -and
+        $_.Operand.Name -eq "get_AllowAdminCheatCommands"
+    }).Count -eq 0) `
+    "A disabled cheat bypass policy suppresses periodic raw admin status updates."
+
 foreach ($serverGrantGuard in @(
     $refreshActivePeerCall,
     $refreshAdminCall)) {
@@ -2232,6 +2282,9 @@ Assert-True (
     $canReleaseWorldCall.Offset -lt $releaseBufferCall.Offset -and
     $releaseBufferCall.Offset -lt $initialEntitlementCall.Offset) `
     "The initial admin entitlement no longer follows world-buffer release."
+Assert-True (@($releaseWorldCalls |
+    Where-Object { $_.Operand.Name -eq "get_AllowAdminCheatCommands" }).Count -eq 0) `
+    "A disabled cheat bypass policy suppresses initial raw admin status delivery."
 
 $cleanupPeerDefinition = $runtimeDefinition.Methods |
     Where-Object Name -eq "CleanupPeer"
@@ -4966,9 +5019,18 @@ $applyAdminEntitlement = $commandGuardType.GetMethod(
 $hasActiveAdminEntitlement = $commandGuardType.GetMethod(
     "HasActiveAdminEntitlement",
     $staticNonPublic)
-$adminEntitlementExpiryField = $commandGuardType.GetField(
+$commandPermissionsType = $pluginAssembly.GetType(
+    "ServerManager.ClientCommandPermissions",
+    $true)
+$hasActiveAdminStatus = $commandPermissionsType.GetMethod(
+    "HasActiveAdminStatus",
+    $staticNonPublic)
+$adminEntitlementExpiryField = $commandPermissionsType.GetField(
     "_adminEntitlementExpiryTimestamp",
     $staticNonPublic)
+Assert-True ($null -ne $hasActiveAdminStatus -and
+    $null -ne $adminEntitlementExpiryField) `
+    "The independent server-confirmed admin status cache is missing."
 $shouldAllowCommand = $commandGuardType.GetMethod(
     "ShouldAllowExecution",
     $staticNonPublic)
@@ -5003,12 +5065,16 @@ $applyAdminEntitlement.Invoke(
 Assert-True ($hasActiveAdminEntitlement.Invoke(
     $null,
     $null)) "A valid server admin entitlement was not activated."
+Assert-True ($hasActiveAdminStatus.Invoke($null, $null)) `
+    "A valid server admin entitlement did not activate raw admin status."
 $adminEntitlementExpiryField.SetValue(
     $null,
     [Diagnostics.Stopwatch]::GetTimestamp() - 1)
 Assert-True (-not $hasActiveAdminEntitlement.Invoke(
     $null,
     $null)) "An expired server admin entitlement remained active."
+Assert-True (-not $hasActiveAdminStatus.Invoke($null, $null)) `
+    "Expired server admin status remained active for ordinary command permissions."
 $applyAdminEntitlement.Invoke(
     $null,
     [object[]]@($true, 1000))
@@ -5018,6 +5084,8 @@ $applyAdminEntitlement.Invoke(
 Assert-True (-not $hasActiveAdminEntitlement.Invoke(
     $null,
     $null)) "A server admin revocation did not clear local execution."
+Assert-True (-not $hasActiveAdminStatus.Invoke($null, $null)) `
+    "Server admin revocation did not clear ordinary command permissions."
 $configureCommand.Invoke(
     $null,
     [object[]]@($true, $true, $false))
@@ -5026,10 +5094,28 @@ $applyAdminEntitlement.Invoke(
     [object[]]@($true, 1000))
 Assert-True (-not $hasActiveAdminEntitlement.Invoke(
     $null,
-    $null)) "A disabled policy accepted a server admin entitlement."
+    $null)) "Raw admin status granted cheat execution despite a disabled bypass policy."
+Assert-True ($hasActiveAdminStatus.Invoke($null, $null)) `
+    "A disabled cheat bypass policy discarded independent server-confirmed admin status."
+Assert-True (-not $shouldAllowCommand.Invoke(
+    $null,
+    [object[]]@($true, $true, $false, $hasActiveAdminStatus.Invoke($null, $null)))) `
+    "Raw admin status bypassed the disabled cheat policy at the execution decision."
 $configureCommand.Invoke(
     $null,
     [object[]]@($true, $true, $true))
+Assert-True (-not $hasActiveAdminStatus.Invoke($null, $null) -and
+    -not $hasActiveAdminEntitlement.Invoke($null, $null)) `
+    "A new managed session inherited an earlier server admin status."
+$applyAdminEntitlement.Invoke($null, [object[]]@($true, 1000))
+$resetCommand.Invoke($null, $null)
+Assert-True (-not $hasActiveAdminStatus.Invoke($null, $null) -and
+    -not $hasActiveAdminEntitlement.Invoke($null, $null)) `
+    "Disconnect cleanup retained raw server admin status or cheat entitlement."
+$applyAdminEntitlement.Invoke($null, [object[]]@($true, 1000))
+Assert-True (-not $hasActiveAdminStatus.Invoke($null, $null)) `
+    "A grant applied after disconnect revived an inactive managed session."
+$configureCommand.Invoke($null, [object[]]@($true, $true, $true))
 
 for ($attempt = 0; $attempt -lt 3; ++$attempt) {
     Assert-True ($enqueueCommand.Invoke(

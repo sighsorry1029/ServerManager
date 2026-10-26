@@ -1146,6 +1146,23 @@ namespace ServerManager.Events
                     int.TryParse(rawCount, NumberStyles.None, CultureInfo.InvariantCulture, out int count) &&
                     count >= 1 && count <= 16 && rawCount == count.ToString(CultureInfo.InvariantCulture))
                     fields["cron_command_count"] = rawCount;
+                if (action == "maintenance" && data.TryGetValue("cron_failure_code", out string failure) && failure == "uw_partial_failure")
+                {
+                    fields["cron_failure_code"] = failure;
+                    if (data.TryGetValue("cron_partial_changes", out string persisted) &&
+                        (persisted == "persisted" || persisted == "not_confirmed"))
+                        fields["cron_partial_changes"] = persisted;
+                    if (data.TryGetValue("cron_save_result", out string saveResult) && saveResult.Length > 0 &&
+                        saveResult.Length <= 64 && SafeToken(saveResult, 64) == saveResult)
+                        fields["cron_save_result"] = saveResult;
+                    // The text audit renders message, not the structured fields.
+                    if (fields.TryGetValue("message", out string message))
+                    {
+                        foreach (string key in new[] { "cron_failure_code", "cron_partial_changes", "cron_save_result" })
+                            if (fields.TryGetValue(key, out string value)) message += "; " + key + "=" + value;
+                        fields["message"] = message;
+                    }
+                }
             }
             if (action == "giveitem" && data != null && data.TryGetValue("data_id", out string dataId) &&
                 global::ServerManager.Commands.ServerCommands.IsItemDataId(dataId))

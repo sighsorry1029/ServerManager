@@ -19,6 +19,31 @@ internal static class UpgradeWorldScheduleSmoke
             BepInEx.Bootstrap.Chainloader.PluginInfos["upgrade_world"] = new();
             var plugin = BepInEx.Bootstrap.Chainloader.PluginInfos["upgrade_world"];
             plugin.Metadata.Version = new Version(1, 82);
+#if UW_BAD_CORE
+            Check(!UpgradeWorldScheduleBridge.TryCreate(out _, out string unsupported) && unsupported == "uw_unsupported_contract", "Old Init(bool) contract rejected by signature, not version");
+            Check(HarmonyLib.Harmony.Patched.Count == 0, "Invalid shared contract installs no hooks");
+            Check(ServerManagerPlugin.Log.Warnings.Any(message => message.Contains("Init") && message.Contains("expected") && message.Contains("actual") && message.Contains("MVID=")), "Concrete diagnostic identifies expected/actual member and DLL");
+            int warnings = ServerManagerPlugin.Log.Warnings.Count;
+            Check(!UpgradeWorldScheduleBridge.TryCreate(out _, out _), "Repeated invalid contract still rejected");
+            Check(ServerManagerPlugin.Log.Warnings.Count == warnings, "Repeated contract failure logged once");
+            Console.WriteLine("PASS: unsupported shared contract " + _checks + " assertions.");
+            return 0;
+#elif UW_BAD_CLEAN
+            Check(UpgradeWorldScheduleBridge.TryCreate(out var capabilityBridge, out _), "Unrelated bad Clean signature leaves shared tracking available");
+            using (capabilityBridge!)
+            {
+                Check(capabilityBridge!.SupportsCommand("zones_generate start", out _), "Generate capability remains supported");
+                Check(capabilityBridge.SupportsCommand("clean_objects", out _), "Other clean capability remains supported");
+                Check(!capabilityBridge.SupportsCommand("world_clean", out string unavailable) && unavailable == "uw_unsupported_contract", "World-clean capability reports exact unsupported contract");
+                Check(!capabilityBridge.SupportsCommand("clean_duplicates", out _), "Bad command cannot dispatch through tracked path");
+                Check(capabilityBridge.Begin("clean_duplicates", () => throw new Exception("Must not dispatch")).Code == "uw_unsupported_contract", "Unsupported capability refuses before mutation");
+                Check(ServerManagerPlugin.Log.Warnings.Any(message => message.Contains("CleanDuplicates") && message.Contains("expected") && message.Contains("actual")), "Capability diagnostic names bad constructor");
+                Normal(capabilityBridge);
+            }
+            Check(HarmonyLib.Harmony.Patched.Count == 0, "Partial capability observer cleans up own hooks");
+            Console.WriteLine("PASS: isolated command capability " + _checks + " assertions.");
+            return 0;
+#else
             Check(UpgradeWorldScheduleBridge.TryCreate(out var bridge, out _), "Compatible contract accepted regardless of plugin version");
             using (bridge!)
             {
@@ -41,12 +66,20 @@ internal static class UpgradeWorldScheduleSmoke
                 Normal(bridge); FailedCounter(bridge); NestedException(bridge); SwallowedStart(bridge);
                 ManualStop(bridge); MissingLocation(bridge); ForeignOperation(bridge); NotAdmitted(bridge); Clean(bridge);
                 Composite(bridge); AllReviewedShapes(bridge); EntityNoOp(bridge); Immediate(bridge); GeneralizedFailures(bridge); ForeignInspection(bridge);
+                CurrentLifecycleFailures(bridge); PartialCompletion(bridge); EndProof(bridge); TimeoutWaits(bridge); HookIntegrity(bridge);
                 Retire(bridge);
             }
             Check(HarmonyLib.Harmony.Patched.Count == 0, "Observers removed on dispose");
             Check(UpgradeWorld.Executor.StopCalls == 0, "Adapter never stops UW work");
+            HarmonyLib.Harmony.FailAfter = 3;
+            Check(!UpgradeWorldScheduleBridge.TryCreate(out _, out string failedPatch) && failedPatch == "uw_unsupported_contract", "Partial hook installation failure is unsupported");
+            Check(HarmonyLib.Harmony.Patched.Count == 0 && !UpgradeWorldScheduleBridge.ObserverCleanupFailed, "Partial installation removes only this observer's hooks");
+            HarmonyLib.Harmony.FailAfter = -1;
+            Check(UpgradeWorldScheduleBridge.TryCreate(out var recovered, out _), "Cleanly failed installation does not strand observer ownership");
+            recovered!.Dispose();
             Console.WriteLine("PASS: Upgrade World bridge " + _checks + " assertions (source-linked iterator/lifecycle tests; no world mutation).");
             return 0;
+#endif
         }
         catch (Exception exception) { Console.Error.WriteLine(exception); return 1; }
     }
@@ -57,9 +90,17 @@ internal static class UpgradeWorldScheduleSmoke
     {
         Hook("BeforeAdd", operation); Hook("AfterInit", operation, true);
         UpgradeWorld.Executor.Work.Add(operation); UpgradeWorld.Executor.Busy = new UnityEngine.Coroutine();
-        object?[] arguments = { operation, body };
+        object?[] arguments = { operation, CompleteLifecycle(operation, body) };
         Hook("AfterExecute", arguments);
         return (IEnumerator)arguments[1]!;
+    }
+    private static IEnumerator CompleteLifecycle(UpgradeWorld.ExecutedOperation operation, IEnumerator body)
+    {
+        yield return body;
+        object?[] state = { operation, 0 };
+        Hook("BeforeOperationEnd", state);
+        Hook("AfterOperationEnd", operation, state[1], true);
+        Hook("FinalizeOperationEnd", operation, null, state[1]);
     }
     private static IEnumerable<object?> Nested()
     { yield return One().GetEnumerator(); yield return null; }
@@ -149,13 +190,26 @@ internal static class UpgradeWorldScheduleSmoke
     }
     private static void Clean(UpgradeWorldScheduleBridge bridge)
     {
-        Check(bridge.Begin("world_clean", () => Success).Code == "uw_synchronous_unconfirmed", "World cleaned text alone insufficient");
-        Check(bridge.Begin("world_clean", () =>
+        Check(bridge.Begin("world_clean", () => Success).Code == "uw_start_required", "Current queued cleanup requires explicit start");
+        Check(bridge.Begin("world_clean start", () => Success).Code == "uw_operation_not_admitted", "World cleaned text alone insufficient");
+        IEnumerator? iterator = null;
+        var names = new[] { "CleanDuplicates", "CleanLocations", "CleanObjects", "CleanChests", "CleanStands", "CleanDungeons", "CleanSpawns", "CleanHealth" };
+        Check(bridge.Begin("world_clean start", () =>
         {
-            foreach (var name in new[] { "CleanDuplicates", "CleanLocations", "CleanObjects", "CleanChests", "CleanStands", "CleanDungeons", "CleanSpawns", "CleanHealth" })
-                Hook("AfterImmediate", System.Runtime.Serialization.FormatterServices.GetUninitializedObject(typeof(UpgradeWorld.CleanDuplicates).Assembly.GetType("UpgradeWorld." + name)!));
+            iterator = Track(new UpgradeWorld.QueuedOperation(), ConstructorBody(names).GetEnumerator());
             return Success;
-        }).State == UpgradeWorldScheduleState.Succeeded, "All synchronous cleanup components confirmed");
+        }).State == UpgradeWorldScheduleState.Pending, "Cleanup constructor callbacks may run after dispatch");
+        Drain(iterator!); Empty();
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Succeeded, "Queued cleanup and every constructor completed");
+        bridge.Begin("world_clean start", () => { iterator = Track(new UpgradeWorld.QueuedOperation(), ConstructorBody(names.Take(7)).GetEnumerator()); return Success; });
+        Drain(iterator!); Empty();
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Indeterminate, "Queued wrapper alone cannot certify missing cleanup component");
+    }
+    private static IEnumerable<object?> ConstructorBody(IEnumerable<string> names)
+    {
+        yield return null;
+        foreach (string name in names)
+            Hook("AfterImmediate", System.Runtime.Serialization.FormatterServices.GetUninitializedObject(typeof(UpgradeWorld.UpgradeWorld).Assembly.GetType("UpgradeWorld." + name)!));
     }
     private static void Composite(UpgradeWorldScheduleBridge bridge)
     {
@@ -187,6 +241,15 @@ internal static class UpgradeWorldScheduleSmoke
         BepInEx.Bootstrap.Chainloader.PluginInfos["nickpappas.locationplacementaccelerator"] = new();
         Check(bridge.Begin("locations_add start", () => throw new Exception()).Code == "uw_lpa_unverified", "Unknown optional placement contract refused before mutation");
         BepInEx.Bootstrap.Chainloader.PluginInfos.Remove("nickpappas.locationplacementaccelerator");
+        foreach (string value in new[] { "false", "0", "no", "off" })
+        {
+            IEnumerator? iterator = null;
+            bridge.Begin("locations_add explored=" + value + " start", () => { iterator = Track(new UpgradeWorld.DistributeLocations(), One().GetEnumerator()); return Success; });
+            Drain(iterator!); Empty();
+            Check(bridge.Poll().State == UpgradeWorldScheduleState.Succeeded, "Unexplored-only add has no SpawnLocations: " + value);
+        }
+        bridge.Begin("locations_add explored=false explored=true start", () => { Track(new UpgradeWorld.DistributeLocations(), One().GetEnumerator()); return Success; });
+        Check(bridge.Poll().Code == "uw_operation_not_admitted", "Last explored assignment restores required spawn stage"); Empty();
     }
     private static void EntityNoOp(UpgradeWorldScheduleBridge bridge)
     {
@@ -200,6 +263,7 @@ internal static class UpgradeWorldScheduleSmoke
     private static void AllReviewedShapes(UpgradeWorldScheduleBridge bridge)
     {
         var queued = (Dictionary<string, string[]>)typeof(UpgradeWorldScheduleBridge).GetField("Queued", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+        var synchronous = (Dictionary<string, string[]>)typeof(UpgradeWorldScheduleBridge).GetField("Constructors", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
         var recipes = (Dictionary<string, string[][]>)typeof(UpgradeWorldScheduleBridge).GetField("UpgradeSequences", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
         var shapes = queued.Select(pair => (pair.Key + (pair.Key == "temple_gen" || pair.Key == "world_gen" ? " mistlands start" : " start"), pair.Value))
             .Concat(recipes.SelectMany(pair => pair.Value.Select(sequence => ("upgrade " + pair.Key + " start", sequence))));
@@ -211,7 +275,9 @@ internal static class UpgradeWorldScheduleSmoke
                 foreach (string name in shape.Item2)
                 {
                     var operation = (UpgradeWorld.ExecutedOperation)Activator.CreateInstance(typeof(UpgradeWorld.UpgradeWorld).Assembly.GetType("UpgradeWorld." + name)!)!;
-                    iterators.Add(Track(operation, One().GetEnumerator()));
+                    IEnumerator body = synchronous.TryGetValue(shape.Item1.Split(' ')[0], out string[] constructors)
+                        ? ConstructorBody(constructors).GetEnumerator() : One().GetEnumerator();
+                    iterators.Add(Track(operation, body));
                 }
                 return Success;
             }).State == UpgradeWorldScheduleState.Pending, "Reviewed exact queue shape admitted: " + shape.Item1);
@@ -219,8 +285,7 @@ internal static class UpgradeWorldScheduleSmoke
             Hook("BeforeStop"); UpgradeWorld.Executor.Busy = null;
             Check(bridge.Poll().State == UpgradeWorldScheduleState.Succeeded, "Reviewed queue shape completed: " + shape.Item1);
         }
-        var synchronous = (Dictionary<string, string[]>)typeof(UpgradeWorldScheduleBridge).GetField("Immediate", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
-        foreach (var pair in synchronous)
+        foreach (var pair in synchronous.Where(pair => !queued.ContainsKey(pair.Key)))
             Check(bridge.Begin(pair.Key, () =>
             {
                 foreach (string name in pair.Value)
@@ -230,7 +295,7 @@ internal static class UpgradeWorldScheduleSmoke
     }
     private static void Immediate(UpgradeWorldScheduleBridge bridge)
     {
-        foreach (var pair in new[] { ("clean_objects", "CleanObjects"), ("locations_fix", "FixLocations"),
+        foreach (var pair in new[] { ("locations_fix", "FixLocations"),
             ("locations_swap Crypt1 Crypt2", "SwapLocations"), ("location_register Crypt1 pos=0,0,0", "RegisterLocation"),
             ("time_change 100", "ChangeTime"), ("time_set 100", "SetTime") })
         {
@@ -297,6 +362,112 @@ internal static class UpgradeWorldScheduleSmoke
         Drain(iterator!); Empty();
         Check(bridge.Poll().Code == "uw_foreign_inspection", "GetInfo reinitialization cannot later become successful completion");
     }
+    private static void CurrentLifecycleFailures(UpgradeWorldScheduleBridge bridge)
+    {
+        var operation = new UpgradeWorld.Generate(); IEnumerator? iterator = null;
+        bridge.Begin("zones_generate start", () => { iterator = Track(operation, One().GetEnumerator()); return Success; });
+        operation.ExecutionFailed = true;
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Pending, "Internally caught exception does not imply UW idle");
+        Drain(iterator!); Empty();
+        var result = bridge.Poll();
+        Check(result.State == UpgradeWorldScheduleState.Failed && result.Code == "uw_execution_exception" && !result.CanPersistPartialChanges,
+            "ExecutionFailed defeats normal root exhaustion and empty queue");
+
+        operation = new UpgradeWorld.Generate();
+        bridge.Begin("zones_generate start", () =>
+        {
+            iterator = Track(operation, One().GetEnumerator());
+            Hook("BeforePrintedMessage", "Operation failed: nested iterator error. Changes already made are not rolled back.");
+            return Success;
+        });
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Pending, "Reported execution fault keeps observation until idle");
+        Drain(iterator!); Empty();
+        Check(bridge.Poll().Code == "uw_execution_exception", "Reviewed exception report is not generic success output");
+    }
+    private static void PartialCompletion(UpgradeWorldScheduleBridge bridge)
+    {
+        var operation = new UpgradeWorld.Generate(); IEnumerator? iterator = null;
+        bridge.Begin("zones_generate start", () => { iterator = Track(operation, Nested().GetEnumerator()); return Success; });
+        operation.SetFailed(2);
+        var pending = bridge.Poll();
+        Check(pending.State == UpgradeWorldScheduleState.Pending && pending.Code == "uw_partial_failure" && !pending.CanPersistPartialChanges,
+            "Skipped zones remain pending while later zones execute");
+        Drain(iterator!);
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Pending, "Partial result still waits for executor drain");
+        UpgradeWorld.Executor.Work.Clear(); Hook("BeforeStop"); UpgradeWorld.Executor.Busy = null;
+        var result = bridge.Poll();
+        Check(result.State == UpgradeWorldScheduleState.Failed && result.Code == "uw_partial_failure" && result.CanPersistPartialChanges,
+            "Only fully ended, idle, sole partial failures permit preservation save");
+
+        foreach (string lateFault in new[] { "exception", "cancel", "foreign", "timeout" })
+        {
+            operation = new UpgradeWorld.Generate();
+            bridge.Begin("zones_generate start", () => { iterator = Track(operation, One().GetEnumerator()); return Success; });
+            operation.SetFailed(1); bridge.Poll();
+            if (lateFault == "exception") operation.ExecutionFailed = true;
+            else if (lateFault == "cancel") Hook("BeforeStop");
+            else if (lateFault == "foreign") Hook("BeforeAdd", new UpgradeWorld.Generate());
+            else bridge.MarkTimedOut();
+            Check(bridge.Poll().State == UpgradeWorldScheduleState.Pending, "Late " + lateFault + " keeps ownership until idle");
+            Drain(iterator!); Empty(); result = bridge.Poll();
+            Check(result.State != UpgradeWorldScheduleState.Succeeded && !result.CanPersistPartialChanges && result.Code != "uw_partial_failure",
+                "Late " + lateFault + " revokes partial-save eligibility");
+        }
+    }
+    private static void EndProof(UpgradeWorldScheduleBridge bridge)
+    {
+        var operation = new UpgradeWorld.Generate(); IEnumerator? iterator = null;
+        bridge.Begin("zones_generate start", () =>
+        {
+            Hook("BeforeAdd", operation); Hook("AfterInit", operation, true);
+            UpgradeWorld.Executor.Work.Add(operation); UpgradeWorld.Executor.Busy = new UnityEngine.Coroutine();
+            object?[] args = { operation, One().GetEnumerator() }; Hook("AfterExecute", args); iterator = (IEnumerator)args[1]!;
+            return Success;
+        });
+        Drain(iterator!); Empty();
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Indeterminate, "Root exhaustion without successful OnEnd is not completion");
+        operation = new UpgradeWorld.Generate();
+        bridge.Begin("zones_generate start", () => { iterator = Track(operation, One().GetEnumerator()); return Success; });
+        object?[] ending = { operation, 0 }; Hook("BeforeOperationEnd", ending);
+        Hook("AfterOperationEnd", operation, ending[1], false);
+        Hook("FinalizeOperationEnd", operation, null, ending[1]);
+        Drain(iterator!); Empty();
+        Check(bridge.Poll().Code == "uw_completion_skipped", "Other patch skipping OnEnd cannot certify completion");
+
+        operation = new UpgradeWorld.Generate();
+        bridge.Begin("zones_generate start", () =>
+        {
+            Hook("BeforeAdd", operation); Hook("AfterInit", operation, true);
+            object?[] outer = { operation, 0 }; object?[] inner = { operation, 0 };
+            Hook("BeforeOperationEnd", outer); Hook("BeforeOperationEnd", inner);
+            Hook("AfterOperationEnd", operation, inner[1], true);
+            Hook("FinalizeOperationEnd", operation, null, inner[1]);
+            Hook("AfterOperationEnd", operation, outer[1], true);
+            Hook("FinalizeOperationEnd", operation, null, outer[1]);
+            UpgradeWorld.Executor.Work.Add(operation); UpgradeWorld.Executor.Busy = new UnityEngine.Coroutine();
+            object?[] args = { operation, One().GetEnumerator() }; Hook("AfterExecute", args); iterator = (IEnumerator)args[1]!;
+            return Success;
+        });
+        Drain(iterator!); Empty();
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Succeeded, "Derived-to-base OnEnd nesting is one completion");
+    }
+    private static void TimeoutWaits(UpgradeWorldScheduleBridge bridge)
+    {
+        IEnumerator? iterator = null;
+        bridge.Begin("zones_generate start", () => { iterator = Track(new UpgradeWorld.Generate(), One().GetEnumerator()); return Success; });
+        bridge.MarkTimedOut();
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Pending && UpgradeWorld.Executor.StopCalls == 0, "Timeout does not stop work or release ownership");
+        Drain(iterator!); Empty();
+        Check(bridge.Poll().State == UpgradeWorldScheduleState.Indeterminate && bridge.Poll().Code == "uw_unconfirmed", "Late completion remains review-required after timeout");
+    }
+    private static void HookIntegrity(UpgradeWorldScheduleBridge bridge)
+    {
+        HarmonyLib.Harmony.TemporarilyMissingHooks = true;
+        Check(!bridge.SupportsCommand("zones_generate start", out string code) && code == "uw_observer_hooks_changed", "Removed observation hooks detected before dispatch");
+        Check(bridge.Begin("zones_generate start", () => throw new Exception("Must not dispatch")).Code == "uw_observer_hooks_changed", "Begin rechecks own hooks before mutation");
+        HarmonyLib.Harmony.TemporarilyMissingHooks = false;
+        Normal(bridge);
+    }
     private static void Retire(UpgradeWorldScheduleBridge bridge)
     {
         IEnumerator? iterator = null;
@@ -310,12 +481,30 @@ internal static class UpgradeWorldScheduleSmoke
 namespace HarmonyLib
 {
     public sealed class HarmonyMethod { public readonly MethodInfo Method; public HarmonyMethod(Type type, string name) => Method = type.GetMethod(name, BindingFlags.Static | BindingFlags.NonPublic)!; }
+    public sealed class Patch { public string owner = ""; public MethodInfo PatchMethod = null!; }
+    public sealed class Patches
+    {
+        public readonly List<Patch> Prefixes = new(), Postfixes = new(), Finalizers = new();
+    }
     public sealed class Harmony
     {
         public static readonly List<MethodBase> Patched = new();
-        public Harmony(string id) { }
-        public void Patch(MethodBase original, HarmonyMethod? prefix = null, HarmonyMethod? postfix = null, HarmonyMethod? transpiler = null, HarmonyMethod? finalizer = null) => Patched.Add(original);
-        public void UnpatchSelf() => Patched.Clear();
+        private static readonly Dictionary<MethodBase, Patches> Details = new();
+        public static int FailAfter = -1;
+        public static bool TemporarilyMissingHooks;
+        public string Id { get; }
+        public Harmony(string id) { Id = id; }
+        public static Patches? GetPatchInfo(MethodBase target) => TemporarilyMissingHooks ? null : Details.TryGetValue(target, out var patches) ? patches : null;
+        public void Patch(MethodBase original, HarmonyMethod? prefix = null, HarmonyMethod? postfix = null, HarmonyMethod? transpiler = null, HarmonyMethod? finalizer = null)
+        {
+            if (FailAfter >= 0 && Patched.Count >= FailAfter) throw new InvalidOperationException("Injected patch failure");
+            Patched.Add(original);
+            if (!Details.TryGetValue(original, out var details)) Details[original] = details = new();
+            if (prefix != null) details.Prefixes.Add(new Patch { owner = Id, PatchMethod = prefix.Method });
+            if (postfix != null) details.Postfixes.Add(new Patch { owner = Id, PatchMethod = postfix.Method });
+            if (finalizer != null) details.Finalizers.Add(new Patch { owner = Id, PatchMethod = finalizer.Method });
+        }
+        public void UnpatchSelf() { Patched.Clear(); Details.Clear(); }
     }
 }
 namespace BepInEx.Bootstrap
@@ -326,6 +515,16 @@ namespace BepInEx.Bootstrap
 }
 namespace ServerManager
 {
+    internal static class ServerManagerPlugin
+    {
+        internal const string ModVersion = "test";
+        internal static readonly TestLog Log = new();
+    }
+    internal sealed class TestLog
+    {
+        internal readonly List<string> Warnings = new();
+        internal void LogWarning(object message) => Warnings.Add(message.ToString()!);
+    }
     internal static class IntegrityCanonical { internal static bool IsFatal(Exception error) => error is OutOfMemoryException; }
     internal static class UpgradeWorldScheduleCommands
     {
@@ -350,7 +549,8 @@ namespace ServerManager.Events
 public class Terminal { }
 public class ZRpc { }
 public class ZDO { }
-public struct Vector2i { }
+public struct Vector2s { }
+public class Minimap { public enum PinType { Icon0 } }
 public class ZoneSystem { public struct LocationInstance { public bool m_placed; } }
 public class ZNet { public static ZNet? instance = new(); public bool Dedicated = true; public bool IsServer() => true; public bool IsDedicated() => Dedicated; }
 namespace UnityEngine { public class Coroutine { } public struct Vector3 { } }
@@ -375,7 +575,12 @@ namespace UpgradeWorld
     {
         protected int Failed;
         public void SetFailed(int value) => Failed = value;
-        public bool Init(bool autoStart) => true;
+        public bool ExecutionFailed { get; set; }
+#if UW_BAD_CORE
+        public bool Init(bool start) => true;
+#else
+        public bool Init() => true;
+#endif
         public IEnumerator Execute(Stopwatch sw) { yield return null; }
         protected virtual void OnStart() { }
         protected virtual string OnInit() => "Ready";
@@ -397,12 +602,13 @@ namespace UpgradeWorld
     public sealed class TempleVersion : ExecutedOperation { }
     public sealed class WorldVersion : ExecutedOperation { }
     public sealed class Print : ExecutedOperation { }
+    public sealed class QueuedOperation : ExecutedOperation { }
     public sealed class Generate : ExecutedOperation { }
     public sealed class RestoreZones : ExecutedOperation { }
     public class RegenerateLocations : ExecutedOperation
-    { protected bool ExecuteLocation(Vector2i zone, ZoneSystem.LocationInstance location) => true; }
+    { protected bool ExecuteLocation(Vector2s zone, ZoneSystem.LocationInstance location) => true; }
     public class SpawnLocations : ExecutedOperation
-    { protected bool ExecuteLocation(Vector2i zone, ZoneSystem.LocationInstance location) => true; }
+    { protected bool ExecuteLocation(Vector2s zone, ZoneSystem.LocationInstance location) => true; }
     public class FiltererParameters { }
     public class DataParameters { }
     public sealed class FixLocations { public FixLocations(Terminal context, FiltererParameters args) { } }
@@ -410,12 +616,16 @@ namespace UpgradeWorld
     public sealed class RegisterLocation { public RegisterLocation(Terminal context, string id, UnityEngine.Vector3 position) { } }
     public sealed class ChangeTime { public ChangeTime(Terminal context, double time) { } }
     public sealed class SetTime { public SetTime(Terminal context, double time) { } }
+#if UW_BAD_CLEAN
     public sealed class CleanDuplicates { public CleanDuplicates(Terminal context, bool pin, bool print) { } }
-    public sealed class CleanLocations { public CleanLocations(Terminal context, ZDO[] data, bool pin, bool print) { } }
-    public sealed class CleanObjects { public CleanObjects(Terminal context, ZDO[] data, bool pin, bool print) { } }
-    public sealed class CleanChests { public CleanChests(Terminal context, ZDO[] data, bool pin, bool print) { } }
-    public sealed class CleanStands { public CleanStands(Terminal context, ZDO[] data, bool pin, bool print) { } }
-    public sealed class CleanDungeons { public CleanDungeons(Terminal context, ZDO[] data, bool pin, bool print) { } }
-    public sealed class CleanSpawns { public CleanSpawns(Terminal context, ZDO[] data, bool pin, bool print) { } }
-    public sealed class CleanHealth { public CleanHealth(Terminal context, ZDO[] data, bool pin, bool print) { } }
+#else
+    public sealed class CleanDuplicates { public CleanDuplicates(Terminal context, Minimap.PinType? pin, bool print, FiltererParameters args) { } }
+#endif
+    public sealed class CleanLocations { public CleanLocations(Terminal context, ZDO[] data, Minimap.PinType? pin, bool print) { } }
+    public sealed class CleanObjects { public CleanObjects(Terminal context, ZDO[] data, Minimap.PinType? pin, bool print) { } }
+    public sealed class CleanChests { public CleanChests(Terminal context, ZDO[] data, Minimap.PinType? pin, bool print) { } }
+    public sealed class CleanStands { public CleanStands(Terminal context, ZDO[] data, Minimap.PinType? pin, bool print) { } }
+    public sealed class CleanDungeons { public CleanDungeons(Terminal context, ZDO[] data, Minimap.PinType? pin, bool print) { } }
+    public sealed class CleanSpawns { public CleanSpawns(Terminal context, ZDO[] data, Minimap.PinType? pin, bool print) { } }
+    public sealed class CleanHealth { public CleanHealth(Terminal context, ZDO[] data, Minimap.PinType? pin, bool print) { } }
 }

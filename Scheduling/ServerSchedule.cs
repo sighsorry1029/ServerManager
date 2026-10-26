@@ -56,7 +56,7 @@ jobs: []
 # jobs:
 #   - schedule: '35 5 * * *'
 #     commands:
-#       - world_clean
+#       - world_clean start
 #       - zones_reset safeZones=1 start
 #       - vegetation_reset rock4_copper,silvervein terrain=20 safeZones=0 start
 #       - locations_reset Hildir_crypt,Hildir_cave,Hildir_plainsfortress,SunkenCrypt4,Crypt2,Crypt3,Crypt4,MountainCave02,Mistlands_Giant1,Mistlands_Excavation1,Mistlands_DvergrTownEntrance1,Mistlands_DvergrTownEntrance2,Mistlands_DvergrBossEntrance1,CharredFortress force start
@@ -311,7 +311,7 @@ jobs: []
 
 internal enum UpgradeWorldCommandKind { None, QueuedMutation, ImmediateMutation, Query, Control, Unsupported }
 
-// Reviewed against Upgrade World 1.80's registered commands and execution paths.
+// Explicit scheduling policy; runtime contracts are validated by the adapter.
 // Classification is deliberately explicit: matching a prefix is not proof of a
 // command's ownership or completion semantics. The runtime also verifies the
 // registered handler belongs to the optional mod before dispatching it.
@@ -346,6 +346,9 @@ internal static class UpgradeWorldScheduleCommands
             case "locations_add": case "locations_remove": case "locations_reset":
             case "objects_edit": case "objects_refresh": case "objects_remove": case "objects_swap":
             case "world_reset":
+            case "world_clean":
+            case "clean_chests": case "clean_dungeons": case "clean_duplicates": case "clean_health":
+            case "clean_locations": case "clean_objects": case "clean_spawns": case "clean_stands":
             case "vegetation_add": case "vegetation_remove": case "vegetation_reset":
             case "zones_generate": case "zones_reset": case "zones_restore":
                 return UpgradeWorldCommandKind.QueuedMutation;
@@ -359,22 +362,19 @@ internal static class UpgradeWorldScheduleCommands
             case "world_gen":
                 return HasSingleVersion(commandLine, "legacy", "hh", "mistlands")
                     ? UpgradeWorldCommandKind.QueuedMutation : UpgradeWorldCommandKind.Unsupported;
-            case "world_clean":
-            case "clean_chests": case "clean_dungeons": case "clean_duplicates": case "clean_health":
-            case "clean_locations": case "clean_objects": case "clean_spawns": case "clean_stands":
             case "location_register": case "locations_fix": case "locations_swap":
             case "time_change": case "time_change_day": case "time_set": case "time_set_day":
                 return UpgradeWorldCommandKind.ImmediateMutation;
             case "biomes_count": case "chests_search": case "locations_count": case "locations_list":
             case "objects_count": case "objects_list":
                 return UpgradeWorldCommandKind.Query;
-            // GetInfo invokes OnInit again in 1.80, changing a live operation's
-            // filtered targets/counters. This is not a harmless status query.
+            // Queue inspection/control remains manual-only in this scheduler.
+            // UW 1.87 GetInfo is cached; this is policy, not a mutation claim.
             case "uw_check":
             case "start": case "stop": case "save_disable": case "save_enable": case "verbose":
                 return UpgradeWorldCommandKind.Control;
             case "location_unregister":
-                // 1.80 prints a removal without removing the registration.
+                // The reviewed implementation reports removal without unregistering it.
                 return UpgradeWorldCommandKind.Unsupported;
             default:
                 return UpgradeWorldCommandKind.None;
@@ -387,7 +387,7 @@ internal static class UpgradeWorldScheduleCommands
         foreach (string word in commandLine.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Skip(1))
         {
             string value = word.Trim('\'', '"').ToLowerInvariant();
-            // 1.80's onions branch constructs a reset but never enqueues it.
+            // The reviewed onions recipe constructs a reset but never enqueues it.
             if (value == "onions") return "";
             if (!UpgradeTypes.Contains(value)) continue;
             if (selected.Length != 0) return "";

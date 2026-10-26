@@ -115,6 +115,13 @@ try {
     $korean = Parse-TranslationYaml (Read-TranslationResource 'Korean')
     Assert-True ($english.Count -gt 0 -and $english.Count -eq $korean.Count) 'Embedded translation tables are empty or have different key counts.'
     Assert-True ((@($english.Keys | Sort-Object) -join '|') -ceq (@($korean.Keys | Sort-Object) -join '|')) 'English and Korean localization key sets diverged.'
+    foreach ($language in @('English', 'Korean')) {
+        $messages = if ($language -eq 'English') { $english } else { $korean }
+        Assert-True ($messages.ContainsKey('sm_command_admin_required') -and
+            -not [string]::IsNullOrWhiteSpace($messages['sm_command_admin_required']) -and
+            (Localized $language 'sm_command_admin_required') -ceq $messages['sm_command_admin_required']) `
+            ('The administrator permission message is missing or not localized: ' + $language)
+    }
     $menuGuideKeys = @('sm_menu_guide_title', 'sm_menu_guide_character', 'sm_menu_guide_mods', 'sm_menu_guide_update', 'sm_menu_guide_worlds')
     foreach ($menuGuideKey in $menuGuideKeys) {
         Assert-True ($english.ContainsKey($menuGuideKey) -and $korean.ContainsKey($menuGuideKey) -and

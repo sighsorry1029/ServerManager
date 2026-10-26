@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using HarmonyLib;
 
 namespace ServerManager;
@@ -19,7 +18,6 @@ internal static class CheatCommandGuard
     private static volatile bool _monitor;
     private static volatile bool _block;
     private static volatile bool _allowAdminBypass;
-    private static long _adminEntitlementExpiryTimestamp;
     private static uint _policyGeneration = 1;
 
     internal static void Configure(
@@ -30,7 +28,7 @@ internal static class CheatCommandGuard
         _monitor = monitor;
         _block = block;
         _allowAdminBypass = allowAdminBypass;
-        _adminEntitlementExpiryTimestamp = 0;
+        ClientCommandPermissions.BeginSession();
         _policyGeneration = 1;
 
         if (!monitor)
@@ -54,7 +52,7 @@ internal static class CheatCommandGuard
         _monitor = false;
         _block = false;
         _allowAdminBypass = false;
-        _adminEntitlementExpiryTimestamp = 0;
+        ClientCommandPermissions.Reset();
         ClearSignals();
     }
 
@@ -80,6 +78,10 @@ internal static class CheatCommandGuard
         {
             return true;
         }
+
+        // Seed visibility is a separate administrator permission, not cheat
+        // evidence. Do not sanction it even if another mod marks it IsCheat.
+        if (ClientCommandPermissions.IsSeedCommand(__0)) return true;
 
         ZNet? network = ZNet.instance;
         if (network == null || network.IsServer())
@@ -119,45 +121,10 @@ internal static class CheatCommandGuard
     internal static void ApplyAdminEntitlement(
         bool granted,
         int validForMilliseconds)
-    {
-        if (!granted || !_allowAdminBypass)
-        {
-            _adminEntitlementExpiryTimestamp = 0;
-            return;
-        }
-
-        if (validForMilliseconds <
-            AdminCommandEntitlementCodec.MinimumGrantMilliseconds ||
-            validForMilliseconds >
-            AdminCommandEntitlementCodec.MaximumGrantMilliseconds)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(validForMilliseconds));
-        }
-
-        long durationTicks = checked(
-            ((long)validForMilliseconds * Stopwatch.Frequency + 999L) /
-            1000L);
-        _adminEntitlementExpiryTimestamp = checked(
-            Stopwatch.GetTimestamp() + Math.Max(1L, durationTicks));
-    }
+        => ClientCommandPermissions.ApplyAdminStatus(granted, validForMilliseconds);
 
     internal static bool HasActiveAdminEntitlement()
-    {
-        if (!_allowAdminBypass)
-        {
-            return false;
-        }
-
-        long expiry = _adminEntitlementExpiryTimestamp;
-        if (expiry <= Stopwatch.GetTimestamp())
-        {
-            _adminEntitlementExpiryTimestamp = 0;
-            return false;
-        }
-
-        return true;
-    }
+        => _allowAdminBypass && ClientCommandPermissions.HasActiveAdminStatus();
 
     private static bool TryResolveCheatCommand(
         string text,

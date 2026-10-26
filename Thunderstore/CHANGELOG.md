@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.4
+
+- Updated scheduled Upgrade World maintenance for its current execution flow, including queued cleanup commands. Use `world_clean start` to run cleanup from cron.
+- Improved completion tracking for partial failures and timeouts. Normally completed work with failed targets is saved and marked for review; remaining batch commands stop without automatic retry. Timed-out work remains observed until Upgrade World becomes idle.
+- Restricted `printseeds` to server-verified administrators on ServerManager servers, hiding it from non-admin help and autocomplete and blocking direct chat/F5 use. Denied attempts show a localized permission message without cheat reports or sanctions. Local hosts and single-player games are unchanged.
+- Kept command permissions separate from cheat and stat-cap exemptions. Added regression coverage for maintenance completion, command visibility, expiring admin permissions and localization.
+- Update ServerManager on both the server and clients. The command restriction does not hide seed data from modified clients.
+
 ## 1.2.3
 
 - Fixed temporary Steam authentication failures blocking an account until the server restarted. Players can retry after the previous session is cleaned up and a short waiting period has passed.

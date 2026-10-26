@@ -187,6 +187,12 @@ cannot make a client cheat-proof.
 Defensive client checks use `cheatDetection.action` and `security.alert`.
 Admin status does not exempt cheat-tool detections.
 
+On ServerManager servers, `printseeds` is hidden from non-admins and blocked in
+both chat and the F5 console. Verified admins, local hosts and single-player
+games keep their normal access. A blocked attempt only shows a permission
+message; it is not a cheat report or a kick reason. Update both server and clients.
+This restricts the command, not access to seed data by a modified client.
+
 Assembly-inspection diagnostics are log-only, not proof of cheating. They are
 separate from the `required`/`optional` folders. The audit log and `security.alert`
 webhook show a short failure summary; the affected client's `BepInEx/LogOutput.log`
@@ -686,7 +692,10 @@ Update both the server and clients before using this feature.
 
 ### Upgrade World maintenance
 
-Requires separately installed **Upgrade World**. Completion tracking checks the required runtime members rather than enforcing an exact plugin version.
+Requires separately installed **Upgrade World**. The adapter follows the execution
+contract used by Upgrade World 1.87. It checks the shared runtime and each command's
+required members, not an exact version number. An unsupported cleanup command does
+not disable tracking for an otherwise compatible `zones_generate` command.
 Back up the world and test your commands before enabling maintenance.
 Put related changes in one job. This example is disabled:
 
@@ -697,17 +706,36 @@ jobs: []
 # jobs:
 #   - schedule: '35 5 * * *'
 #     commands:
-#       - world_clean
+#       - world_clean start
 #       - zones_reset safeZones=1 start
 ```
 
 ServerManager adds confirmed saves before and after supported maintenance and
-waits for its operations. Queued changes require `start`; unsupported operations
-are refused. Maintenance batches may contain supported world changes and plain
-`save`, not announcements or unrelated commands. If Upgrade World’s `Root users`
+waits for its operations to actually finish. Queued changes require `start`;
+this includes `world_clean` and individual `clean_*` commands.
+Unsupported operations are refused. Maintenance batches may contain supported
+world changes and plain `save`, not announcements or unrelated commands. If Upgrade World’s `Root users`
 is restricted, include `-1` for dedicated-console execution.
 
-If the completion-tracking contract is incompatible, a job with exactly one world-change command is dispatched through the normal server console instead. Its report says **Dispatched; completion not tracked**, not completed. This fallback adds no automatic pre/post saves and never advances a multi-command sequence. Missing plugins, replaced command handlers, permission denials and observer cleanup failures do not enable fallback. Untracked work may overlap later scheduled operations; choose intervals accordingly. A delivered occurrence is recorded without automatic retry. After an interrupted dispatch, review is still required.
+If the required tracking contract is incompatible, a job with exactly one
+world-change command is dispatched through the normal server console instead.
+Its report says **Dispatched; completion not tracked**, not completed. This
+fallback adds no automatic pre/post saves and never advances a multi-command
+sequence. Missing plugins, replaced command handlers, permission denials and
+observer cleanup failures do not enable fallback. Untracked work may overlap
+later scheduled operations; choose intervals accordingly. A delivered occurrence
+is recorded without automatic retry. After an interrupted dispatch, review is
+still required.
+
+For tracked work, a failed target does not mean the remaining work has stopped.
+ServerManager keeps observing until Upgrade World is idle. If the tracked work
+finishes normally but reports failed targets, it saves the partial changes, verifies
+the world/character checkpoint, and stops the rest of the batch with
+**needs review**. This is not a successful job and is never retried automatically.
+Exceptions, cancellation or uncertain completion do not qualify for this partial
+save. A timeout also does not cancel Upgrade World or prove that it stopped;
+scheduled changes remain waiting while it is still active. Ordinary game saves
+are not disabled by this adapter.
 
 Maintenance can catch up once after downtime. Failed or interrupted work pauses
 later maintenance for that world. Inspect the world and backups, then use:
@@ -721,7 +749,8 @@ Discord equivalents are `/cronstatus` and `/cronack job:<jobId>`.
 Use the ID shown by status. Acknowledging **skips** the interrupted occurrence;
 it does not retry or undo it. Upgrade World must be supported and idle.
 
-Avoid manual world-changing commands and `uw_check` during maintenance.
+Avoid manual world-changing commands during maintenance. The scheduler cannot
+prevent another mod, the console or Discord from starting an independent operation.
 `force` and `safeZones=0` can remove base protection. Automatic saves do not
 provide rollback or make a reset crash-safe.
 

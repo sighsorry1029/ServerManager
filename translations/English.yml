@@ -18,6 +18,7 @@ sm_menu_guide_update: "Modpack updates — Install updates in a new profile to a
 sm_menu_guide_worlds: "Your worlds / other servers — Hold Alt while pressing Start, on either the main menu or character selection screen."
 sm_connection_failed: "Could not complete the connection to this server. Try again. If this continues, contact a server administrator."
 sm_security_ended: "The server security policy ended this connection. If you believe this is an error, contact a server administrator."
+sm_command_admin_required: "You must be a server administrator to use this command."
 sm_version_mismatch: "The client and server use incompatible ServerManager versions. Install the server's version and restart Valheim."
 sm_duplicate_connection: "This account is already connecting or connected. Wait for the previous connection to close, then try again."
 sm_auth_failed: "Steam authentication could not be completed. Restart Steam and Valheim, then try again."

@@ -5740,8 +5740,7 @@ internal static partial class ServerManagerRuntime
                  ServerDetectionStates.ToArray())
         {
             ServerDetectionState state = pair.Value;
-            if (!state.Policy.AllowAdminCheatCommands ||
-                state.TerminalActionApplied ||
+            if (state.TerminalActionApplied ||
                 state.NextAdminEntitlementRefreshTimestamp > now)
             {
                 continue;
@@ -5775,8 +5774,7 @@ internal static partial class ServerManagerRuntime
         long now,
         out ProtocolRejection rejection)
     {
-        if (!state.Policy.AllowAdminCheatCommands ||
-            !_coordinator.TryGetSnapshot(
+        if (!_coordinator.TryGetSnapshot(
                 rpc,
                 out ConnectionSessionSnapshot session) ||
             session.State != ConnectionSessionState.Ready ||
@@ -5812,18 +5810,21 @@ internal static partial class ServerManagerRuntime
 
         try
         {
-            // Release a cancelled numerical kick before advertising a new
-            // generation: its detection-only gate would discard PolicyAck.
-            if (granted && state.PendingKickTimestamp != 0)
-                TryCancelNumericDetectionResponseForAdmin(server, rpc, identity, state);
-            if (state.LastAdminEntitlementGranted.HasValue &&
-                state.LastAdminEntitlementGranted.Value != granted)
+            // Advertise authenticated administrator status independently of
+            // cheat exemptions. Only the latter may alter detection policy.
+            if (state.Policy.AllowAdminCheatCommands)
             {
-                // Re-advertise the same caps in a new generation. This makes a
-                // fresh carry-weight/damage observation reportable after adminlist
-                // revocation without retagging queued evidence or losing sequence
-                // checks. Numeric sanctions still wait for this policy's ACK.
-                state.PolicyGeneration = checked(state.PolicyGeneration + 1);
+                // Release a cancelled numerical kick before advertising a new
+                // generation: its detection-only gate would discard PolicyAck.
+                if (granted && state.PendingKickTimestamp != 0)
+                    TryCancelNumericDetectionResponseForAdmin(server, rpc, identity, state);
+                if (state.LastAdminEntitlementGranted.HasValue &&
+                    state.LastAdminEntitlementGranted.Value != granted)
+                {
+                    // Re-arm numeric observations after membership changes;
+                    // sanctions still wait for this policy generation's ACK.
+                    state.PolicyGeneration = checked(state.PolicyGeneration + 1);
+                }
             }
             state.LastAdminEntitlementGranted = granted;
             AdminCommandEntitlement entitlement = new(
@@ -9310,8 +9311,7 @@ internal static partial class ServerManagerRuntime
 
             if (ServerDetectionStates.TryGetValue(
                     rpc,
-                    out ServerDetectionState detectionState) &&
-                detectionState.Policy.AllowAdminCheatCommands)
+                    out ServerDetectionState detectionState))
             {
                 ProtocolRejection? entitlementError = null;
                 bool entitlementRefreshed =

@@ -114,6 +114,8 @@ internal static class ServerScheduleRuntime
         internal bool PendingDurable, Started, Finishing, WaitingUpgrade, Skip, PreflightDone;
         internal string[] Commands;
         internal bool UntrackedUpgrade;
+        internal bool UpgradeTimedOut, SavingPartialChanges, PartialChangesPersisted;
+        internal string PartialFailureCode = "", PartialSaveResult = "";
         internal string Verb = "", BaselineSave = "", SaveId = "";
         internal long Deadline;
         internal Run(ServerScheduleOccurrence occurrence)
@@ -255,15 +257,28 @@ internal static class ServerScheduleRuntime
                             }
                             run.PreflightDone = true;
                         }
-                        if (!run.UntrackedUpgrade && _upgradeBridge == null && !UpgradeWorldScheduleBridge.TryCreate(out _upgradeBridge, out string unavailable))
+                        if (!run.UntrackedUpgrade)
                         {
-                            // Only an incompatible observation contract permits dispatch-only mode.
-                            // Busy/failed observer cleanup and other safety denials remain blocking.
-                            if (unavailable != "uw_unsupported_contract" || run.Occurrence.Job.Commands.Count != 1)
-                            { EndRun(run, false, unavailable); return; }
-                            run.UntrackedUpgrade = true;
-                            // No implicit pre/post saves: completion and ordering cannot be observed.
-                            run.Commands = run.Occurrence.Job.Commands.ToArray();
+                            string unavailable = "uw_available";
+                            bool supported = _upgradeBridge != null || UpgradeWorldScheduleBridge.TryCreate(out _upgradeBridge, out unavailable);
+                            if (supported)
+                                foreach (string command in run.Occurrence.Job.Commands)
+                                    if (FirstVerb(command) != "save" && !_upgradeBridge!.SupportsCommand(command, out unavailable))
+                                    { supported = false; break; }
+                            if (!supported)
+                            {
+                                // Check this job's capabilities before even its pre-save. An
+                                // unrelated unsupported command must not disable other jobs.
+                                if (unavailable != "uw_unsupported_contract" || run.Occurrence.Job.Commands.Count != 1)
+                                { EndRun(run, false, unavailable); return; }
+                                _upgradeBridge?.Dispose();
+                                _upgradeBridge = null;
+                                if (UpgradeWorldScheduleBridge.ObserverCleanupFailed)
+                                { EndRun(run, false, "uw_observer_cleanup_failed"); return; }
+                                run.UntrackedUpgrade = true;
+                                // No implicit pre/post saves: completion and ordering cannot be observed.
+                                run.Commands = run.Occurrence.Job.Commands.ToArray();
+                            }
                         }
                         if (!run.UntrackedUpgrade)
                         {
@@ -397,6 +412,7 @@ internal static class ServerScheduleRuntime
                     if (!Current || !_runs.Contains(run)) return;
                     run.Common = false;
                     run.WaitingUpgrade = true;
+                    run.UpgradeTimedOut = false;
                     run.Deadline = Stopwatch.GetTimestamp() + 60 * 60 * Stopwatch.Frequency;
                     ApplyUpgradeObservation(run, observed);
                     return;
@@ -426,14 +442,33 @@ internal static class ServerScheduleRuntime
         private void PollUpgrade(Run run)
         {
             if (_upgradeBridge == null) { CompleteCommand(run, Result(false, "uw_unavailable", "Upgrade World observation was lost.")); return; }
+            if (!run.UpgradeTimedOut && Stopwatch.GetTimestamp() >= run.Deadline)
+            {
+                run.UpgradeTimedOut = true;
+                _upgradeBridge.MarkTimedOut();
+                Warn("Job '" + run.Occurrence.Job.Id + "' exceeded the observation deadline. Upgrade World was not cancelled; waiting for it to become idle before releasing scheduled mutations. Review is required.");
+                Audit(run, Result(false, "uw_unconfirmed", "Completion deadline exceeded; still observing Upgrade World."));
+            }
             ApplyUpgradeObservation(run, _upgradeBridge.Poll());
-            if (run.WaitingUpgrade && Stopwatch.GetTimestamp() >= run.Deadline)
-                CompleteCommand(run, Result(false, "uw_unconfirmed", "Maintenance did not complete within one hour; review is required."));
         }
 
         private void ApplyUpgradeObservation(Run run, UpgradeWorldScheduleObservation observed)
         {
             if (observed.State == UpgradeWorldScheduleState.Pending) return;
+            if (observed.State == UpgradeWorldScheduleState.Failed && observed.CanPersistPartialChanges && !run.Retired)
+            {
+                // Only the adapter can certify normal termination with skipped targets,
+                // no execution exception/cancellation, and a now-idle executor. Preserve
+                // those changes, never execute the rest of the mutation batch or replay it.
+                Audit(run, Result(false, observed.Code, "Upgrade World ended with partial changes."));
+                run.WaitingUpgrade = false;
+                run.PartialFailureCode = observed.Code;
+                run.SavingPartialChanges = true;
+                run.Commands = new[] { "save" };
+                run.Index = 0;
+                Warn("Job '" + run.Occurrence.Job.Id + "' ended with partial changes (" + observed.Code + "). Saving the completed changes before marking it for review; no remaining mutations or automatic retry.");
+                return;
+            }
             CompleteCommand(run, Result(observed.State == UpgradeWorldScheduleState.Succeeded,
                 observed.Code, "Upgrade World scheduled operation observation."));
         }
@@ -473,6 +508,13 @@ internal static class ServerScheduleRuntime
             if (!run.Common) Audit(run, result);
             run.SaveRequested = run.WaitingSave = run.WaitingUpgrade = false;
             run.Pending = null;
+            if (run.SavingPartialChanges)
+            {
+                run.PartialSaveResult = result.Code;
+                run.PartialChangesPersisted = result.Success && result.Code == "checkpoint_completed";
+                EndRun(run, false, run.PartialChangesPersisted ? "uw_partial_failure_persisted" : "uw_partial_failure_save_unconfirmed");
+                return;
+            }
             if (!result.Success || run.Retired)
             {
                 if (!result.Success) Warn("Job '" + run.Occurrence.Job.Id + "' stopped: " + result.Code + ". No automatic retry.");
@@ -523,6 +565,12 @@ internal static class ServerScheduleRuntime
             };
             if (!multiple) data["cron_verb"] = job.AllowClientHide &&
                 ServerScheduleSettings.TryGetCenterBroadcast(job.Commands[0], out _) ? "broadcast" : FirstVerb(job.Commands[0]);
+            if (run.PartialFailureCode.Length != 0)
+            {
+                data["cron_failure_code"] = run.PartialFailureCode;
+                data["cron_partial_changes"] = run.PartialChangesPersisted ? "persisted" : "not_confirmed";
+                data["cron_save_result"] = run.PartialSaveResult;
+            }
             return data;
         }
 

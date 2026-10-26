@@ -18,8 +18,10 @@ internal readonly struct UpgradeWorldScheduleObservation
 {
     internal UpgradeWorldScheduleState State { get; }
     internal string Code { get; }
-    internal UpgradeWorldScheduleObservation(UpgradeWorldScheduleState state, string code)
-    { State = state; Code = code; }
+    internal bool CanPersistPartialChanges { get; }
+    internal UpgradeWorldScheduleObservation(UpgradeWorldScheduleState state, string code,
+        bool canPersistPartialChanges = false)
+    { State = state; Code = code; CanPersistPartialChanges = canPersistPartialChanges; }
 }
 
 // Optional observation adapter: validate the required runtime contract, not a version number.
@@ -29,20 +31,25 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
 {
     private static UpgradeWorldScheduleBridge? _owner;
     private static bool _patchFaulted;
+    private static readonly HashSet<string> ReportedContracts = new(StringComparer.Ordinal);
     private static readonly string[] CleanTypes = { "CleanDuplicates", "CleanLocations", "CleanObjects",
         "CleanChests", "CleanStands", "CleanDungeons", "CleanSpawns", "CleanHealth" };
     private readonly int _thread = Thread.CurrentThread.ManagedThreadId;
     private readonly Harmony _harmony = new("sighsorry.ServerManager.UpgradeWorldSchedule." + Guid.NewGuid().ToString("N"));
     private readonly Assembly _assembly;
-    private readonly MethodInfo _getOperations, _isRoot;
-    private readonly FieldInfo _coroutine, _failed, _savingDisabled, _user, _locationPlaced, _entityTotal;
-    private readonly Type _entityOperation;
+    private readonly MethodInfo _getOperations, _isRoot, _executionFailed;
+    private readonly FieldInfo _coroutine, _failed, _savingDisabled, _user;
+    private FieldInfo? _locationPlaced, _entityTotal;
+    private readonly Type? _entityOperation;
     private readonly Dictionary<string, Type> _operationTypes = new(StringComparer.Ordinal);
+    private readonly List<(MethodBase Target, string? Prefix, string? Postfix, string? Finalizer)> _installedHooks = new();
+    private readonly HashSet<string> _immediateTypes = new(StringComparer.Ordinal);
     private readonly HashSet<string> _synchronousCompleted = new(StringComparer.Ordinal);
     private readonly List<TrackedOperation> _operations = new();
     private string[][] _expected = Array.Empty<string[]>();
     private string[] _synchronousExpected = Array.Empty<string>();
     private UpgradeWorldScheduleObservation _observation = new(UpgradeWorldScheduleState.Indeterminate, "uw_not_started");
+    private UpgradeWorldScheduleObservation? _fault;
     private bool _dispatching, _disposed;
     private int _moving;
 
@@ -66,9 +73,16 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
         ["world_gen"] = new[] { "WorldVersion" },
         ["zones_generate"] = new[] { "Generate" },
         ["zones_reset"] = new[] { "ResetZones" },
-        ["zones_restore"] = new[] { "RestoreZones" }
+        ["zones_restore"] = new[] { "RestoreZones" },
+        ["world_clean"] = new[] { "QueuedOperation" },
+        ["clean_duplicates"] = new[] { "QueuedOperation" }, ["clean_locations"] = new[] { "QueuedOperation" },
+        ["clean_objects"] = new[] { "QueuedOperation" }, ["clean_chests"] = new[] { "QueuedOperation" },
+        ["clean_stands"] = new[] { "QueuedOperation" }, ["clean_dungeons"] = new[] { "QueuedOperation" },
+        ["clean_spawns"] = new[] { "QueuedOperation" }, ["clean_health"] = new[] { "QueuedOperation" }
     };
-    private static readonly Dictionary<string, string[]> Immediate = new(StringComparer.OrdinalIgnoreCase)
+    // These constructors run synchronously, but cleanup commands invoke them
+    // later inside a QueuedOperation. Both layers must complete in that case.
+    private static readonly Dictionary<string, string[]> Constructors = new(StringComparer.OrdinalIgnoreCase)
     {
         ["world_clean"] = CleanTypes,
         ["clean_duplicates"] = new[] { "CleanDuplicates" }, ["clean_locations"] = new[] { "CleanLocations" },
@@ -84,7 +98,8 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     private sealed class TrackedOperation
     {
         internal readonly object Instance;
-        internal bool Initialized, Completed, IteratorCreated;
+        internal bool Initialized, Completed, IteratorCreated, Ended, EmptySelection;
+        internal int EndingDepth;
         internal TrackedOperation(object instance) => Instance = instance;
     }
 
@@ -95,67 +110,136 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
         _getOperations = RequireMethod(executor, "GetOperations", true, typeof(List<>).MakeGenericType(operation));
         _coroutine = RequireField(executor, "executionCoroutine", true, "UnityEngine.Coroutine");
         _failed = RequireField(operation, "Failed", false, typeof(int).FullName!);
+        _executionFailed = RequireMethod(operation, "get_ExecutionFailed", false, typeof(bool));
         _savingDisabled = RequireField(RequireType("SavingCommands"), "SavingDisabled", true, typeof(bool).FullName!);
         _user = RequireField(RequireType("ServerExecution"), "User", true, typeof(ZRpc).FullName!);
-        _locationPlaced = RequireField(typeof(ZoneSystem.LocationInstance), "m_placed", false, typeof(bool).FullName!);
         _isRoot = RequireMethod(RequireType("Settings"), "IsRoot", true, typeof(bool), typeof(string));
-        _entityOperation = RequireType("ExecutedEntityOperation");
-        _entityTotal = RequireField(_entityOperation, "TotalCount", false, typeof(int).FullName!);
-        foreach (string name in Queued.Values.SelectMany(names => names).Concat(new[] { "Print" }).Distinct())
-            _operationTypes.Add(name, RequireType(name));
-        foreach (Type concrete in _operationTypes.Values)
-            if (!operation.IsAssignableFrom(concrete)) throw new MissingMemberException();
-
+        _entityOperation = _assembly.GetType("UpgradeWorld.ExecutedEntityOperation");
         var patches = new List<(MethodBase Target, string? Prefix, string? Postfix, string? Finalizer)>();
         patches.Add((RequireMethod(executor, "AddOperation", true, typeof(void), operation, typeof(bool)), nameof(BeforeAdd), null, nameof(ObserveException)));
         patches.Add((RequireMethod(executor, "StopExecution", true, typeof(void)), nameof(BeforeStop), null, null));
-        patches.Add((RequireMethod(operation, "Init", false, typeof(bool), typeof(bool)), null, nameof(AfterInit), nameof(ObserveOperationException)));
+        patches.Add((RequireMethod(operation, "Init", false, typeof(bool)), null, nameof(AfterInit), nameof(ObserveOperationException)));
         patches.Add((RequireMethod(operation, "Execute", false, typeof(IEnumerator), typeof(Stopwatch)), null, nameof(AfterExecute), nameof(ObserveOperationException)));
         patches.Add((RequireMethod(RequireType("Helper"), "AddError", true, typeof(void), typeof(Terminal), typeof(string), typeof(bool)), nameof(BeforeError), null, null));
         patches.Add((RequireMethod(RequireType("Helper"), "Print", true, typeof(void), typeof(Terminal), typeof(ZRpc), typeof(string)), nameof(BeforePrintedMessage), null, null));
-        // UW catches exceptions thrown while obtaining OnExecute and in OnStart.
-        // Observe the actual virtual implementations before those catches; deep
-        // iterator wrappers separately cover deferred bodies and OnEnd failures.
-        var lifecycle = _operationTypes.Values.SelectMany(type => new[] {
-            RequireMethod(type, "OnStart", false, typeof(void)),
-            RequireMethod(type, "OnExecute", false, typeof(IEnumerator), typeof(Stopwatch)),
-            RequireMethod(type, "OnEnd", false, typeof(void)) });
-        foreach (MethodInfo method in lifecycle.GroupBy(method => method.MethodHandle).Select(group => group.First()))
-            patches.Add((method, null, null, nameof(ObserveOperationException)));
-        foreach (MethodInfo method in _operationTypes.Values.Select(type => RequireMethod(type, "OnInit", false, typeof(string)))
-            .GroupBy(method => method.MethodHandle).Select(group => group.First()))
-            patches.Add((method, nameof(BeforeOperationInit), null, nameof(ObserveOperationException)));
-        foreach (string type in new[] { "RegenerateLocations", "SpawnLocations" })
-            patches.Add((RequireMethod(_operationTypes[type], "ExecuteLocation", false, typeof(bool),
-                typeof(Vector2i), typeof(ZoneSystem.LocationInstance)), nameof(BeforeLocation), nameof(AfterLocation), nameof(ObserveOperationException)));
+        // Validate a complete capability before adding its hooks. An unrelated
+        // immediate command or location API must not disable zones_generate.
+        foreach (string name in Queued.Values.SelectMany(names => names).Concat(new[] { "Print" }).Distinct())
+        {
+            try
+            {
+                Type concrete = RequireType(name);
+                if (!operation.IsAssignableFrom(concrete))
+                    throw new MissingMemberException(concrete.FullName + " must derive from " + operation.FullName);
+                if (_entityOperation != null && _entityOperation.IsAssignableFrom(concrete))
+                    _entityTotal = RequireField(_entityOperation, "TotalCount", false, typeof(int).FullName!);
+                var capability = new List<(MethodBase Target, string? Prefix, string? Postfix, string? Finalizer)> {
+                    (RequireMethod(concrete, "OnStart", false, typeof(void)), null, null, nameof(ObserveOperationException)),
+                    (RequireMethod(concrete, "OnExecute", false, typeof(IEnumerator), typeof(Stopwatch)), null, null, nameof(ObserveOperationException)),
+                    (RequireMethod(concrete, "OnEnd", false, typeof(void)), nameof(BeforeOperationEnd), nameof(AfterOperationEnd), nameof(FinalizeOperationEnd)),
+                    (RequireMethod(concrete, "OnInit", false, typeof(string)), nameof(BeforeOperationInit), null, nameof(ObserveOperationException))
+                };
+                if (name == "RegenerateLocations" || name == "SpawnLocations")
+                {
+                    _locationPlaced = RequireField(typeof(ZoneSystem.LocationInstance), "m_placed", false, typeof(bool).FullName!);
+                    capability.Add((RequireMethod(concrete, "ExecuteLocation", false, typeof(bool),
+                        typeof(Vector2s), typeof(ZoneSystem.LocationInstance)), nameof(BeforeLocation), nameof(AfterLocation), nameof(ObserveOperationException)));
+                }
+                patches.AddRange(capability);
+                _operationTypes.Add(name, concrete);
+            }
+            catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+            { Unsupported(name, exception); }
+        }
         foreach (string clean in CleanTypes)
         {
-            Type[] arguments = clean == "CleanDuplicates"
-                ? new[] { typeof(Terminal), typeof(bool), typeof(bool) }
-                : new[] { typeof(Terminal), typeof(ZDO[]), typeof(bool), typeof(bool) };
-            ConstructorInfo constructor = RequireType(clean).GetConstructor(arguments) ?? throw new MissingMethodException();
-            patches.Add((constructor, null, nameof(AfterImmediate), nameof(ObserveException)));
+            AddImmediate(clean, () => clean == "CleanDuplicates"
+                ? new[] { typeof(Terminal), typeof(Minimap.PinType?), typeof(bool), RequireType("FiltererParameters") }
+                : new[] { typeof(Terminal), typeof(ZDO[]), typeof(Minimap.PinType?), typeof(bool) }, patches);
         }
-        foreach (var contract in new[] {
-            ("FixLocations", new[] { typeof(Terminal), RequireType("FiltererParameters") }),
-            ("SwapLocations", new[] { typeof(Terminal), typeof(IEnumerable<string>), RequireType("DataParameters") }),
-            ("RegisterLocation", new[] { typeof(Terminal), typeof(string), typeof(UnityEngine.Vector3) }),
-            ("ChangeTime", new[] { typeof(Terminal), typeof(double) }),
-            ("SetTime", new[] { typeof(Terminal), typeof(double) }) })
-            patches.Add((RequireType(contract.Item1).GetConstructor(contract.Item2) ?? throw new MissingMethodException(),
-                null, nameof(AfterImmediate), nameof(ObserveException)));
+        AddImmediate("FixLocations", () => new[] { typeof(Terminal), RequireType("FiltererParameters") }, patches);
+        AddImmediate("SwapLocations", () => new[] { typeof(Terminal), typeof(IEnumerable<string>), RequireType("DataParameters") }, patches);
+        AddImmediate("RegisterLocation", () => new[] { typeof(Terminal), typeof(string), typeof(UnityEngine.Vector3) }, patches);
+        AddImmediate("ChangeTime", () => new[] { typeof(Terminal), typeof(double) }, patches);
+        AddImmediate("SetTime", () => new[] { typeof(Terminal), typeof(double) }, patches);
         // Fully validate before installing anything. Do not pin metadata tokens,
         // file hashes or MVIDs, which change without changing these contracts.
         _owner = this;
         try
         {
-            foreach (var patch in patches)
+            foreach (var patch in patches.Distinct())
+            {
                 _harmony.Patch(patch.Target, prefix: Hook(patch.Prefix), postfix: Hook(patch.Postfix), finalizer: Hook(patch.Finalizer));
+                _installedHooks.Add(patch);
+            }
         }
         catch { Dispose(); throw; }
     }
 
+    private void AddImmediate(string name, Func<Type[]> arguments,
+        List<(MethodBase Target, string? Prefix, string? Postfix, string? Finalizer)> patches)
+    {
+        try
+        {
+            Type type = RequireType(name);
+            Type[] parameters = arguments();
+            ConstructorInfo constructor = type.GetConstructor(parameters) ?? throw MissingMethod(type, ".ctor", typeof(void), parameters);
+            patches.Add((constructor, null, nameof(AfterImmediate), nameof(ObserveException)));
+            _immediateTypes.Add(name);
+        }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        { Unsupported(name, exception); }
+    }
+
+    private void Unsupported(string name, Exception exception)
+    {
+        ReportContract(_assembly, name, exception);
+    }
+
+    internal bool SupportsCommand(string command, out string code)
+    {
+        code = "uw_unsupported_command";
+        if (!IsCurrent) { code = "uw_unavailable"; return false; }
+        // Recheck our own hooks at the command boundary, never every frame.
+        // Foreign patches may coexist; this is not a foreign-mod allowlist.
+        try
+        {
+            foreach (var hook in _installedHooks)
+            {
+                var info = Harmony.GetPatchInfo(hook.Target);
+                if (info == null || !HasHook(info.Prefixes, hook.Prefix) ||
+                    !HasHook(info.Postfixes, hook.Postfix) || !HasHook(info.Finalizers, hook.Finalizer))
+                    throw new MissingMemberException(hook.Target.DeclaringType?.FullName + "." + hook.Target.Name +
+                        ": expected ServerManager observation hooks; actual missing or replaced hook");
+            }
+        }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        {
+            ReportContract(_assembly, "active observation hooks", exception);
+            code = "uw_observer_hooks_changed";
+            return false;
+        }
+        if (!TryArguments(command, out string[] arguments) || !IsMaintenanceCommand(command)) return false;
+        if (Constructors.TryGetValue(arguments[0], out string[] constructors) &&
+            constructors.Any(name => !_immediateTypes.Contains(name)))
+        { code = "uw_unsupported_contract"; return false; }
+        string[][] expected = ExpectedOperations(command, arguments[0]);
+        if (expected.Length == 0 && constructors == null) return false;
+        foreach (string name in expected.SelectMany(sequence => sequence))
+        {
+            if (!_operationTypes.ContainsKey(name))
+            { code = "uw_unsupported_contract"; return false; }
+        }
+        code = "uw_available";
+        return true;
+    }
+
+    private bool HasHook(IEnumerable<Patch> patches, string? name) => name == null || patches.Any(patch =>
+        patch.owner == _harmony.Id && patch.PatchMethod == typeof(UpgradeWorldScheduleBridge).GetMethod(name,
+            BindingFlags.Static | BindingFlags.NonPublic));
+
     internal static bool IsMaintenanceCommand(string command) => UpgradeWorldScheduleCommands.IsMaintenance(command);
+    internal static bool ObserverCleanupFailed => _patchFaulted;
 
     internal static bool TryCreate(out UpgradeWorldScheduleBridge? bridge, out string code)
     {
@@ -166,7 +250,10 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
         if (!Chainloader.PluginInfos.TryGetValue("upgrade_world", out var plugin) || plugin.Instance == null) return false;
         try { bridge = new UpgradeWorldScheduleBridge(plugin.Instance.GetType().Assembly); code = "uw_available"; return true; }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
-        { code = _patchFaulted ? "uw_observer_cleanup_failed" : "uw_unsupported_contract"; return false; }
+        {
+            ReportContract(plugin.Instance.GetType().Assembly, "shared lifecycle", exception);
+            code = _patchFaulted ? "uw_observer_cleanup_failed" : "uw_unsupported_contract"; return false;
+        }
     }
 
     internal bool CanRun(out string code)
@@ -206,13 +293,16 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     {
         if (!TryArguments(command, out string[] arguments) || !IsMaintenanceCommand(command))
             return new(UpgradeWorldScheduleState.Failed, "uw_unsupported_command");
-        bool immediate = Immediate.TryGetValue(arguments[0], out string[] synchronous);
+        if (!SupportsCommand(command, out string support))
+            return new(UpgradeWorldScheduleState.Failed, support);
+        Constructors.TryGetValue(arguments[0], out string[] synchronous);
         string[][] expected = ExpectedOperations(command, arguments[0]);
+        bool immediate = synchronous != null && expected.Length == 0;
         if (!immediate && expected.Length == 0)
             return new(UpgradeWorldScheduleState.Failed, "uw_unsupported_command");
         if (!immediate && !arguments.Skip(1).Contains("start", StringComparer.OrdinalIgnoreCase))
             return new(UpgradeWorldScheduleState.Failed, "uw_start_required");
-        if (_observation.State == UpgradeWorldScheduleState.Pending)
+        if (_observation.State == UpgradeWorldScheduleState.Pending && Poll().State == UpgradeWorldScheduleState.Pending)
             return new(UpgradeWorldScheduleState.Indeterminate, "uw_observer_busy");
         if (!TryGetIdle(out bool idle, out string code) || !idle)
             return new(UpgradeWorldScheduleState.Failed, code);
@@ -223,6 +313,7 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
             return new(UpgradeWorldScheduleState.Failed, "uw_lpa_unverified");
         _operations.Clear(); _synchronousCompleted.Clear();
         _expected = expected; _synchronousExpected = synchronous ?? Array.Empty<string>();
+        _fault = null;
         _observation = new(UpgradeWorldScheduleState.Pending, "uw_pending");
         _dispatching = true;
         try
@@ -233,7 +324,6 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
         { Mark(UpgradeWorldScheduleState.Failed, "uw_dispatch_exception"); }
         finally { _dispatching = false; }
-        if (_observation.State != UpgradeWorldScheduleState.Pending) return _observation;
         if (immediate)
         {
             // Every expected synchronous constructor must return normally.
@@ -252,22 +342,41 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     {
         if (!IsCurrent) return new(UpgradeWorldScheduleState.Indeterminate, "uw_observer_retired");
         if (_observation.State != UpgradeWorldScheduleState.Pending) return _observation;
-        if (!CanRun(out string code)) { Mark(UpgradeWorldScheduleState.Indeterminate, code); return _observation; }
+        if (!CanRun(out string code)) Mark(UpgradeWorldScheduleState.Indeterminate, code);
         try
         {
-            if (Operations.Cast<object>().Any(item => Find(item) == null))
+            IList active = Operations;
+            bool idle = active.Count == 0 && _coroutine.GetValue(null) == null;
+            if (active.Cast<object>().Any(item => Find(item) == null))
                 Mark(UpgradeWorldScheduleState.Indeterminate, "uw_foreign_operation");
-            else if (_operations.Any(item => (int)_failed.GetValue(item.Instance)! != 0))
+            if (_operations.Any(item => (bool)_executionFailed.Invoke(item.Instance, Array.Empty<object>())!))
+                Mark(UpgradeWorldScheduleState.Failed, "uw_execution_exception");
+            if (_operations.Any(item => (int)_failed.GetValue(item.Instance)! != 0))
                 Mark(UpgradeWorldScheduleState.Failed, "uw_partial_failure");
-            else if (Completed && Operations.Count == 0 && _coroutine.GetValue(null) == null)
-                _observation = new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed");
-            else if (_operations.Any(item => !item.Completed && !Operations.Contains(item.Instance)))
+            if (_operations.Any(item => !item.Completed && !active.Contains(item.Instance)))
                 Mark(UpgradeWorldScheduleState.Indeterminate, "uw_operation_disappeared");
+            // A failure is a result, not proof that UW stopped. Keep ownership
+            // and hooks until the real queue AND execution coroutine are idle.
+            if (!idle)
+                return new(UpgradeWorldScheduleState.Pending, _fault?.Code ?? "uw_pending");
+            if (_fault is { } failure)
+                _observation = new(failure.State, failure.Code,
+                    failure.Code == "uw_partial_failure" && Completed);
+            else if (Completed)
+                _observation = new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed");
+            else
+                _observation = new(UpgradeWorldScheduleState.Indeterminate, "uw_operation_not_completed");
         }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
-        { Mark(UpgradeWorldScheduleState.Indeterminate, "uw_observation_failed"); }
+        {
+            Mark(UpgradeWorldScheduleState.Indeterminate, "uw_observation_failed");
+            // Do not release ownership if idle cannot be established.
+            return new(UpgradeWorldScheduleState.Pending, _fault?.Code ?? "uw_observation_failed");
+        }
         return _observation;
     }
+
+    internal void MarkTimedOut() => Mark(UpgradeWorldScheduleState.Indeterminate, "uw_unconfirmed");
 
     public void Dispose()
     {
@@ -281,13 +390,20 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     }
 
     private bool IsCurrent => !_disposed && ReferenceEquals(_owner, this) && _thread == Thread.CurrentThread.ManagedThreadId;
-    private bool Completed => _synchronousExpected.Length != 0
-        ? _synchronousExpected.All(_synchronousCompleted.Contains)
-        : _operations.Count != 0 && _operations.All(item => item.Initialized && item.Completed);
+    private bool Completed => _synchronousExpected.All(_synchronousCompleted.Contains) &&
+        (_expected.Length == 0 ? _synchronousExpected.Length != 0 :
+            _operations.Count != 0 && _expected.Any(sequence => SequenceMatches(sequence, exact: true)) &&
+            _operations.All(item => item.Initialized && item.Completed && (item.Ended || item.EmptySelection)));
     private bool Observing => IsCurrent && _observation.State == UpgradeWorldScheduleState.Pending;
     private IList Operations => (IList)(_getOperations.Invoke(null, Array.Empty<object>()) ?? throw new InvalidOperationException());
     private void Mark(UpgradeWorldScheduleState state, string code)
-    { if (_observation.State == UpgradeWorldScheduleState.Pending) _observation = new(state, code); }
+    {
+        if (_observation.State != UpgradeWorldScheduleState.Pending) return;
+        // A later exception/cancel/foreign operation always revokes partial-save
+        // eligibility. Preserve the first non-partial cause for diagnosis.
+        if (_fault == null || (_fault.Value.Code == "uw_partial_failure" && code != "uw_partial_failure"))
+            _fault = new(state, code);
+    }
     private static UpgradeWorldScheduleBridge? Observer => _owner is { Observing: true } value ? value : null;
 
     private TrackedOperation? Find(object value) => _operations.FirstOrDefault(item => ReferenceEquals(item.Instance, value));
@@ -301,6 +417,20 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
 
     private static string[][] ExpectedOperations(string command, string verb)
     {
+        if (verb == "locations_add" && TryArguments(command, out string[] arguments))
+        {
+            // Match the reviewed LocationIdParameters/Service.Parse.Boolean
+            // forms and last valid assignment. Only explored=false omits spawn.
+            bool explored = true;
+            foreach (string argument in arguments.Skip(1))
+            {
+                string[] pair = argument.Split('=');
+                if (pair.Length < 2 || pair[0] != "explored") continue;
+                if (new[] { "0", "false", "no", "off" }.Contains(pair[1])) explored = false;
+                else if (new[] { "1", "true", "yes", "on" }.Contains(pair[1])) explored = true;
+            }
+            if (!explored) return new[] { new[] { "DistributeLocations" } };
+        }
         if (Queued.TryGetValue(verb, out string[] sequence)) return new[] { sequence };
         if (verb != "upgrade") return Array.Empty<string[]>();
         string type = UpgradeWorldScheduleCommands.GetUpgradeType(command);
@@ -345,7 +475,13 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
         {
             // Only the reviewed entity OnInit returns false for a legitimate
             // empty selection. A generic false Init is not a completion result.
-            try { operation.Completed = owner._entityOperation.IsInstanceOfType(__instance) && (int)owner._entityTotal.GetValue(__instance)! == 0; }
+            try
+            {
+                operation.EmptySelection = owner._entityOperation?.IsInstanceOfType(__instance) == true &&
+                    owner._entityTotal != null && (int)owner._entityTotal.GetValue(__instance)! == 0 &&
+                    !(bool)owner._executionFailed.Invoke(__instance, Array.Empty<object>())!;
+                operation.Completed = operation.EmptySelection;
+            }
             catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception)) { }
             if (!operation.Completed) owner.Mark(UpgradeWorldScheduleState.Indeterminate, "uw_operation_not_admitted");
         }
@@ -354,9 +490,8 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     private static void BeforeOperationInit(object __instance)
     {
         var owner = Observer;
-        // In 1.80 GetInfo (uw_check) calls OnInit again, rebuilding selections
-        // and counters without resetting execution progress. It is not a pure
-        // inspection. Do not interfere with UW, but retire our completion proof.
+        // Current GetInfo is cached and does not come through this hook. An
+        // actual second OnInit can still mutate selections/progress unexpectedly.
         if (owner?.Find(__instance) is { Initialized: true })
             owner.Mark(UpgradeWorldScheduleState.Indeterminate, "uw_foreign_inspection");
     }
@@ -378,8 +513,8 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     {
         var owner = Observer;
         if (owner == null) return;
-        // Normal 1.80 completion calls StopExecution only after dequeueing the
-        // completed iterator. Manual stop with any queued work is not success.
+        // Normal completion calls StopExecution only after dequeueing completed
+        // iterators. Manual stop with queued work is not completion.
         try
         {
             if (!owner.Completed || owner.Operations.Count != 0)
@@ -403,7 +538,9 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
         string text = (__2 ?? "").TrimStart();
         // These are UW's reviewed non-throwing error paths (including location
         // generation exhaustion). Successful text is deliberately ignored.
-        if (text.StartsWith("Error:", StringComparison.OrdinalIgnoreCase) ||
+        if (text.StartsWith("Operation failed:", StringComparison.Ordinal))
+            owner.Mark(UpgradeWorldScheduleState.Failed, "uw_execution_exception");
+        else if (text.StartsWith("Error:", StringComparison.OrdinalIgnoreCase) ||
             text.StartsWith("Failed to place all ", StringComparison.Ordinal))
             owner.Mark(UpgradeWorldScheduleState.Failed, "uw_reported_error");
     }
@@ -424,12 +561,50 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
         return __exception;
     }
 
+    private static void BeforeOperationEnd(object __instance, out int __state)
+    {
+        // Default zero also covers an earlier foreign prefix throwing/skipping
+        // before our prefix ran. Only an entered scope may unwind its depth.
+        __state = 0;
+        TrackedOperation? operation = Observer?.Find(__instance);
+        if (operation != null) __state = ++operation.EndingDepth;
+    }
+
+    private static void AfterOperationEnd(object __instance, int __state, bool __runOriginal)
+    {
+        var owner = Observer;
+        TrackedOperation? operation = owner?.Find(__instance);
+        if (owner != null && operation != null)
+        {
+            if (!__runOriginal) owner.Mark(UpgradeWorldScheduleState.Indeterminate, "uw_completion_skipped");
+            else if (__state == 1)
+            {
+                if (operation.Ended) owner.Mark(UpgradeWorldScheduleState.Indeterminate, "uw_duplicate_completion");
+                else operation.Ended = true;
+            }
+        }
+    }
+
+    // HarmonyX 2.9 supports __runOriginal in postfixes, not finalizers. Keep
+    // normal-end proof above and unwind the nested scope on every exit here.
+    private static Exception? FinalizeOperationEnd(object __instance, Exception? __exception, int __state)
+    {
+        var owner = Observer;
+        TrackedOperation? operation = owner?.Find(__instance);
+        if (owner != null && operation != null)
+        {
+            if (__state > 0) operation.EndingDepth = __state - 1;
+            if (__exception != null) owner.Mark(UpgradeWorldScheduleState.Failed, "uw_execution_exception");
+        }
+        return __exception;
+    }
+
     private static void BeforeLocation(object __instance, object __1, out bool __state)
     {
         __state = false;
         var owner = Observer;
         if (owner == null || owner.Find(__instance) == null) return;
-        try { __state = (bool)owner._locationPlaced.GetValue(__1)!; }
+        try { __state = (bool)owner._locationPlaced!.GetValue(__1)!; }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
         { owner.Mark(UpgradeWorldScheduleState.Indeterminate, "uw_location_unobservable"); }
     }
@@ -448,7 +623,7 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     private static void AfterImmediate(object __instance)
     {
         var owner = Observer;
-        if (owner == null || !owner._dispatching) return;
+        if (owner == null || (!owner._dispatching && owner._moving == 0)) return;
         string name = __instance.GetType().Name;
         if (__instance.GetType().Assembly != owner._assembly || !owner._synchronousExpected.Contains(name) || !owner._synchronousCompleted.Add(name))
             owner.Mark(UpgradeWorldScheduleState.Indeterminate, "uw_foreign_operation");
@@ -506,14 +681,38 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     private static HarmonyMethod? Hook(string? name) => name == null ? null : new HarmonyMethod(typeof(UpgradeWorldScheduleBridge), name);
     private static FieldInfo RequireField(Type type, string name, bool isStatic, string fieldType)
     {
-        FieldInfo field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | (isStatic ? BindingFlags.Static : BindingFlags.Instance)) ?? throw new MissingFieldException();
-        if (field.IsStatic != isStatic || field.FieldType.FullName != fieldType) throw new MissingFieldException();
+        FieldInfo? field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | (isStatic ? BindingFlags.Static : BindingFlags.Instance));
+        if (field == null || field.IsStatic != isStatic || field.FieldType.FullName != fieldType)
+            throw new MissingFieldException(type.FullName + "." + name + ": expected " + (isStatic ? "static " : "instance ") +
+                fieldType + "; actual " + (field == null ? "missing" : field.ToString()));
         return field;
     }
     private static MethodInfo RequireMethod(Type type, string name, bool isStatic, Type returns, params Type[] arguments)
     {
-        MethodInfo method = type.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | (isStatic ? BindingFlags.Static : BindingFlags.Instance), null, arguments, null) ?? throw new MissingMethodException();
-        if (method.IsStatic != isStatic || method.ReturnType != returns || method.IsAbstract || method.ContainsGenericParameters) throw new MissingMethodException();
+        MethodInfo? method = type.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | (isStatic ? BindingFlags.Static : BindingFlags.Instance), null, arguments, null);
+        if (method == null || method.IsStatic != isStatic || method.ReturnType != returns || method.IsAbstract || method.ContainsGenericParameters)
+            throw MissingMethod(type, name, returns, arguments);
         return method;
+    }
+
+    private static MissingMethodException MissingMethod(Type type, string name, Type returns, Type[] arguments)
+    {
+        IEnumerable<MethodBase> candidates = name == ".ctor" ? type.GetConstructors() :
+            type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance)
+                .Where(method => method.Name == name).Cast<MethodBase>();
+        string actual = string.Join("; ", candidates.Take(4).Select(method => method.ToString()));
+        return new MissingMethodException(type.FullName + "." + name + ": expected " + returns.FullName + " (" +
+            string.Join(", ", arguments.Select(type => type.FullName)) + "); actual " + (actual.Length == 0 ? "missing" : actual));
+    }
+
+    private static void ReportContract(Assembly assembly, string capability, Exception exception)
+    {
+        string identity = assembly.GetName().Name + "; MVID=" + assembly.ManifestModule.ModuleVersionId;
+        string version = Chainloader.PluginInfos.TryGetValue("upgrade_world", out var plugin)
+            ? plugin.Metadata.Version.ToString() : "unknown";
+        string message = "Upgrade World cron tracking unavailable for " + capability + ": " + exception.GetType().Name +
+            ": " + exception.Message + " [Upgrade World " + version + "; " + identity + "; ServerManager " +
+            ServerManagerPlugin.ModVersion + "; MVID=" + typeof(UpgradeWorldScheduleBridge).Module.ModuleVersionId + "].";
+        if (ReportedContracts.Add(message)) ServerManagerPlugin.Log.LogWarning(message);
     }
 }

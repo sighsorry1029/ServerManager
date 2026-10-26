@@ -84,7 +84,10 @@ $configure = $guardType.GetMethod('Configure', $staticFlags)
 $applyGrant = $guardType.GetMethod('ApplyAdminEntitlement', $staticFlags)
 $hasGrant = $guardType.GetMethod('HasActiveAdminEntitlement', $staticFlags)
 $reset = $guardType.GetMethod('Reset', $staticFlags)
-$expiry = $guardType.GetField('_adminEntitlementExpiryTimestamp', $staticFlags)
+$permissionsType = $assembly.GetType('ServerManager.ClientCommandPermissions', $true)
+$hasAdminStatus = $permissionsType.GetMethod('HasActiveAdminStatus', $staticFlags)
+$expiry = $permissionsType.GetField('_adminEntitlementExpiryTimestamp', $staticFlags)
+Assert-True ($null -ne $hasAdminStatus -and $null -ne $expiry) 'The separate expiring server-confirmed admin status cache is missing.'
 $oversizedHit = New-TestHit
 try {
     $null = $configure.Invoke($null, [object[]]@($true, $true, $true))
@@ -100,7 +103,15 @@ try {
     Assert-True (Test-Blocked $oversizedHit ($hasGrant.Invoke($null, $null))) 'A revoked entitlement still released finite damage.'
     $null = $configure.Invoke($null, [object[]]@($true, $true, $false))
     $null = $applyGrant.Invoke($null, [object[]]@($true, 10000))
-    Assert-True (Test-Blocked $oversizedHit ($hasGrant.Invoke($null, $null))) 'A disabled pinned admin policy accepted a grant.'
+    Assert-True ($hasAdminStatus.Invoke($null, $null)) 'A disabled cheat policy discarded the independent server-confirmed admin status.'
+    Assert-True (Test-Blocked $oversizedHit ($hasGrant.Invoke($null, $null))) 'Raw admin status bypassed a finite damage cap despite the disabled pinned admin policy.'
+    $null = $configure.Invoke($null, [object[]]@($true, $true, $true))
+    Assert-True (-not $hasAdminStatus.Invoke($null, $null) -and
+        (Test-Blocked $oversizedHit ($hasGrant.Invoke($null, $null)))) 'A new managed session inherited the prior raw admin status or stat bypass.'
+    $null = $applyGrant.Invoke($null, [object[]]@($true, 10000))
+    $null = $reset.Invoke($null, $null)
+    Assert-True (-not $hasAdminStatus.Invoke($null, $null) -and
+        (Test-Blocked $oversizedHit ($hasGrant.Invoke($null, $null)))) 'Disconnect reset retained raw admin status or a stat bypass.'
 }
 finally { $null = $reset.Invoke($null, $null) }
 
@@ -241,6 +252,13 @@ foreach ($member in @('get_LastAdminEntitlementGranted', 'set_LastAdminEntitleme
 }
 $refreshCancellation = Get-Call $refresh 'TryCancelNumericDetectionResponseForAdmin'
 $generationSetter = Get-Call $refresh 'set_PolicyGeneration'
+$refreshAdminPolicy = Get-Call $refresh 'get_AllowAdminCheatCommands'
+foreach ($numericMutation in @($refreshCancellation, $generationSetter)) {
+    Assert-Dominates $refresh $refreshAdminPolicy $numericMutation `
+        'Raw admin status can cancel a numeric kick or re-arm observations without the pinned bypass policy.'
+    Assert-PredicateControls $refreshAdminPolicy $numericMutation `
+        'A disabled pinned bypass policy still cancels a numeric kick or re-arms observations.'
+}
 Assert-True ($null -ne $refreshCancellation -and $refreshCancellation.Offset -lt $generationSetter.Offset -and
     $refreshCancellation.Offset -lt (Get-Call $refresh 'Send').Offset) `
     'Admin promotion advertises its new generation/entitlement before cancelling a pending numeric kick.'
