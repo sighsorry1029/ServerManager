@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -30,7 +31,14 @@ internal static class ServerScheduleRuntimeSmoke
     private static string FilePath => Path.Combine(ServerManagerPlugin.DataRoot, ServerScheduleSettings.FileName);
     private static string JobId(int index = 0) => ((ServerScheduleSettings)Get(Session!, "_settings")!).Jobs[index].Id;
     private static string Config(params string[] commands) => "timezone: UTC\njobs:\n" + Job("test", commands);
-    private static string Maintenance(params string[] commands) => Config(commands);
+    // Checkpoint-specific fixtures request saves explicitly; production never inserts them.
+    private static string Maintenance(params string[] commands)
+    {
+        var requested = commands.ToList();
+        if (requested[0] != "save") requested.Insert(0, "save");
+        if (requested[requested.Count - 1] != "save") requested.Add("save");
+        return Config(requested.ToArray());
+    }
     private static string Job(string label, string[] commands, string extra = "") =>
         "  # Fixture " + label + "\n  - schedule: '* * * * * *'\n    useGameTime: true\n    commands: [" +
         string.Join(", ", commands.Select(line => "'" + line.Replace("'", "''") + "'")) + "]\n" + extra;
@@ -41,8 +49,9 @@ internal static class ServerScheduleRuntimeSmoke
         {
             Lifecycle(); GuardsAndFiles(); AlternateConfiguration(); CanonicalJournalStartup(); RoutingAndBudget(); OptionalCenterBroadcasts(); CenterBroadcastAuditPolicy(); Gates(); PollingAndLogging(); Saves(); ReloadAndRetirement(); ReentrancyAndSuspension();
             DurableDispatchAndCatchup(); AutomaticUpgradeWorldPolicies(); UpgradeWorldOwnership(); UntrackedUpgrade(); CommandCapabilities(); SynchronousMutationAbort(); MaintenanceSequence(); MaintenanceFailureAndRecovery(); MaintenancePartialPersistence(); MaintenanceTimeoutDrain(); MaintenanceReload(); MaintenanceReviewBarrier(); MaintenanceAdmission();
+            FreshWorldContract(); FreshWorldOrdering(); FreshWorldFailures(); FreshWorldTimeoutAndRecovery(); FreshWorldNativeSaveDrain(); FreshWorldBusyBounds(); FreshWorldAdmissionBounds();
             Console.WriteLine("ServerScheduleRuntimeSmoke: PASS (" + _checks +
-                " assertions; source-linked runtime/parser/engine/journal; stub game/command/Upgrade World boundaries, no native game execution).");
+                " assertions; source-linked runtime/parser/engine/journal/FreshWorld bridge; stub game/command/Upgrade World/provider boundaries, no native game execution).");
             return 0;
         }
         catch (Exception exception) { Console.Error.WriteLine(exception); return 1; }
@@ -68,8 +77,10 @@ internal static class ServerScheduleRuntimeSmoke
         ServerCommands.Calls.Clear(); ServerCommands.NextTask = null;
         ServerManagerRuntime.CenterMessages.Clear(); ServerManagerRuntime.AcceptCenterMessages = true; ServerManagerRuntime.OnCenterBroadcast = null;
         ServerEventRuntime.Audits.Clear(); ServerEventRuntime.Saves.Clear(); ServerEventRuntime.NextSave = null;
+        ServerEventRuntime.AssignMaintenanceIds = false; ServerEventRuntime.AssignedMaintenanceIds = 0;
         ServerEventRuntime.CommandWorldEpoch++;
         UpgradeWorldScheduleBridge.Reset();
+        FreshWorld.API.MaintenanceCoordination.Reset();
         ServerEventRuntime.Status = new ServerManagerStatusSnapshot { WorldReady = true };
         ZNet.instance = new ZNet(); EnvMan.instance = new EnvMan(); ZoneSystem.instance = new ZoneSystem();
     }
@@ -667,7 +678,7 @@ internal static class ServerScheduleRuntimeSmoke
         }
 
         Activate(Maintenance("world_clean")); Restart(60);
-        Check(ServerEventRuntime.Saves.Count == 1 && JournalState() == "running", "Automatically classified mutation coalesces its offline backlog once into pre-save.");
+        Check(ServerEventRuntime.Saves.Count == 1 && JournalState() == "running", "Automatically classified mutation coalesces its offline backlog once into its user-written pre-save.");
         Tick(); Check(ServerEventRuntime.Saves.Count == 1 && UpgradeWorldScheduleBridge.Begun.Count == 0,
             "Automatic mutation catch-up neither duplicates the occurrence nor bypasses its checkpoint.");
 
@@ -690,21 +701,18 @@ internal static class ServerScheduleRuntimeSmoke
             "location_register StartTemple 1,2,3", "locations_fix", "time_set 1000" })
         {
             Activate(Config(command)); Due();
-            Check(ServerEventRuntime.Saves.Count == 1 && UpgradeWorldScheduleBridge.Begun.Count == 0 && ServerConsoleExecutor.Lines.Count == 0,
-                "Every reviewed queued/immediate mutation waits for its automatic pre-save: " + command);
-            ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
-            Check(UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { command }) && ServerConsoleExecutor.Lines.SequenceEqual(new[] { command }),
-                "Reviewed mutation routes exactly once through the UW boundary: " + command);
+            Check(ServerEventRuntime.Saves.Count == 0 && UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { command }) &&
+                ServerConsoleExecutor.Lines.SequenceEqual(new[] { command }),
+                "Reviewed mutation dispatches once without adding any save: " + command);
             if (UpgradeWorldScheduleCommands.GetKind(command) == UpgradeWorldCommandKind.QueuedMutation)
             {
                 Tick();
-                Check(ServerEventRuntime.Saves.Count == 1 && JournalState() == "running",
-                    "Queued mutation, including clean callbacks, cannot start post-save before completion: " + command);
+                Check(JournalState() == "running" && Runs.Count == 1,
+                    "Queued mutation keeps its durable marker until actual operation completion: " + command);
             }
             UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed"); Tick();
-            Check(ServerEventRuntime.Saves.Count == 2 && JournalState() == "running", "Mutation requests a single post-save without claiming completion: " + command);
-            ServerEventRuntime.Status.LatestSave = Save("post", ServerManagerSaveState.CheckpointCompleted); Tick();
-            Check(JournalState() == "ready" && Claims == 0 && Runs.Count == 0, "Full post-save durably completes reviewed mutation: " + command);
+            Check(ServerEventRuntime.Saves.Count == 0 && JournalState() == "ready" && Claims == 0 && Runs.Count == 0,
+                "Actual completion finishes mutation without an automatic post-save: " + command);
         }
         foreach (string command in new[] { "biomes_count 100", "objects_count", "objects_list", "locations_count", "locations_list", "chests_search Wood" })
         {
@@ -713,22 +721,23 @@ internal static class ServerScheduleRuntimeSmoke
             Check(!job.Maintenance && !job.CatchUp, "Queries derive no maintenance or offline catch-up: " + command);
             Due();
             Check(ServerConsoleExecutor.Lines.SequenceEqual(new[] { command }) && UpgradeWorldScheduleBridge.Begun.Count == 0 && ServerEventRuntime.Saves.Count == 0,
-                "Read-only UW query dispatches without implicit saves or mutation lifecycle: " + command);
+                "Read-only UW query dispatches without saves or mutation lifecycle: " + command);
             Restart(60);
-            Check(ServerConsoleExecutor.Lines.Count == 1 && ServerEventRuntime.Saves.Count == 0, "Read-only UW query does not replay its missed offline backlog: " + command);
+            Check(ServerConsoleExecutor.Lines.Count == 1 && ServerEventRuntime.Saves.Count == 0,
+                "Read-only UW query does not replay its missed offline backlog: " + command);
         }
     }
 
     private static void UntrackedUpgrade()
     {
-        Activate(Maintenance("zones_generate start"));
+        Activate(Config("zones_generate start"));
         BepInEx.Bootstrap.Chainloader.PluginInfos["upgrade_world"].Metadata.Version = new Version(1, 82);
         UpgradeWorldScheduleBridge.Available = false;
         UpgradeWorldScheduleBridge.FailureCode = "uw_unsupported_contract";
         Due();
         Check(ServerConsoleExecutor.Lines.SequenceEqual(new[] { "zones_generate start" }) &&
             ServerEventRuntime.Saves.Count == 0 && UpgradeWorldScheduleBridge.Begun.Count == 0,
-            "Single incompatible-contract command dispatches once without implicit saves or observer.");
+            "Single incompatible-contract command dispatches once without extra saves or observer.");
         Check(Runs.Count == 0 && JournalState() == "ready" && Claims == 0,
             "Dispatch-only occurrence finishes durably without a retry claim.");
         Check(ServerEventRuntime.Audits.Last().Code == "cron_dispatched_untracked" && ServerEventRuntime.Audits.Last().Success,
@@ -736,14 +745,14 @@ internal static class ServerScheduleRuntimeSmoke
         Tick(); Check(ServerConsoleExecutor.Lines.Count == 1, "No retry after untracked dispatch.");
         foreach (string[] commands in new[] { new[] { "zones_generate start", "save" }, new[] { "zones_generate start", "zones_reset start" } })
         {
-            Activate(Maintenance(commands));
+            Activate(Config(commands));
             UpgradeWorldScheduleBridge.Available = false;
             UpgradeWorldScheduleBridge.FailureCode = "uw_unsupported_contract";
             Due();
             Check(ServerConsoleExecutor.Lines.Count == 0 && ServerEventRuntime.Saves.Count == 0,
-                "Unobservable sequences stop before any command or implicit save.");
+                "Unobservable sequences stop before any command or user-written save.");
         }
-        Activate(Maintenance("zones_generate start"));
+        Activate(Config("zones_generate start"));
         UpgradeWorldScheduleBridge.Available = false;
         UpgradeWorldScheduleBridge.FailureCode = "uw_observer_cleanup_failed";
         Due();
@@ -754,7 +763,7 @@ internal static class ServerScheduleRuntimeSmoke
     {
         Activate(Maintenance("zones_reset start", "vegetation_reset start"));
         Due();
-        Check(ServerEventRuntime.Saves.Count == 1 && UpgradeWorldScheduleBridge.Begun.Count == 0, "Implicit pre-save precedes all resets.");
+        Check(ServerEventRuntime.Saves.Count == 1 && UpgradeWorldScheduleBridge.Begun.Count == 0, "Explicit pre-save precedes all resets.");
         ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted);
         bool markerObserved = false;
         UpgradeWorldScheduleBridge.BeforeBegin = () => markerObserved = JournalState() == "running";
@@ -778,20 +787,20 @@ internal static class ServerScheduleRuntimeSmoke
 
     private static void CommandCapabilities()
     {
-        Activate(Maintenance("world_clean"));
+        Activate(Config("world_clean"));
         UpgradeWorldScheduleBridge.Unsupported.Add("world_clean"); Due();
         Check(ServerEventRuntime.Saves.Count == 0 && ServerConsoleExecutor.Lines.SequenceEqual(new[] { "world_clean" }) &&
             ServerEventRuntime.Audits.Last().Code == "cron_dispatched_untracked" && UpgradeWorldScheduleBridge.Disposals == 1,
             "A command-specific unsupported contract keeps the single-command fallback and cleans its observer.");
-        Activate(Maintenance("zones_generate start", "world_clean"));
+        Activate(Config("zones_generate start", "world_clean"));
         UpgradeWorldScheduleBridge.Unsupported.Add("world_clean"); Due();
         Check(ServerEventRuntime.Saves.Count == 0 && ServerConsoleExecutor.Lines.Count == 0 && JournalState() == "ready",
             "All batch capabilities are checked before pre-save or any world mutation.");
-        Activate(Maintenance("zones_generate start"));
+        Activate(Config("zones_generate start"));
         UpgradeWorldScheduleBridge.Unsupported.Add("world_clean"); Due();
-        Check(ServerEventRuntime.Saves.Count == 1 && ServerConsoleExecutor.Lines.Count == 0,
+        Check(ServerEventRuntime.Saves.Count == 0 && UpgradeWorldScheduleBridge.Begun.Count == 1,
             "An unsupported clean capability does not disable a supported generation job.");
-        Activate(Maintenance("world_clean"));
+        Activate(Config("world_clean"));
         UpgradeWorldScheduleBridge.Unsupported.Add("world_clean");
         UpgradeWorldScheduleBridge.FailCleanup = true; Due();
         Check(ServerEventRuntime.Saves.Count == 0 && ServerConsoleExecutor.Lines.Count == 0 &&
@@ -831,7 +840,7 @@ internal static class ServerScheduleRuntimeSmoke
         Check(ServerConsoleExecutor.Lines.SequenceEqual(new[] { "ordinary_plugin_command" }) && ServerEventRuntime.Saves.Count == 0,
             "A genuinely non-UW raw command remains an ordinary scheduled command.");
 
-        Activate(Config("world_clean")); Due();
+        Activate(Maintenance("world_clean")); Due();
         ValheimPrivateAccess.Commands["world_clean"] = new Terminal.ConsoleCommand(GC.Collect);
         ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
         Check(ServerConsoleExecutor.Lines.Count == 0 && ServerEventRuntime.Saves.Count == 1 && JournalState() == "needs_review",
@@ -846,13 +855,13 @@ internal static class ServerScheduleRuntimeSmoke
 
     private static void SynchronousMutationAbort()
     {
-        Activate(Config("locations_fix", "time_set 1000")); Due();
+        Activate(Maintenance("locations_fix", "time_set 1000")); Due();
         ServerConsoleExecutor.NextResult = new(false, "rcon_failed", "failed");
         ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
         Check(UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { "locations_fix" }) && ServerEventRuntime.Saves.Count == 1 && JournalState() == "needs_review",
             "Synchronous mutation failure blocks its next mutation and post-save behind durable review.");
 
-        Activate(Config("locations_fix", "time_set 1000")); Due();
+        Activate(Maintenance("locations_fix", "time_set 1000")); Due();
         var capturedSave = ServerEventRuntime.Saves.Single();
         ServerConsoleExecutor.OnExecute = ServerScheduleRuntime.Stop;
         ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
@@ -906,60 +915,32 @@ internal static class ServerScheduleRuntimeSmoke
 
     private static void MaintenancePartialPersistence()
     {
-        foreach (string outcome in new[] { "success", "failed", "partial", "timeout", "replaced" })
+        foreach (string failureCode in new[] { "uw_partial_failure", "uw_execution_exception" })
         {
-            Activate(Maintenance("zones_generate start", "zones_reset start")); Due();
-            ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
-            UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Pending, "uw_partial_failure"); Tick();
-            Check(ServerEventRuntime.Saves.Count == 1 && UpgradeWorldScheduleBridge.Begun.Count == 1 && JournalState() == "running",
-                "Partial failure while UW is still executing neither saves nor advances the batch.");
-            UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure", true); Tick();
-            Check(ServerEventRuntime.Saves.Count == 2 && UpgradeWorldScheduleBridge.Begun.Count == 1 && JournalState() == "running" &&
-                Get(Session!, "_maintenanceOwner") != null && UpgradeWorldScheduleBridge.Disposals == 0,
-                "Certified normal partial termination requests one checkpoint while retaining ownership and skipping remaining mutations.");
-            if (outcome == "timeout") Set(Runs[0]!, "Deadline", 0L);
-            else if (outcome == "replaced")
-            {
-                ServerEventRuntime.Status.LatestSave = Save("partial-save", ServerManagerSaveState.InProgress); Tick();
-                ServerEventRuntime.Status.LatestSave = Save("unrelated-new-save", ServerManagerSaveState.CheckpointCompleted);
-            }
-            else
-            {
-                var save = Save("partial-save", outcome == "failed" ? ServerManagerSaveState.Failed : ServerManagerSaveState.CheckpointCompleted);
-                if (outcome == "partial") save.PendingCharacterCount = 1;
-                ServerEventRuntime.Status.LatestSave = save;
-            }
-            Tick();
-            var final = ServerEventRuntime.Audits.Last(a => a.Verb == "maintenance");
-            Check(JournalState() == "needs_review" && !final.Success && final.Code == "cron_needs_review" &&
-                final.Data["cron_failure_code"] == "uw_partial_failure" &&
-                final.Data["cron_partial_changes"] == (outcome == "success" ? "persisted" : "not_confirmed"),
-                "Partial result stays failed/reviewable; persistence is certified only by full checkpoint: " + outcome);
-            string expected = outcome == "success" ? "checkpoint_completed" : outcome == "failed" ? "save_failed" :
-                outcome == "partial" ? "checkpoint_partial" : outcome == "timeout" ? "save_unconfirmed" : "save_observation_lost";
-            Check(final.Data["cron_save_result"] == expected && UpgradeWorldScheduleBridge.Disposals == 1 &&
-                !ServerConsoleExecutor.Lines.Contains("zones_reset start"), "Original mutation and checkpoint outcomes remain distinct: " + outcome);
-            Due(); Check(ServerEventRuntime.Saves.Count == 2 && UpgradeWorldScheduleBridge.Begun.Count == 1,
-                "Neither partial mutation nor failed persistence is automatically replayed.");
+            Activate(Config("zones_generate start", "zones_reset start")); Due();
+            UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Pending, failureCode); Tick();
+            Check(ServerEventRuntime.Saves.Count == 0 && UpgradeWorldScheduleBridge.Begun.Count == 1 && JournalState() == "running",
+                "Failure indication while UW executes neither advances the batch nor adds a save.");
+            UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, failureCode); Tick();
+            Check(ServerEventRuntime.Saves.Count == 0 && UpgradeWorldScheduleBridge.Begun.Count == 1 && JournalState() == "needs_review",
+                "Settled partial failure remains reviewable, skips remaining mutations, and never inserts a preservation save.");
+            Check(ServerEventRuntime.Audits.Any(a => a.Code == failureCode && !a.Success),
+                "Original partial-failure reason remains in the audit when forced persistence is removed.");
+            Check(!ServerEventRuntime.Audits.Any(a => a.Code.Contains("persisted") || a.Code == "checkpoint_completed"),
+                "Partial operation does not falsely claim that changes were persisted.");
+            Due(); Restart(60);
+            Check(ServerEventRuntime.Saves.Count == 0 && UpgradeWorldScheduleBridge.Begun.Count == 1 && JournalState() == "needs_review",
+                "Partial failure never automatically repeats the mutation after restart.");
         }
-        Activate(Maintenance("zones_generate start")); Due();
-        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
-        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure", true); Tick();
-        Restart(60);
-        Check(JournalState() == "needs_review" && ServerEventRuntime.Saves.Count == 2 && UpgradeWorldScheduleBridge.Begun.Count == 1,
-            "Restart during partial persistence keeps durable review, never claims success or replays generation.");
-
-        Activate(Maintenance("zones_generate start")); Due();
-        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
-        Set(Runs[0]!, "Retired", true);
-        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure", true); Tick();
-        Check(JournalState() == "needs_review" && ServerEventRuntime.Saves.Count == 1,
-            "Retired authority never starts a new partial-result checkpoint.");
+        Activate(Config("zones_generate start", "save")); Due();
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure"); Tick();
+        Check(ServerEventRuntime.Saves.Count == 0 && JournalState() == "needs_review",
+            "Failure stops the remaining user-written batch, including its trailing save.");
     }
 
     private static void MaintenanceTimeoutDrain()
     {
-        Activate("jobs:\n" + Job("first", new[] { "zones_generate start" }) +
+        Activate("jobs:\n" + Job("first", new[] { "save", "zones_generate start", "save" }) +
             Job("second", new[] { "zones_reset start" }) + Job("ordinary", new[] { "echo after" }));
         Due(); ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
         object active = Runs.Cast<object>().Single(run => (bool)Get(run, "WaitingUpgrade")!);
@@ -1012,7 +993,7 @@ internal static class ServerScheduleRuntimeSmoke
 
     private static void MaintenanceReviewBarrier()
     {
-        Activate("jobs:\n" + Job("a", new[] { "zones_reset start" }) + Job("b", new[] { "locations_reset start" })); Due();
+        Activate("jobs:\n" + Job("a", new[] { "save", "zones_reset start", "save" }) + Job("b", new[] { "save", "locations_reset start", "save" })); Due();
         ServerEventRuntime.Status.LatestSave = Save("a-pre", ServerManagerSaveState.CheckpointCompleted); Tick();
         UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure"); Tick();
         Check(JournalState(JobId(0)) == "needs_review" && JournalState(JobId(1)) == "pending" && ServerEventRuntime.Saves.Count == 1 &&
@@ -1022,7 +1003,7 @@ internal static class ServerScheduleRuntimeSmoke
         Check(ack.Result.Success && JournalState(JobId(0)) == "ready" && JournalState(JobId(1)) == "running" && Runs.Count == 1 && Claims == 1,
             "Acknowledgement can release review with another unstarted pending job, preserving its unique claim.");
         Check(ServerEventRuntime.Saves.Count == 2 && UpgradeWorldScheduleBridge.Begun.Count == 1,
-            "Pending maintenance still starts with its own checkpoint after acknowledgement.");
+            "Pending maintenance still starts with its user-written checkpoint after acknowledgement.");
         ServerEventRuntime.Status.LatestSave = Save("b-pre", ServerManagerSaveState.CheckpointCompleted); Tick();
         Check(UpgradeWorldScheduleBridge.Begun.SequenceEqual(new[] { "zones_reset start", "locations_reset start" }),
             "Acknowledgement never replays failed job A or duplicates pending job B.");
@@ -1042,7 +1023,7 @@ internal static class ServerScheduleRuntimeSmoke
             "Reload cancellation releases a bridge acquired before maintenance ownership.");
 
         Activate("jobs:\n" + Job("ordinary", new[] { "announce Before upkeep" }) +
-            Job("maintenance", new[] { "zones_reset start" }));
+            Job("maintenance", new[] { "save", "zones_reset start", "save" }));
         var pending = new TaskCompletionSource<ServerManagerCommandResult>(); ServerCommands.NextTask = pending.Task; Due();
         Check(ServerCommands.Calls.Count == 1 && ServerEventRuntime.Saves.Count == 0 && JournalState(JobId(1)) == "pending",
             "Maintenance pre-save waits for previously admitted asynchronous scheduled commands.");
@@ -1050,7 +1031,7 @@ internal static class ServerScheduleRuntimeSmoke
         Check(ServerEventRuntime.Saves.Count == 1 && JournalState(JobId(1)) == "running",
             "Maintenance admission resumes after the previous command completes.");
 
-        Activate("jobs:\n" + Job("upkeep", new[] { "zones_reset start" }) + Job("query", new[] { "objects_count" }) +
+        Activate("jobs:\n" + Job("upkeep", new[] { "save", "zones_reset start", "save" }) + Job("query", new[] { "objects_count" }) +
             Job("ordinary", new[] { "echo after-upkeep" })); Due();
         Check(ServerEventRuntime.Saves.Count == 1 && ServerConsoleExecutor.Lines.SequenceEqual(new[] { "objects_count" }),
             "Owned read-only UW query interleaves with maintenance pre-save, while unrelated raw commands wait.");
@@ -1080,7 +1061,7 @@ internal static class ServerScheduleRuntimeSmoke
         foreach (string transition in new[] { "shutdown", "epoch", "not_ready" })
         {
             string first = mutation ? "world_clean" : "echo invalidated-world";
-            Activate(Config(first, mutation ? "clean_chests" : "echo invalidated-tail"));
+            Activate(mutation ? Maintenance(first, "clean_chests") : Config(first, "echo invalidated-tail"));
             object prior = Session!;
             if (mutation) Due();
             ServerConsoleExecutor.NextResult = new(success, success ? "rcon_dispatched" : "rcon_failed", "fixture result");
@@ -1127,17 +1108,316 @@ internal static class ServerScheduleRuntimeSmoke
 
     private static void Throws<T>(Action action, string reason) where T : Exception
     { try { action(); } catch (T) { Check(true, reason); return; } throw new Exception(reason); }
+
+    // Production bridge/scheduler execute against a public BCL-only provider
+    // fixture. No new YAML field, timestamp proof or FreshWorld history is used.
+    private static void RegisterFresh()
+    {
+        BepInEx.Bootstrap.Chainloader.PluginInfos["sighsorry.FreshWorld"] = new BepInEx.PluginInfo();
+        FreshWorld.API.MaintenanceCoordination.Enabled = true;
+    }
+    private static void ActivateFresh(string state = "Ready", Action? configure = null, bool explicitSaves = false)
+    {
+        Activate(explicitSaves ? Maintenance("zones_generate start") : Config("zones_generate start"));
+        RegisterFresh();
+        FreshWorld.API.MaintenanceCoordination.Status = state;
+        ServerEventRuntime.AssignMaintenanceIds = explicitSaves;
+        configure?.Invoke();
+        Due();
+    }
+    private static void PollFresh()
+    {
+        foreach (object run in Runs) Set(run, "NextFreshWorldPoll", 0L);
+        Tick();
+    }
+    private static void FreshWorldContract()
+    {
+        Reset();
+        Check(!FreshWorldScheduleBridge.IsInstalled &&
+            !FreshWorldScheduleBridge.TryCreate(out _, out string absent) && absent == "fw_not_installed",
+            "Provider API in an unrelated assembly is not mistaken for installed FreshWorld.");
+        RegisterFresh();
+        FreshWorld.API.MaintenanceCoordination.Enabled = false;
+        Check(FreshWorldScheduleBridge.IsInstalled && !FreshWorldScheduleBridge.TryCreate(out _, out string unsupported) &&
+            unsupported == "fw_unsupported_contract", "Installed incompatible provider is distinct from an absent one.");
+        FreshWorld.API.MaintenanceCoordination.Enabled = true;
+        Check(FreshWorldScheduleBridge.TryCreate(out FreshWorldScheduleBridge? bridge, out _),
+            "The minimal v2 BCL lease contract is discovered.");
+        BepInEx.Bootstrap.Chainloader.PluginInfos["sighsorry.FreshWorld"].Metadata.Version = new Version(99, 7, 3);
+        Check(bridge!.Current && FreshWorldScheduleBridge.TryCreate(out _, out _),
+            "Unrelated provider version changes do not invalidate the behavior contract.");
+        FreshWorld.API.MaintenanceCoordination.BeforeAcquire = () => FreshWorld.API.MaintenanceCoordination.Status = "Busy";
+        Check(!bridge.TryAcquire("123456789", "fixture", out _, out _, out bool busy, out _) && busy &&
+            !FreshWorld.API.MaintenanceCoordination.LeaseHeld,
+            "Atomic acquisition rejects a competing task that starts before the claim, without a check-only race.");
+        FreshWorld.API.MaintenanceCoordination.BeforeAcquire = null;
+        FreshWorld.API.MaintenanceCoordination.Status = "Ready";
+        Check(bridge.TryAcquire("123456789", "fixture", out string session, out string token, out busy, out _) && !busy &&
+            bridge.Validate("123456789", session, "fixture", token),
+            "Acquired lease carries the correct world, session and owner identity.");
+        Check(!bridge.Validate("another-world", session, "fixture", token) &&
+            !bridge.Release("123456789", session, "another-owner", token),
+            "A foreign world or owner cannot validate or release a lease.");
+        Check(bridge.Release("123456789", session, "fixture", token) &&
+            !bridge.Release("123456789", session, "fixture", token), "Lease releases exactly once.");
+        BepInEx.Bootstrap.Chainloader.PluginInfos["sighsorry.FreshWorld"] = new BepInEx.PluginInfo();
+        Check(!bridge.Current && !bridge.TryAcquire("123456789", "fixture", out _, out _, out _, out _),
+            "Replacing a provider instance invalidates its cached bridge.");
+
+        Activate(Config("announce unaffected")); RegisterFresh();
+        FreshWorld.API.MaintenanceCoordination.Enabled = false; Due();
+        Check(ServerCommands.Calls.Count == 1 && FreshWorld.API.MaintenanceCoordination.Acquisitions == 0,
+            "Ordinary scheduling does not consult an incompatible FreshWorld provider.");
+        Activate(Config("save")); RegisterFresh(); FreshWorld.API.MaintenanceCoordination.Enabled = false; Due();
+        Check(ServerEventRuntime.Saves.Count == 1 && !ServerEventRuntime.Saves[0].Maintenance &&
+            FreshWorld.API.MaintenanceCoordination.Acquisitions == 0,
+            "Ordinary explicit save remains available with an incompatible optional provider.");
+
+        Activate(Maintenance("zones_generate start")); Due(); RegisterFresh();
+        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 0 && JournalState() == "needs_review",
+            "A provider appearing after admission cannot be bypassed at the next dispatch boundary.");
+    }
+
+    private static void FreshWorldOrdering()
+    {
+        ActivateFresh("Busy");
+        Check(JournalState() == "pending" && ServerEventRuntime.Saves.Count == 0 &&
+            UpgradeWorldScheduleBridge.Begun.Count == 0 && !FreshWorld.API.MaintenanceCoordination.LeaseHeld,
+            "Existing cron syntax waits lease-free while FreshWorld is running.");
+        int attempts = FreshWorld.API.MaintenanceCoordination.Acquisitions;
+        int supportChecks = UpgradeWorldScheduleBridge.SupportChecks;
+        for (int index = 0; index < 12; ++index) Tick();
+        Check(FreshWorld.API.MaintenanceCoordination.Acquisitions == attempts,
+            "Busy provider calls are throttled, not repeated every frame.");
+        Check(UpgradeWorldScheduleBridge.SupportChecks == supportChecks,
+            "A busy provider does not cause repeated per-frame Upgrade World contract inspection.");
+        FreshWorld.API.MaintenanceCoordination.Status = "Ready";
+        UpgradeWorldScheduleBridge.BeforeBegin = () => Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld &&
+            JournalState() == "running", "Shared lease and durable running marker precede UW dispatch.");
+        PollFresh();
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 1 && FreshWorld.API.MaintenanceCoordination.LeaseHeld &&
+            ServerEventRuntime.Saves.Count == 0, "UW starts after the shared claim without any extra save.");
+        FreshWorld.API.MaintenanceCoordination.OnRelease = () => Check(JournalState() == "ready",
+            "Terminal result is durable before the shared lease is released.");
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed"); Tick();
+        Check(JournalState() == "ready" && FreshWorld.API.MaintenanceCoordination.Releases == 1 &&
+            !FreshWorld.API.MaintenanceCoordination.LeaseHeld && ServerEventRuntime.Saves.Count == 0,
+            "Actual UW completion releases once without an automatic post-save.");
+
+        ActivateFresh("FailedPreviously");
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 1 && FreshWorld.API.MaintenanceCoordination.LeaseHeld,
+            "An idle provider after an earlier failed reset allows UW: exclusion is not occurrence-success certification.");
+        ActivateFresh(configure: () => ZNet.instance!.Dedicated = false);
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 1 && FreshWorld.API.MaintenanceCoordination.LeaseHeld &&
+            ServerEventRuntime.Saves.Count == 0, "Lease-only mutual exclusion works on a listen host without requiring a dedicated save proof.");
+    }
+
+    private static void FreshWorldFailures()
+    {
+        foreach (string error in new[] { "ProviderNotReady", "WrongWorld", "PreparationFailed", "ProviderError" })
+        {
+            ActivateFresh(configure: () => FreshWorld.API.MaintenanceCoordination.AcquireError = error);
+            Check(UpgradeWorldScheduleBridge.Begun.Count == 0 && ServerEventRuntime.Saves.Count == 0 &&
+                !FreshWorld.API.MaintenanceCoordination.LeaseHeld && ServerScheduleRuntime.GetStatus().Code != "cron_suspended",
+                "Rejected provider admission prevents only this maintenance dispatch: " + error);
+        }
+        ActivateFresh(configure: () => FreshWorld.API.MaintenanceCoordination.Enabled = false);
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 0 && ServerEventRuntime.Saves.Count == 0,
+            "Installed unsupported FreshWorld does not silently act as absent.");
+        ActivateFresh(configure: () => { UpgradeWorldScheduleBridge.Available = false; UpgradeWorldScheduleBridge.FailureCode = "uw_unsupported_contract"; });
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 0 && ServerConsoleExecutor.Lines.Count == 0 &&
+            FreshWorld.API.MaintenanceCoordination.Acquisitions == 0,
+            "FreshWorld coordination never uses unobservable single-command fallback.");
+
+        ActivateFresh();
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Pending, "uw_partial_failure");
+        UpgradeWorldScheduleBridge.Idle = false; Tick();
+        Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0 &&
+            ServerEventRuntime.Saves.Count == 0, "Failure indication alone is not proof that UW stopped.");
+        UpgradeWorldScheduleBridge.Idle = true;
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Failed, "uw_partial_failure"); Tick();
+        Check(JournalState() == "needs_review" && FreshWorld.API.MaintenanceCoordination.Releases == 1 &&
+            ServerEventRuntime.Saves.Count == 0, "Settled partial failure records review without a forced preservation save.");
+
+        ActivateFresh(explicitSaves: true);
+        FreshWorld.API.MaintenanceCoordination.Valid = false;
+        Check(!ServerEventRuntime.Saves[0].Authorized(), "Queued explicit save guard revalidates the shared lease.");
+        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 0 && JournalState() == "needs_review",
+            "Lost lease blocks the next mutation after an explicit checkpoint.");
+    }
+
+    private static void FreshWorldTimeoutAndRecovery()
+    {
+        ActivateFresh();
+        Set(Runs[0]!, "Deadline", 0L); UpgradeWorldScheduleBridge.Idle = false; Tick(); Tick();
+        Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0 &&
+            UpgradeWorldScheduleBridge.TimeoutMarks == 1 && ServerEventRuntime.Saves.Count == 0,
+            "UW timeout retains the shared lease until actual worker/queue idle, and logs only once.");
+        UpgradeWorldScheduleBridge.Idle = true;
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Indeterminate, "uw_unconfirmed"); Tick();
+        Check(JournalState() == "needs_review" && FreshWorld.API.MaintenanceCoordination.Releases == 1,
+            "Idle after timeout releases safely but never marks the operation successful.");
+
+        ActivateFresh();
+        UpgradeWorldScheduleBridge.Idle = false;
+        string id = JobId(); Restart(60);
+        Check(JournalState(id) == "needs_review" && UpgradeWorldScheduleBridge.Begun.Count == 1,
+            "Restart does not replay a running UW occurrence.");
+        Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0,
+            "Retiring an observer is not permission to unlock work that may still run.");
+
+        Activate(Config("zones_reset start", "locations_reset start")); RegisterFresh(); Due();
+        object settings = Get(Session!, "_settings")!;
+        Reload(Config("echo replacement"));
+        Check(ReferenceEquals(settings, Get(Session!, "_settings")) && FreshWorld.API.MaintenanceCoordination.LeaseHeld,
+            "Configuration replacement waits for the captured mutation batch.");
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed"); Tick();
+        Check(FreshWorld.API.MaintenanceCoordination.Releases == 1 && !ReferenceEquals(settings, Get(Session!, "_settings")) &&
+            ServerEventRuntime.Saves.Count == 0, "Captured batch drains and releases before installing replacement settings.");
+    }
+
+    private static void FreshWorldNativeSaveDrain()
+    {
+        ActivateFresh(explicitSaves: true);
+        Check(ServerEventRuntime.Saves.Count == 1 && FreshWorld.API.MaintenanceCoordination.LeaseHeld &&
+            UpgradeWorldScheduleBridge.Begun.Count == 0, "User-written pre-save retains the shared lease until its own checkpoint.");
+        ZNet.instance!.Saving = true;
+        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.Failed); Tick();
+        Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0 &&
+            UpgradeWorldScheduleBridge.Begun.Count == 0, "Failed save status does not prove native worker idle.");
+        ZNet.instance.Saving = false; Tick();
+        Check(JournalState() == "needs_review" && FreshWorld.API.MaintenanceCoordination.Releases == 1 &&
+            ServerEventRuntime.Saves.Count == 1, "Native worker idle permits release without save retries or UW execution.");
+
+        ActivateFresh(explicitSaves: true);
+        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 1 && ServerEventRuntime.Saves.Count == 1,
+            "Explicit pre-save completion permits UW exactly once.");
+        UpgradeWorldScheduleBridge.Observation = new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed"); Tick();
+        Check(ServerEventRuntime.Saves.Count == 2 && FreshWorld.API.MaintenanceCoordination.LeaseHeld,
+            "User-written trailing save is still executed, with no duplicate save.");
+        ServerEventRuntime.Status.LatestSave = Save("post", ServerManagerSaveState.CheckpointCompleted); Tick();
+        Check(JournalState() == "ready" && FreshWorld.API.MaintenanceCoordination.Releases == 1,
+            "Explicit trailing checkpoint releases the captured batch.");
+
+        foreach (bool lostIdentity in new[] { false, true })
+        {
+            ActivateFresh(explicitSaves: true);
+            ZNet.instance!.Saving = true;
+            if (lostIdentity) ServerEventRuntime.Status.LatestSave = Save("newer-save", ServerManagerSaveState.CheckpointCompleted);
+            else Set(Runs[0]!, "Deadline", 0L);
+            Tick();
+            Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0,
+                "Lost or timed-out checkpoint retains exclusion while its known-started native worker is active.");
+            ZNet.instance.Saving = false; Tick();
+            Check(JournalState() == "needs_review" && FreshWorld.API.MaintenanceCoordination.Releases == 1 &&
+                UpgradeWorldScheduleBridge.Begun.Count == 0 && ServerEventRuntime.Saves.Count == 1 &&
+                ServerEventRuntime.Audits.Any(a => !a.Success && a.Code == (lostIdentity ? "save_observation_lost" : "save_unconfirmed")),
+                "Known-started save becoming idle permits failed cleanup, not success or a remaining mutation.");
+        }
+
+        ActivateFresh(configure: () => ServerEventRuntime.NextSave = Task.FromResult(new ServerManagerCommandResult(true, "save_requested", "deferred, no ID")), explicitSaves: true);
+        Set(Runs[0]!, "Deadline", 0L); Tick();
+        Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0,
+            "Unknown-start deferred save cannot release on timeout just because no worker is active yet.");
+        ServerEventRuntime.Status.LatestSave = Save("deferred-started", ServerManagerSaveState.CheckpointCompleted); Tick();
+        Check(JournalState() == "needs_review" && FreshWorld.API.MaintenanceCoordination.Releases == 1 &&
+            UpgradeWorldScheduleBridge.Begun.Count == 0,
+            "Later terminal evidence resolves deferred save as failed timeout without running its mutation.");
+    }
+
+    private static void FreshWorldBusyBounds()
+    {
+        foreach (string busy in new[] { "world_save", "upgrade_world", "cleanup" })
+        {
+            ActivateFresh(configure: () =>
+            {
+                if (busy == "world_save") ZNet.instance!.Saving = true;
+                else if (busy == "upgrade_world") UpgradeWorldScheduleBridge.Idle = false;
+                else FreshWorld.API.MaintenanceCoordination.AcquireError = "CleanupPending";
+            });
+            Check(JournalState() == "pending" && !FreshWorld.API.MaintenanceCoordination.LeaseHeld &&
+                ServerEventRuntime.Saves.Count == 0 && UpgradeWorldScheduleBridge.Begun.Count == 0,
+                "Unstarted work waits without taking a lease while native work/cleanup is busy: " + busy);
+            ZNet.instance!.Saving = false; UpgradeWorldScheduleBridge.Idle = true;
+            FreshWorld.API.MaintenanceCoordination.AcquireError = ""; PollFresh();
+            Check(UpgradeWorldScheduleBridge.Begun.Count == 1 && FreshWorld.API.MaintenanceCoordination.LeaseHeld,
+                "Settled native work/cleanup allows a single shared claim and dispatch: " + busy);
+        }
+        ActivateFresh("Busy");
+        Reload(Config("echo after-cancel")); Due();
+        Check(!FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0 &&
+            ServerConsoleExecutor.Lines.SequenceEqual(new[] { "echo after-cancel" }),
+            "Reload safely retires a never-started lease-free waiter without leaving a lock.");
+    }
+
+    private static void FreshWorldAdmissionBounds()
+    {
+        FileStream? journalLock = null;
+        try
+        {
+            ActivateFresh(configure: () => FreshWorld.API.MaintenanceCoordination.BeforeAcquire = () =>
+                journalLock = new FileStream(JournalPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None));
+            Check(ServerScheduleRuntime.GetStatus().Code == "cron_suspended" && UpgradeWorldScheduleBridge.Begun.Count == 0 &&
+                ServerEventRuntime.Saves.Count == 0 && FreshWorld.API.MaintenanceCoordination.Releases == 1 &&
+                !FreshWorld.API.MaintenanceCoordination.LeaseHeld,
+                "Pre-dispatch journal failure releases an idle lease after revoking authority, without stranding FreshWorld.");
+        }
+        finally { journalLock?.Dispose(); }
+
+        var queuedSave = new TaskCompletionSource<ServerManagerCommandResult>();
+        ActivateFresh(configure: () => ServerEventRuntime.NextSave = queuedSave.Task, explicitSaves: true);
+        UpgradeWorldScheduleBridge.Idle = false; Set(Runs[0]!, "AdmissionDeadline", 0L); Tick();
+        Check(ServerEventRuntime.Saves[0].Cancellation.IsCancellationRequested && !ServerEventRuntime.Saves[0].Authorized() &&
+            FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0,
+            "Admission expiry cancels the unstarted request but does not unlock while foreign native work is active.");
+        queuedSave.SetResult(new(false, "cancelled", "unstarted queued save")); Tick();
+        Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld && UpgradeWorldScheduleBridge.Begun.Count == 0,
+            "Cancelled request is consumed without a tail or premature release.");
+        UpgradeWorldScheduleBridge.Idle = true; Tick();
+        Check(JournalState() == "needs_review" && FreshWorld.API.MaintenanceCoordination.Releases == 1,
+            "Settled admission cancellation releases once and preserves the interrupted batch for review.");
+
+        ActivateFresh(explicitSaves: true);
+        UpgradeWorldScheduleBridge.Idle = false;
+        ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
+        Check(UpgradeWorldScheduleBridge.Begun.Count == 0 && FreshWorld.API.MaintenanceCoordination.LeaseHeld,
+            "Foreign UW starting between explicit save and mutation prevents overlapping dispatch.");
+        Set(Runs[0]!, "AdmissionDeadline", 0L); Tick();
+        UpgradeWorldScheduleBridge.Idle = true; Tick();
+        Check(JournalState() == "needs_review" && FreshWorld.API.MaintenanceCoordination.Releases == 1 &&
+            UpgradeWorldScheduleBridge.Begun.Count == 0,
+            "An expired between-step admission never resumes its delayed mutation after the foreign work ends.");
+
+        foreach (bool identified in new[] { false, true })
+        {
+            var failure = new TaskCompletionSource<ServerManagerCommandResult>();
+            ActivateFresh(configure: () => ServerEventRuntime.NextSave = failure.Task, explicitSaves: true);
+            ZNet.instance!.Saving = true;
+            failure.SetResult(new(false, "save_failed", "entry threw after starting worker", identified ? "worker-save" : "")); Tick();
+            Check(FreshWorld.API.MaintenanceCoordination.LeaseHeld && FreshWorld.API.MaintenanceCoordination.Releases == 0 &&
+                UpgradeWorldScheduleBridge.Begun.Count == 0,
+                "Failed request cannot unlock its active native worker, with or without assigned identity.");
+            ZNet.instance.Saving = false; Tick();
+            Check(JournalState() == "needs_review" && FreshWorld.API.MaintenanceCoordination.Releases == 1 &&
+                ServerEventRuntime.Saves.Count == 1, "Failed native dispatch drains without inventing checkpoint success or save retry.");
+        }
+    }
+
 }
 
 public sealed class ZNet
 {
     public static ZNet? instance;
-    public bool Server = true, Saving;
+    public bool Server = true, Saving, Dedicated = true;
     public double Seconds;
     public long WorldUid = 123456789L;
     public long GetWorldUID() => WorldUid;
     public bool IsServer() => Server;
     public bool IsSaving() => Saving;
+    public bool IsDedicated() => Dedicated;
     public double GetTimeSeconds() => Seconds;
 }
 public sealed class EnvMan { public static EnvMan? instance; public double m_dayLengthSec = 86400; }
@@ -1157,6 +1437,43 @@ namespace BepInEx
         internal object Instance = new FixtureUpgradeWorld();
     }
     internal sealed class PluginMetadata { internal Version Version = new(1, 80); }
+}
+namespace FreshWorld.API
+{
+    // Public contract fixture only. It does not import/copypaste FreshWorld's
+    // maintenance implementation; the source-linked SM bridge invokes it by
+    // reflection exactly as it would the optional external provider.
+    public static class MaintenanceCoordination
+    {
+        internal static bool Enabled, LeaseHeld, Valid = true;
+        internal static string Status = "Ready", Session = "fw-session", Owner = "", Token = "", World = "", AcquireError = "";
+        internal static int Acquisitions, Releases;
+        internal static Action? BeforeAcquire, OnRelease;
+        public static int ContractVersion => Enabled ? 2 : 0;
+        public static string[] Capabilities => new[] { "atomic-lease-v1", "main-thread-v1", "lease-validation-v1" };
+        internal static void Reset()
+        {
+            Enabled = LeaseHeld = false; Valid = true; Status = "Ready"; Session = "fw-session";
+            Owner = Token = World = AcquireError = ""; Acquisitions = Releases = 0;
+            BeforeAcquire = OnRelease = null;
+        }
+        public static Dictionary<string, string> TryAcquire(string world, string owner)
+        {
+            ++Acquisitions; BeforeAcquire?.Invoke();
+            if (AcquireError.Length != 0)
+                return new() { ["status"] = AcquireError == "Busy" || AcquireError == "CleanupPending" ? "Busy" : "Rejected", ["errorCode"] = AcquireError };
+            if (LeaseHeld || Status == "Busy") return new() { ["status"] = "Busy", ["errorCode"] = "Busy" };
+            LeaseHeld = true; Owner = owner; Token = Guid.NewGuid().ToString("N"); World = world;
+            return new() { ["status"] = "Acquired", ["worldId"] = World, ["sessionId"] = Session, ["leaseToken"] = Token };
+        }
+        public static bool ValidateLease(string world, string session, string owner, string token) =>
+            Valid && LeaseHeld && world == World && session == Session && owner == Owner && token == Token;
+        public static bool ReleaseLease(string world, string session, string owner, string token)
+        {
+            if (!LeaseHeld || world != World || session != Session || owner != Owner || token != Token) return false;
+            ++Releases; OnRelease?.Invoke(); LeaseHeld = false; return true;
+        }
+    }
 }
 internal sealed class FixtureUpgradeWorld { internal static void NoOp() { } internal static bool True() => true; }
 public class Terminal
@@ -1192,9 +1509,8 @@ namespace ServerManager
     {
         internal UpgradeWorldScheduleState State { get; }
         internal string Code { get; }
-        internal bool CanPersistPartialChanges { get; }
-        internal UpgradeWorldScheduleObservation(UpgradeWorldScheduleState state, string code, bool canPersistPartialChanges = false)
-        { State = state; Code = code; CanPersistPartialChanges = canPersistPartialChanges; }
+        internal UpgradeWorldScheduleObservation(UpgradeWorldScheduleState state, string code)
+        { State = state; Code = code; }
     }
     internal sealed class UpgradeWorldScheduleBridge : IDisposable
     {
@@ -1205,12 +1521,12 @@ namespace ServerManager
         internal static readonly HashSet<string> Unsupported = new();
         internal static UpgradeWorldScheduleObservation Observation;
         internal static Action? BeforeBegin;
-        internal static int Disposals, TimeoutMarks;
+        internal static int Disposals, TimeoutMarks, SupportChecks;
         internal static void Reset()
         {
             Available = Allowed = Idle = true; Begun.Clear(); BeforeBegin = null; Disposals = 0;
             FailureCode = "uw_unavailable";
-            Unsupported.Clear(); TimeoutMarks = 0;
+            Unsupported.Clear(); TimeoutMarks = SupportChecks = 0;
             ObserverCleanupFailed = FailCleanup = false;
             Observation = new(UpgradeWorldScheduleState.Pending, "uw_pending");
         }
@@ -1218,7 +1534,7 @@ namespace ServerManager
         internal static bool TryCreate(out UpgradeWorldScheduleBridge? bridge, out string code)
         { bridge = Available ? new UpgradeWorldScheduleBridge() : null; code = Available ? "uw_ready" : FailureCode; return Available; }
         internal bool SupportsCommand(string command, out string code)
-        { bool supported = !Unsupported.Contains(command.Split(' ')[0]); code = supported ? "uw_available" : "uw_unsupported_contract"; return supported; }
+        { ++SupportChecks; bool supported = !Unsupported.Contains(command.Split(' ')[0]); code = supported ? "uw_available" : "uw_unsupported_contract"; return supported; }
         internal void MarkTimedOut() => ++TimeoutMarks;
         internal bool TryGetIdle(out bool idle, out string code)
         { idle = Idle; code = "uw_idle"; return true; }
@@ -1340,17 +1656,31 @@ namespace ServerManager.Events
     }
     internal static class ServerEventRuntime
     {
-        internal sealed class SaveCall { internal CancellationToken Cancellation; internal Func<bool> Authorized = null!; }
+        internal sealed class SaveCall { internal CancellationToken Cancellation; internal Func<bool> Authorized = null!; internal bool Maintenance; }
         internal sealed class Audit { internal string Source = "", Id = "", Name = "", Verb = "", Target = "", Code = ""; internal bool Success, WriteAuditLog; internal Dictionary<string, string> Data = new(); }
         internal static long CommandWorldEpoch;
         internal static ServerManagerStatusSnapshot Status = new();
         internal static readonly List<SaveCall> Saves = new();
         internal static readonly List<Audit> Audits = new();
         internal static Task<ServerManagerCommandResult>? NextSave;
+        internal static bool AssignMaintenanceIds;
+        internal static int AssignedMaintenanceIds;
         internal static ServerManagerStatusSnapshot GetStatusSnapshot() => Status;
         internal static Task<ServerManagerCommandResult> EnqueueCommand(ServerEventCommandKind kind, string first, string second,
             CancellationToken cancellation, Func<bool> authorized)
         { Saves.Add(new SaveCall { Cancellation = cancellation, Authorized = authorized }); return NextSave ?? Task.FromResult(new ServerManagerCommandResult(true, "save_requested", "accepted")); }
+        internal static Task<ServerManagerCommandResult> EnqueueMaintenanceSave(ZNet network, CancellationToken cancellation, Func<bool> authorized)
+        {
+            Task<ServerManagerCommandResult> result = EnqueueCommand(ServerEventCommandKind.Save, "", "", cancellation, authorized);
+            Saves.Last().Maintenance = true;
+            if (AssignMaintenanceIds && NextSave == null)
+            {
+                string id = ++AssignedMaintenanceIds == 1 ? "pre" : "post";
+                Status.LatestSave = new ServerManagerSaveOperationSnapshot { OperationId = id, State = ServerManagerSaveState.InProgress };
+                return Task.FromResult(new ServerManagerCommandResult(true, "save_requested", "accepted", id));
+            }
+            return result;
+        }
         internal static void RecordCommand(string source, string id, string name, string verb, string target, string code, bool success,
             IReadOnlyDictionary<string, string>? data = null, bool writeAuditLog = true)
         { Audits.Add(new Audit { Source = source, Id = id, Name = name, Verb = verb, Target = target, Code = code, Success = success, WriteAuditLog = writeAuditLog,

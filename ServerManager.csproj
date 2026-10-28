@@ -230,6 +230,10 @@
         <None Include="Tests\PluginIncompatibilitySmoke.ps1"/>
         <None Include="Tests\ServerSchedule*.ps1"/>
         <None Include="Tests\ServerSchedule*.cs"/>
+        <None Include="Tests\MaintenanceSaveSmoke.cs"/>
+        <None Include="Tests\MaintenanceSaveSmoke.ps1"/>
+        <None Include="Tests\FreshWorldContractMono*.cs"/>
+        <None Include="Tests\FreshWorldContractMono*.ps1"/>
         <None Include="Tests\UpgradeWorldSchedule*.ps1"/>
         <None Include="Tests\UpgradeWorldSchedule*.cs"/>
         <None Include="Tests\ServerConsoleExecutorSmoke.ps1"/>

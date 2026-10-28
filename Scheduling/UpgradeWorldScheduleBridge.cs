@@ -18,10 +18,8 @@ internal readonly struct UpgradeWorldScheduleObservation
 {
     internal UpgradeWorldScheduleState State { get; }
     internal string Code { get; }
-    internal bool CanPersistPartialChanges { get; }
-    internal UpgradeWorldScheduleObservation(UpgradeWorldScheduleState state, string code,
-        bool canPersistPartialChanges = false)
-    { State = state; Code = code; CanPersistPartialChanges = canPersistPartialChanges; }
+    internal UpgradeWorldScheduleObservation(UpgradeWorldScheduleState state, string code)
+    { State = state; Code = code; }
 }
 
 // Optional observation adapter: validate the required runtime contract, not a version number.
@@ -278,7 +276,11 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     internal bool TryGetIdle(out bool idle, out string code)
     {
         idle = false;
-        if (!CanRun(out code)) return false;
+        code = "uw_unavailable";
+        if (!IsCurrent) return false;
+        if (ZNet.instance == null || !ZNet.instance.IsServer()) { code = "uw_server_required"; return false; }
+        // Cleanup is an observation, not permission to start a command. Losing
+        // root permission or disabling saves must not strand an idle FW lease.
         try
         {
             idle = Operations.Count == 0 && _coroutine.GetValue(null) == null;
@@ -304,7 +306,9 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
             return new(UpgradeWorldScheduleState.Failed, "uw_start_required");
         if (_observation.State == UpgradeWorldScheduleState.Pending && Poll().State == UpgradeWorldScheduleState.Pending)
             return new(UpgradeWorldScheduleState.Indeterminate, "uw_observer_busy");
-        if (!TryGetIdle(out bool idle, out string code) || !idle)
+        if (!CanRun(out string code))
+            return new(UpgradeWorldScheduleState.Failed, code);
+        if (!TryGetIdle(out bool idle, out code) || !idle)
             return new(UpgradeWorldScheduleState.Failed, code);
         // LPA's separately versioned placement API has no reviewed completion
         // result here. Do not silently certify a handoff to an unknown plugin.
@@ -360,8 +364,7 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
             if (!idle)
                 return new(UpgradeWorldScheduleState.Pending, _fault?.Code ?? "uw_pending");
             if (_fault is { } failure)
-                _observation = new(failure.State, failure.Code,
-                    failure.Code == "uw_partial_failure" && Completed);
+                _observation = new(failure.State, failure.Code);
             else if (Completed)
                 _observation = new(UpgradeWorldScheduleState.Succeeded, "uw_operation_completed");
             else
@@ -399,8 +402,8 @@ internal sealed class UpgradeWorldScheduleBridge : IDisposable
     private void Mark(UpgradeWorldScheduleState state, string code)
     {
         if (_observation.State != UpgradeWorldScheduleState.Pending) return;
-        // A later exception/cancel/foreign operation always revokes partial-save
-        // eligibility. Preserve the first non-partial cause for diagnosis.
+        // A later exception/cancel/foreign operation is more informative than
+        // skipped targets alone. Preserve the first non-partial cause for diagnosis.
         if (_fault == null || (_fault.Value.Code == "uw_partial_failure" && code != "uw_partial_failure"))
             _fault = new(state, code);
     }

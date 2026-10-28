@@ -52,14 +52,19 @@ internal static class UpgradeWorldScheduleSmoke
                 Check(bridge!.CanRun(out _), "Dedicated default root allowed");
                 UpgradeWorld.Settings.Root = false;
                 Check(!bridge.CanRun(out string denied) && denied == "uw_root_denied", "No root impersonation");
+                Check(bridge.TryGetIdle(out bool cleanupIdle, out _) && cleanupIdle, "Idle cleanup does not require root execution permission");
+                Check(bridge.Begin("zones_generate start", () => throw new Exception()).Code == "uw_root_denied", "Read-only idle proof never authorizes dispatch");
                 ZNet.instance!.Dedicated = false;
                 Check(bridge.CanRun(out _), "Listen host keeps UW local rule");
                 ZNet.instance.Dedicated = true; UpgradeWorld.Settings.Root = true;
                 UpgradeWorld.SavingCommands.SavingDisabled = true;
                 Check(!bridge.CanRun(out _), "Disabled saving blocks maintenance");
+                Check(bridge.TryGetIdle(out cleanupIdle, out _) && cleanupIdle, "Save-disabled mode cannot strand an idle exclusion lease");
+                Check(bridge.Begin("zones_generate start", () => throw new Exception()).Code == "uw_saving_disabled", "Save-disabled still rejects new commands");
                 UpgradeWorld.SavingCommands.SavingDisabled = false;
                 UpgradeWorld.ServerExecution.User = new ZRpc();
                 Check(!bridge.CanRun(out _), "No borrowed RPC caller");
+                Check(bridge.TryGetIdle(out cleanupIdle, out _) && cleanupIdle, "Cleanup reads native executor without borrowing RPC authority");
                 UpgradeWorld.ServerExecution.User = null;
                 Check(bridge.Begin("zones_reset", () => throw new Exception()).Code == "uw_start_required", "Explicit start required");
                 Check(bridge.Begin("upgrade onions start", () => throw new Exception()).Code == "uw_unsupported_command", "Broken upstream command never dispatched");
@@ -370,7 +375,7 @@ internal static class UpgradeWorldScheduleSmoke
         Check(bridge.Poll().State == UpgradeWorldScheduleState.Pending, "Internally caught exception does not imply UW idle");
         Drain(iterator!); Empty();
         var result = bridge.Poll();
-        Check(result.State == UpgradeWorldScheduleState.Failed && result.Code == "uw_execution_exception" && !result.CanPersistPartialChanges,
+        Check(result.State == UpgradeWorldScheduleState.Failed && result.Code == "uw_execution_exception",
             "ExecutionFailed defeats normal root exhaustion and empty queue");
 
         operation = new UpgradeWorld.Generate();
@@ -390,14 +395,14 @@ internal static class UpgradeWorldScheduleSmoke
         bridge.Begin("zones_generate start", () => { iterator = Track(operation, Nested().GetEnumerator()); return Success; });
         operation.SetFailed(2);
         var pending = bridge.Poll();
-        Check(pending.State == UpgradeWorldScheduleState.Pending && pending.Code == "uw_partial_failure" && !pending.CanPersistPartialChanges,
+        Check(pending.State == UpgradeWorldScheduleState.Pending && pending.Code == "uw_partial_failure",
             "Skipped zones remain pending while later zones execute");
         Drain(iterator!);
         Check(bridge.Poll().State == UpgradeWorldScheduleState.Pending, "Partial result still waits for executor drain");
         UpgradeWorld.Executor.Work.Clear(); Hook("BeforeStop"); UpgradeWorld.Executor.Busy = null;
         var result = bridge.Poll();
-        Check(result.State == UpgradeWorldScheduleState.Failed && result.Code == "uw_partial_failure" && result.CanPersistPartialChanges,
-            "Only fully ended, idle, sole partial failures permit preservation save");
+        Check(result.State == UpgradeWorldScheduleState.Failed && result.Code == "uw_partial_failure",
+            "Fully ended, idle partial failures remain failed; the observer does not request a save");
 
         foreach (string lateFault in new[] { "exception", "cancel", "foreign", "timeout" })
         {
@@ -410,8 +415,8 @@ internal static class UpgradeWorldScheduleSmoke
             else bridge.MarkTimedOut();
             Check(bridge.Poll().State == UpgradeWorldScheduleState.Pending, "Late " + lateFault + " keeps ownership until idle");
             Drain(iterator!); Empty(); result = bridge.Poll();
-            Check(result.State != UpgradeWorldScheduleState.Succeeded && !result.CanPersistPartialChanges && result.Code != "uw_partial_failure",
-                "Late " + lateFault + " revokes partial-save eligibility");
+            Check(result.State != UpgradeWorldScheduleState.Succeeded && result.Code != "uw_partial_failure",
+                "Late " + lateFault + " takes diagnostic precedence over skipped targets");
         }
     }
     private static void EndProof(UpgradeWorldScheduleBridge bridge)

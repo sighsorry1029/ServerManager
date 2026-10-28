@@ -1051,9 +1051,27 @@ namespace ServerManager.Events
                     exception.Message));
             }
 
+            return EnqueueValidatedCommand(command);
+        }
+
+        // Scheduler-only entry point, called on Unity's thread while it owns
+        // maintenance ordering (and the optional external maintenance lease).
+        // Never select this path from arbitrary console text or the public API.
+        internal static Task<ServerManagerCommandResult> EnqueueMaintenanceSave(
+            ZNet expectedServer, CancellationToken cancellation, Func<bool> executionGuard)
+        {
+            if (ReferenceEquals(expectedServer, null) || executionGuard == null)
+                return Task.FromResult(Failure("invalid_argument", "Maintenance requires an active server and authorization guard."));
+            return EnqueueValidatedCommand(new QueuedCommand(ServerEventCommandKind.Save,
+                string.Empty, string.Empty, cancellation, executionGuard, expectedServer,
+                ZNet.GetWorldIfIsHost(), CommandWorldEpoch));
+        }
+
+        private static Task<ServerManagerCommandResult> EnqueueValidatedCommand(QueuedCommand command)
+        {
             lock (CommandGate)
             {
-                if (cancellation.IsCancellationRequested)
+                if (command.Cancellation.IsCancellationRequested)
                     return Task.FromResult(Failure("cancelled", "The requesting integration session was retired."));
                 if (!_initialized || !_acceptCommands || Commands.Count >= MaximumQueuedCommands)
                 {
@@ -1256,11 +1274,26 @@ namespace ServerManager.Events
             switch (command.Kind)
             {
                 case ServerEventCommandKind.Save:
+                    bool dedicatedMaintenance = !ReferenceEquals(command.MaintenanceServer, null) && server.IsDedicated();
+                    if (dedicatedMaintenance)
+                    {
+                        ServerManagerCommandResult refusal = ValidateMaintenanceSave(server, command);
+                        if (refusal != null) return refusal;
+                        refusal = CheckMaintenanceDiskSpace(command.MaintenanceWorld);
+                        if (refusal != null) return refusal;
+                        // Disk inspection must not turn a revoked request into
+                        // an executable one. Unity state is still main-thread owned.
+                        refusal = ValidateMaintenanceSave(server, command);
+                        if (refusal != null) return refusal;
+                    }
                     string previousOperationId =
                         _latestSave?.OperationId ?? string.Empty;
                     try
                     {
-                        server.SaveWorldAndPlayerProfiles();
+                        if (dedicatedMaintenance)
+                            server.Save(sync: false, saveOtherPlayerProfiles: true, waitForNextFrame: false);
+                        else
+                            server.SaveWorldAndPlayerProfiles();
                     }
                     catch (Exception exception)
                     {
@@ -1304,6 +1337,79 @@ namespace ServerManager.Events
                 default:
                     return Failure("unsupported_command", "Unsupported command.");
             }
+        }
+
+        private static ServerManagerCommandResult ValidateMaintenanceSave(ZNet server, QueuedCommand command)
+        {
+            if (command.Cancellation.IsCancellationRequested)
+                return Failure("cancelled", "The requesting maintenance session was retired.");
+            if (command.ExecutionGuard == null || !command.ExecutionGuard())
+                return Failure("unauthorized", "The maintenance authorization or lease is no longer valid.");
+            if (!ReferenceEquals(server, command.MaintenanceServer) ||
+                !ReferenceEquals(server, ZNet.instance) || command.MaintenanceEpoch != CommandWorldEpoch ||
+                command.MaintenanceWorld == null || !ReferenceEquals(command.MaintenanceWorld, ZNet.GetWorldIfIsHost()))
+                return Failure("world_changed", "The server world stopped or changed before maintenance saving.");
+            if (!server.enabled || !server.IsServer() || !server.IsDedicated() || !_serverStarted ||
+                !_worldReady || _shutdownStarted || Game.instance == null || ZoneSystem.instance == null || DungeonDB.instance == null)
+                return Failure("server_not_ready", "The dedicated server is not ready for maintenance saving.");
+            // SaveWorld may join an existing worker. Do not enter that path;
+            // the scheduler waits and retries this unstarted request instead.
+            if (server.IsSaving())
+                return Failure("save_busy", "Another world save is in progress; maintenance must wait.");
+            if (ZNet.m_loadError || SaveSystem.HasSessionFlag(SaveSystemSessionFlags.DontSaveWorld) ||
+                ZoneSystem.instance.SkipSaving() || DungeonDB.instance.SkipSaving())
+                return Failure("save_blocked", "Valheim has disabled saving for this world session.");
+            return null;
+        }
+
+        private static ServerManagerCommandResult CheckMaintenanceDiskSpace(World world)
+        {
+            try
+            {
+                // A dedicated world uses local storage. Do not dereference a
+                // distribution platform, local PlayerProfile, or popup UI.
+                if (world.m_fileSource != FileHelpers.FileSource.Local && world.m_fileSource != FileHelpers.FileSource.Legacy)
+                    return Failure("save_storage_unsupported", "Maintenance requires a local dedicated-server world save.");
+                List<string> paths = world.GetSavePaths();
+                if (paths == null || paths.Count == 0)
+                    return Failure("save_storage_unknown", "The world save path is unavailable.");
+                ulong worldBytes = FileHelpers.GetFileSizes(paths, world.m_fileSource);
+                // Preserve vanilla's reserve formula without a nonexistent
+                // local player: 100 MiB for a new world, 2 MiB profile allowance.
+                ulong reserve = checked(((worldBytes == 0 ? 100UL * 1024 * 1024 : worldBytes) + 2UL * 1024 * 1024) * 2);
+                foreach (string path in paths)
+                {
+                    long free = GetMaintenanceFreeSpace(path);
+                    if (free < 0 || (ulong)free <= reserve)
+                        return Failure("save_disk_full", "Insufficient free space for the maintenance world checkpoint.");
+                }
+                return null;
+            }
+            catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+            {
+                ServerManagerPlugin.Log.LogWarning("Maintenance save disk-space check failed (" + exception.GetType().Name + "). No maintenance save was started.");
+                return Failure("save_storage_unknown", "Could not verify free space for the maintenance world checkpoint.");
+            }
+        }
+
+        private static long GetMaintenanceFreeSpace(string savePath)
+        {
+            string path = Path.GetFullPath(savePath);
+            StringComparison comparison = Path.DirectorySeparatorChar == '\\'
+                ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            DriveInfo selected = null;
+            int selectedLength = -1;
+            // Longest mount wins on Unix/container volumes; selecting '/' alone
+            // could inspect a different disk from the configured save volume.
+            foreach (DriveInfo drive in DriveInfo.GetDrives())
+            {
+                string root = Path.GetFullPath(drive.Name).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                if (root.Length > selectedLength && (path.StartsWith(root, comparison) ||
+                    string.Equals(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), root.TrimEnd(Path.DirectorySeparatorChar), comparison)))
+                { selected = drive; selectedLength = root.Length; }
+            }
+            if (selected == null) throw new IOException("No filesystem capacity information is available for the world path.");
+            return selected.AvailableFreeSpace;
         }
 
         // Both the integration API and vanilla-console bridge report the same
@@ -2559,13 +2665,19 @@ namespace ServerManager.Events
                 string primary,
                 string secondary,
                 CancellationToken cancellation = default,
-                Func<bool> executionGuard = null)
+                Func<bool> executionGuard = null,
+                ZNet maintenanceServer = null,
+                World maintenanceWorld = null,
+                long maintenanceEpoch = 0)
             {
                 Kind = kind;
                 Primary = primary;
                 Secondary = secondary;
                 Cancellation = cancellation;
                 ExecutionGuard = executionGuard;
+                MaintenanceServer = maintenanceServer;
+                MaintenanceWorld = maintenanceWorld;
+                MaintenanceEpoch = maintenanceEpoch;
             }
 
             internal ServerEventCommandKind Kind { get; }
@@ -2573,6 +2685,9 @@ namespace ServerManager.Events
             internal string Secondary { get; }
             internal CancellationToken Cancellation { get; }
             internal Func<bool> ExecutionGuard { get; }
+            internal ZNet MaintenanceServer { get; }
+            internal World MaintenanceWorld { get; }
+            internal long MaintenanceEpoch { get; }
             internal Task<ServerManagerCommandResult> Task => _completion.Task;
 
             internal void Complete(ServerManagerCommandResult result)

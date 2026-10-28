@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Path $testDirectory | Out-Null
 $ownedProcess = $null
 try {
     $harness = Join-Path $testDirectory 'ServerScheduleRuntimeSmoke.exe'
-    $arguments = @($compiler, '/nologo', '/noconfig', '/nostdlib+', '/langversion:10.0', '/nullable:enable', '/target:exe', "/out:$harness")
+    $arguments = @($compiler, '/nologo', '/noconfig', '/nostdlib+', '/langversion:10.0', '/nullable:enable', '/debug:full', '/target:exe', "/out:$harness")
     foreach ($name in @('mscorlib.dll', 'System.dll', 'System.Core.dll')) {
         $arguments += '/reference:' + (Join-Path $framework $name)
     }
@@ -25,6 +25,7 @@ try {
         (Join-Path $ProjectRoot 'Scheduling\ServerSchedule.cs'),
         (Join-Path $ProjectRoot 'Scheduling\ServerScheduleJournal.cs'),
         (Join-Path $ProjectRoot 'Scheduling\ServerScheduleRuntime.cs'),
+        (Join-Path $ProjectRoot 'Scheduling\FreshWorldScheduleBridge.cs'),
         (Join-Path $ProjectRoot 'Tests\ServerScheduleRuntimeSmoke.cs'))
     & dotnet @arguments
     if ($LASTEXITCODE -ne 0) { throw "Schedule runtime harness compilation failed ($LASTEXITCODE)." }

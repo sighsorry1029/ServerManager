@@ -108,6 +108,11 @@ $smokeTests = @(
         NeedsGamePath = $false
     },
     [pscustomobject]@{
+        Name = "Headless dedicated maintenance save admission"
+        File = "MaintenanceSaveSmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
         Name = "Shared server console execution"
         File = "ServerConsoleExecutorSmoke.ps1"
         NeedsGamePath = $false
@@ -396,7 +401,7 @@ foreach ($smokeTest in $smokeTests) {
         $arguments += @("-GamePath", $GamePath)
     }
 
-    $shellPath = if ($smokeTest.File -in @("CommonCommandsSmoke.ps1", "ChatLoggingSmoke.ps1", "ClientMenuBrandingSmoke.ps1")) {
+    $shellPath = if ($smokeTest.File -in @("CommonCommandsSmoke.ps1", "ChatLoggingSmoke.ps1", "ClientMenuBrandingSmoke.ps1", "MaintenanceSaveSmoke.ps1")) {
         $powerShell7.Source
     }
     else { "powershell.exe" }

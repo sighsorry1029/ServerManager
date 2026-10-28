@@ -257,6 +257,19 @@ internal static class ServerScheduleJournalSmoke
             File.WriteAllText(file, text);
             Bad(() => { using ServerScheduleJournal journal = ServerScheduleJournal.Open(path, "world"); }, "Unsafe/oversized journal accepted");
         }
+        string extensionPath = Fresh("removed-coordination"), extensionFile = Path.Combine(extensionPath, ServerScheduleJournal.FileName);
+        using (ServerScheduleJournal journal = ServerScheduleJournal.Open(extensionPath, "world"))
+        {
+            journal.Reconcile(Settings(), Now, Game); journal.Flush();
+        }
+        string original = File.ReadAllText(extensionFile);
+        Check(!original.Contains("coordination:"), "Simple maintenance retains the existing journal schema without cross-mod phases");
+        string removedExtension = original.Replace("      state:", "      coordination: {phase: LeaseAcquired}\n      state:");
+        Check(removedExtension != original, "Removed-extension fixture actually adds the unsupported mapping");
+        File.WriteAllText(extensionFile, removedExtension);
+        Bad(() => { using ServerScheduleJournal journal = ServerScheduleJournal.Open(extensionPath, "world"); },
+            "An unsupported coordination journal must be inspected, not silently migrated or reset");
+        Check(File.ReadAllText(extensionFile) == removedExtension, "Unsupported journal is preserved byte-for-byte");
     }
     private static void CompletionCoverage()
     {

@@ -287,8 +287,9 @@ Joins that need to read the character store and disk-based admin commands may
 briefly return a busy message; retry shortly. Settings reload waits for the write.
 
 ServerManager does not change the vanilla automatic world-save interval. Manual
-commands, cron jobs and supported Upgrade World maintenance can request extra
-saves. Background character writes do not remove the game's own world-save cost.
+save commands and explicitly configured cron saves can request extra saves;
+Upgrade World scheduling adds none. Background character writes do not remove
+the game's own world-save cost.
 
 For planned shutdown, run `save` and wait for this server-log confirmation for
 that save:
@@ -710,15 +711,16 @@ jobs: []
 #       - zones_reset safeZones=1 start
 ```
 
-ServerManager adds confirmed saves before and after supported maintenance and
-waits for its operations to actually finish. Queued changes require `start`;
+ServerManager waits for supported maintenance operations to actually finish.
+It does not add saves before or after a job, or after partial failures. Add plain
+`save` commands yourself if needed; normal game saves still run. Queued changes require `start`;
 this includes `world_clean` and individual `clean_*` commands.
 Unsupported operations are refused. Maintenance batches may contain supported
 world changes and plain `save`, not announcements or unrelated commands. If Upgrade World’s `Root users`
 is restricted, include `-1` for dedicated-console execution.
 
-If the required tracking contract is incompatible, a job with exactly one
-world-change command is dispatched through the normal server console instead.
+If the required tracking contract is incompatible and FreshWorld is not installed,
+a job with exactly one world-change command is dispatched through the normal server console instead.
 Its report says **Dispatched; completion not tracked**, not completed. This
 fallback adds no automatic pre/post saves and never advances a multi-command
 sequence. Missing plugins, replaced command handlers, permission denials and
@@ -727,13 +729,34 @@ later scheduled operations; choose intervals accordingly. A delivered occurrence
 is recorded without automatic retry. After an interrupted dispatch, review is
 still required.
 
+#### Using FreshWorld too
+
+With a compatible **FreshWorld** installed, tracked Upgrade World cron jobs
+automatically share FreshWorld's maintenance lock. No YAML field is needed:
+keep the existing `command` / `commands` and `schedule` entries.
+
+If FreshWorld is busy, the job waits. Once it acquires the lock, FreshWorld waits
+until the tracked Upgrade World work has actually stopped. A timeout does not
+release the lock while native work is still active. FreshWorld keeps its own
+schedule and pre-reset save; this integration adds no saves.
+
+This prevents overlapping participating operations. It does **not** require a
+particular FreshWorld run to succeed first: after a failed run has safely ended
+and cleaned up, a later Upgrade World job may still run. Direct Upgrade World
+console commands and other mods' commands are outside this protection.
+
+FreshWorld absent: normal scheduling continues. FreshWorld installed but its
+required API is incompatible or unavailable: the affected maintenance job is
+not dispatched uncoordinated. Ordinary gameplay and saves are unchanged.
+Existing review markers are not cleared. See the
+[coordination and recovery notes](docs/freshworld-maintenance.md) for details.
+
 For tracked work, a failed target does not mean the remaining work has stopped.
-ServerManager keeps observing until Upgrade World is idle. If the tracked work
-finishes normally but reports failed targets, it saves the partial changes, verifies
-the world/character checkpoint, and stops the rest of the batch with
-**needs review**. This is not a successful job and is never retried automatically.
-Exceptions, cancellation or uncertain completion do not qualify for this partial
-save. A timeout also does not cancel Upgrade World or prove that it stopped;
+ServerManager keeps observing until Upgrade World is idle. Failed targets,
+exceptions, cancellation or uncertain completion stop the rest of the batch with
+**needs review**, without an extra save or automatic retry. Changes already made
+are not undone and may be persisted by later game or explicit saves.
+A timeout also does not cancel Upgrade World or prove that it stopped;
 scheduled changes remain waiting while it is still active. Ordinary game saves
 are not disabled by this adapter.
 

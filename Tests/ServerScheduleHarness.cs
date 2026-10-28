@@ -86,8 +86,9 @@ internal static class ServerScheduleHarness
         Bad("jobs: [{schedule: '0 3 * * *', commands: ['zones_reset start', 'quit']}]");
         Bad("jobs: [{schedule: '0 3 * * *', commands: ['save'], maintenance: true}]");
         Bad("jobs:\n" + Job(extra: "    catchUp: 'true'\n"));
-        foreach (string removed in new[] { "id: old", "cron: '* * * * *'", "enabled: true", "enabled: false", "catchUp: true", "catchUp: false", "maintenance: true", "maintenance: false" })
+        foreach (string removed in new[] { "id: old", "cron: '* * * * *'", "enabled: true", "enabled: false", "catchUp: true", "catchUp: false", "maintenance: true", "maintenance: false", "requiresFreshWorld: {slot: '05:35', waitTimeout: 15m}" })
             Bad("jobs:\n" + Job(extra: "    " + removed + "\n"));
+        Bad("jobs:\n" + Job("zones_reset start", extra: "    requiresFreshWorld: {slot: '05:35'}\n"));
         int calls = 0;
         ServerScheduleSettings.Parse("jobs:\n" + Job(), command => { ++calls; return command == "save"; });
         Check(calls == 1, "Pure command admission callback");
@@ -251,6 +252,9 @@ internal static class ServerScheduleHarness
             "Generated default retains one active local timezone and empty jobs list");
         Check(ServerScheduleSettings.Parse(ServerScheduleSettings.DefaultYaml).TimeZone.Id == TimeZoneInfo.Local.Id,
             "Generated default resolves the server-local timezone");
+        Check(!ServerScheduleSettings.DefaultYaml.Contains("requiresFreshWorld") &&
+            ServerScheduleSettings.DefaultYaml.Contains("No saves are added automatically"),
+            "Automatic coordination adds no YAML field and the template documents explicit-only saves");
         int jobLine = Array.IndexOf(lines, "#   - schedule: '35 5 * * *'");
         Check(jobLine > 0 && lines[jobLine - 1] == "# jobs:", "Maintenance example is a fully commented standalone jobs block");
         string[] exampleLines = lines.Skip(jobLine - 1)

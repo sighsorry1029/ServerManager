@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.5
+
+- Added automatic overlap prevention between tracked Upgrade World cron jobs and FreshWorld 1.1.9 maintenance. No new YAML settings are needed. This coordinates participating jobs, not direct Upgrade World commands, and does not require a previous FreshWorld run to have succeeded.
+- Removed ServerManager's automatic saves before and after Upgrade World jobs, including after partial failures. Explicit cron `save` commands, FreshWorld's pre-reset save and normal game saves remain unchanged. Add an explicit save if changes must be persisted before the next normal save.
+- Fixed the dedicated-server save path used by maintenance batches, keeping readiness, world ownership, save-block and disk-space checks without requiring a local player or client UI.
+- Kept failed or uncertain maintenance under review without automatic replay. Locks wait for native work to stop, while confirmed-idle failures can release safely. Reduced repeated compatibility checks while waiting.
+- Added regression coverage for optional integration, save admission, delayed cleanup, configuration reloads and interrupted jobs. Update ServerManager on the server and clients; install FreshWorld 1.1.9 alongside it to use the optional coordination.
+
 ## 1.2.4
 
 - Updated scheduled Upgrade World maintenance for its current execution flow, including queued cleanup commands. Use `world_clean start` to run cleanup from cron.

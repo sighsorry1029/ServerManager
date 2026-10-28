@@ -114,19 +114,23 @@ internal static class ServerScheduleRuntime
         internal bool PendingDurable, Started, Finishing, WaitingUpgrade, Skip, PreflightDone;
         internal string[] Commands;
         internal bool UntrackedUpgrade;
-        internal bool UpgradeTimedOut, SavingPartialChanges, PartialChangesPersisted;
-        internal string PartialFailureCode = "", PartialSaveResult = "";
+        internal bool UpgradeTimedOut;
         internal string Verb = "", BaselineSave = "", SaveId = "";
+        internal string SaveFailureCode = "";
         internal long Deadline;
+        internal FreshWorldScheduleBridge? FreshWorld;
+        internal bool FreshWorldChecked;
+        internal long NextFreshWorldPoll;
+        internal string FreshWorldSession = "", LeaseToken = "", LeaseOwner = "";
+        internal bool SaveTimedOut, AdmissionTimedOut, SaveDrainOnly;
+        internal long AdmissionDeadline;
+        internal bool TerminalPending, TerminalSuccess, ReleasePending;
+        internal string TerminalCode = "";
         internal Run(ServerScheduleOccurrence occurrence)
         {
             Occurrence = occurrence;
             List<string> commands = occurrence.Job.Commands.ToList();
-            if (occurrence.Job.Maintenance)
-            {
-                if (FirstVerb(commands[0]) != "save") commands.Insert(0, "save");
-                if (FirstVerb(commands[commands.Count - 1]) != "save") commands.Add("save");
-            }
+            // Only commands explicitly configured by the operator are dispatched.
             Commands = commands.ToArray();
             // Only a complete, display-only job can opt out of successful
             // local audit entries. Mixed jobs and maintenance remain auditable.
@@ -142,6 +146,8 @@ internal static class ServerScheduleRuntime
         private readonly ZNet _network;
         private readonly long _epoch;
         private readonly string _root;
+        private readonly string _sessionId = Guid.NewGuid().ToString("N");
+        private string WorldId => _network.GetWorldUID().ToString(CultureInfo.InvariantCulture);
         private readonly ServerScheduleEngine _engine = new();
         private readonly List<Run> _runs = new();
         private readonly Random _random = new();
@@ -227,7 +233,17 @@ internal static class ServerScheduleRuntime
             foreach (Run run in _runs.ToArray())
             {
                 if (!Current) return;
-                if (run.Finishing) continue;
+                if (run.Finishing)
+                {
+                    if (run.ReleasePending) Finish(run);
+                    continue;
+                }
+                if (run.TerminalPending)
+                {
+                    EndRun(run, run.TerminalSuccess, run.TerminalCode);
+                    if (_writeTask != null) return;
+                    continue;
+                }
                 if (run.Retired && !run.Started)
                 {
                     EndRun(run, false, "cron_cancelled");
@@ -241,10 +257,16 @@ internal static class ServerScheduleRuntime
                     return;
                 }
                 if (run.Skip) { EndRun(run, true, "cron_skipped"); return; }
+                if (!DrainAdmissionTimeout(run))
+                { if (_writeTask != null) return; continue; }
                 if (!run.Started)
                 {
                     if (run.Occurrence.Job.Maintenance)
                     {
+                        // Resolve optional compatibility before any command, but
+                        // only acquire when UW and existing saves are idle.
+                        if (!PrepareFreshWorld(run, acquire: false))
+                        { if (_writeTask != null) return; continue; }
                         if (_journal.ReviewRequiredJobs.Count != 0) continue;
                         if (_maintenanceOwner != null && !ReferenceEquals(_maintenanceOwner, run)) continue;
                         if (!run.PreflightDone)
@@ -255,9 +277,8 @@ internal static class ServerScheduleRuntime
                                 string? error = ValidateUpgradeWorldCommand(preflightLine);
                                 if (error != null) { EndRun(run, false, error); return; }
                             }
-                            run.PreflightDone = true;
                         }
-                        if (!run.UntrackedUpgrade)
+                        if (!run.UntrackedUpgrade && (!run.PreflightDone || _upgradeBridge == null))
                         {
                             string unavailable = "uw_available";
                             bool supported = _upgradeBridge != null || UpgradeWorldScheduleBridge.TryCreate(out _upgradeBridge, out unavailable);
@@ -267,9 +288,9 @@ internal static class ServerScheduleRuntime
                                     { supported = false; break; }
                             if (!supported)
                             {
-                                // Check this job's capabilities before even its pre-save. An
+                                // Check this job's capabilities before any explicit save. An
                                 // unrelated unsupported command must not disable other jobs.
-                                if (unavailable != "uw_unsupported_contract" || run.Occurrence.Job.Commands.Count != 1)
+                                if (run.FreshWorld != null || unavailable != "uw_unsupported_contract" || run.Occurrence.Job.Commands.Count != 1)
                                 { EndRun(run, false, unavailable); return; }
                                 _upgradeBridge?.Dispose();
                                 _upgradeBridge = null;
@@ -280,6 +301,7 @@ internal static class ServerScheduleRuntime
                                 run.Commands = run.Occurrence.Job.Commands.ToArray();
                             }
                         }
+                        run.PreflightDone = true;
                         if (!run.UntrackedUpgrade)
                         {
                             if (!_upgradeBridge!.CanRun(out string denied)) { EndRun(run, false, denied); return; }
@@ -288,6 +310,8 @@ internal static class ServerScheduleRuntime
                             if (!idle) continue;
                         }
                         if (_network.IsSaving() || _runs.Any(other => other.Pending != null || other.WaitingSave || other.SaveRequested)) continue;
+                        if (!PrepareFreshWorld(run, acquire: true))
+                        { if (_writeTask != null) return; continue; }
                         _maintenanceOwner = run;
                     }
                     else if (_maintenanceOwner != null && !CanInterleave(run.Commands[run.Index])) continue;
@@ -302,15 +326,34 @@ internal static class ServerScheduleRuntime
                     catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
                     { result = Result(false, "command_failed", "The scheduled command threw an exception."); }
                     run.Pending = null;
+                    if (run.SaveRequested && run.Occurrence.Job.Maintenance && result.Code == "save_busy")
+                    {
+                        // Admission lost a race with vanilla autosave. No save was
+                        // dispatched, so only this request (not a mutation) may retry.
+                        run.SaveRequested = false;
+                        continue;
+                    }
                     if (run.SaveRequested && result.Success)
                     {
                         run.SaveId = result.OperationId;
                         run.WaitingSave = true;
                     }
+                    else if (run.SaveRequested && run.LeaseToken.Length != 0 && _network.IsSaving())
+                    {
+                        // A synchronous entry exception may follow native worker
+                        // creation. A failed request is not permission to release
+                        // the gate while that worker is still running.
+                        run.SaveId = result.OperationId;
+                        run.WaitingSave = true;
+                        run.SaveDrainOnly = true;
+                        HoldUnconfirmedSave(run, "save_dispatch_unconfirmed");
+                        return;
+                    }
                     else CompleteCommand(run, result);
                 }
                 if (_writeTask != null) return;
                 if (!_runs.Contains(run)) continue;
+                if (run.TerminalPending) continue;
                 if (run.WaitingSave) { PollSave(run); if (_writeTask != null) return; continue; }
                 if (run.WaitingUpgrade) { PollUpgrade(run); if (_writeTask != null) return; continue; }
                 // Consume even retired tasks and retain a dispatched save's
@@ -320,7 +363,7 @@ internal static class ServerScheduleRuntime
                 // Never overlap a requested save with another observed save.
                 string line = run.Commands[run.Index];
                 // Maintenance owns mutations/save ordering. Ordinary announcements
-                // can continue; other scheduled commands wait for its post-save.
+                // can continue; other scheduled commands wait for its completion.
                 if (_maintenanceOwner != null && !ReferenceEquals(_maintenanceOwner, run) &&
                     !CanInterleave(line)) continue;
                 if (FirstVerb(line) == "save" && (_network.IsSaving() || _runs.Any(other => other.WaitingSave || other.SaveRequested)))
@@ -347,6 +390,62 @@ internal static class ServerScheduleRuntime
             }
         }
 
+        private bool PrepareFreshWorld(Run run, bool acquire)
+        {
+            if (!run.FreshWorldChecked)
+            {
+                if (!FreshWorldScheduleBridge.TryCreate(out run.FreshWorld, out string error) && error != "fw_not_installed")
+                { EndRun(run, false, error); return false; }
+                run.FreshWorldChecked = true;
+            }
+            if (run.FreshWorld == null) return true;
+            if (run.LeaseToken.Length != 0)
+            {
+                if (CoordinationLeaseValid(run)) return true;
+                EndRun(run, false, "fw_lease_lost"); return false;
+            }
+            if (!acquire) return true;
+            if (Stopwatch.GetTimestamp() < run.NextFreshWorldPoll) return false;
+            run.NextFreshWorldPoll = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
+            run.LeaseOwner = "ServerManager:" + _sessionId + ":" + run.Occurrence.Job.Id;
+            if (!run.FreshWorld.TryAcquire(WorldId, run.LeaseOwner, out run.FreshWorldSession,
+                    out run.LeaseToken, out bool busy, out string denied))
+            {
+                // Busy/cleanup is a transient admission state, not proof of a
+                // failed reset. No occurrence, date or success-history matching.
+                if (busy) return false;
+                EndRun(run, false, denied); return false;
+            }
+            _maintenanceOwner = run;
+            run.AdmissionDeadline = Stopwatch.GetTimestamp() + 120 * Stopwatch.Frequency;
+            return true;
+        }
+
+        private bool DrainAdmissionTimeout(Run run)
+        {
+            if (run.LeaseToken.Length == 0 || run.WaitingSave || run.WaitingUpgrade ||
+                Stopwatch.GetTimestamp() < run.AdmissionDeadline) return true;
+            if (!run.AdmissionTimedOut)
+            {
+                run.AdmissionTimedOut = true;
+                run.Cancellation.Cancel();
+                Warn("Job '" + run.Occurrence.Job.Id + "' timed out before its next maintenance dispatch. No further command will start; waiting for queued work/observed busy work to settle before release.");
+            }
+            // Consume an already-queued request first. Its guard/cancellation
+            // prevents a still-unstarted request from entering the native save.
+            if (run.Pending != null) return true;
+            if (_network.IsSaving() || _upgradeBridge == null || !_upgradeBridge.TryGetIdle(out bool idle, out _) || !idle)
+                return false;
+            EndRun(run, false, "fw_admission_timeout");
+            return false;
+        }
+
+        private bool CoordinationLeaseValid(Run run) =>
+            !run.Occurrence.Job.Maintenance ||
+            (run.FreshWorld == null ? !FreshWorldScheduleBridge.IsInstalled :
+                run.LeaseToken.Length != 0 && run.FreshWorld.Validate(WorldId, run.FreshWorldSession,
+                    run.LeaseOwner, run.LeaseToken));
+
         private static DateTime CaptureGameTime(ZNet network)
         {
             if (EnvMan.instance == null) return ServerScheduleEngine.GameEpoch;
@@ -361,6 +460,7 @@ internal static class ServerScheduleRuntime
         private void StartCommand(Run run, string line)
         {
             if (!Current || run.Cancellation.IsCancellationRequested) { EndRun(run, false, "cron_cancelled"); return; }
+            if (!CoordinationLeaseValid(run)) { EndRun(run, false, "fw_lease_lost"); return; }
             run.Verb = FirstVerb(line);
             bool prefixed = line.StartsWith("sm:", StringComparison.OrdinalIgnoreCase);
             if (prefixed) line = line.Substring(3);
@@ -424,9 +524,17 @@ internal static class ServerScheduleRuntime
                 { CompleteCommand(run, Result(false, "invalid_argument", "Use save without arguments.")); return; }
                 run.Common = false;
                 run.SaveRequested = true;
+                run.SaveTimedOut = false;
+                run.SaveDrainOnly = false;
+                run.SaveFailureCode = "";
+                run.SaveId = "";
                 run.BaselineSave = ServerEventRuntime.GetStatusSnapshot().LatestSave?.OperationId ?? "";
-                run.Pending = ServerEventRuntime.EnqueueCommand(ServerEventCommandKind.Save, "", "",
-                    run.Cancellation.Token, () => Current && !run.Retired);
+                run.Pending = run.Occurrence.Job.Maintenance
+                    ? ServerEventRuntime.EnqueueMaintenanceSave(_network, run.Cancellation.Token,
+                        () => Current && !run.Retired && CoordinationLeaseValid(run) &&
+                            (run.LeaseToken.Length == 0 || Stopwatch.GetTimestamp() < run.AdmissionDeadline))
+                    : ServerEventRuntime.EnqueueCommand(ServerEventCommandKind.Save, "", "",
+                        run.Cancellation.Token, () => Current && !run.Retired);
                 return;
             }
             if (run.Common)
@@ -455,20 +563,8 @@ internal static class ServerScheduleRuntime
         private void ApplyUpgradeObservation(Run run, UpgradeWorldScheduleObservation observed)
         {
             if (observed.State == UpgradeWorldScheduleState.Pending) return;
-            if (observed.State == UpgradeWorldScheduleState.Failed && observed.CanPersistPartialChanges && !run.Retired)
-            {
-                // Only the adapter can certify normal termination with skipped targets,
-                // no execution exception/cancellation, and a now-idle executor. Preserve
-                // those changes, never execute the rest of the mutation batch or replay it.
-                Audit(run, Result(false, observed.Code, "Upgrade World ended with partial changes."));
-                run.WaitingUpgrade = false;
-                run.PartialFailureCode = observed.Code;
-                run.SavingPartialChanges = true;
-                run.Commands = new[] { "save" };
-                run.Index = 0;
-                Warn("Job '" + run.Occurrence.Job.Id + "' ended with partial changes (" + observed.Code + "). Saving the completed changes before marking it for review; no remaining mutations or automatic retry.");
-                return;
-            }
+            // Failure stays failure. Do not insert a save, execute remaining
+            // commands, or replay partially completed world mutations.
             CompleteCommand(run, Result(observed.State == UpgradeWorldScheduleState.Succeeded,
                 observed.Code, "Upgrade World scheduled operation observation."));
         }
@@ -476,6 +572,13 @@ internal static class ServerScheduleRuntime
         private void PollSave(Run run)
         {
             ServerManagerSaveOperationSnapshot? save = ServerEventRuntime.GetStatusSnapshot().LatestSave;
+            if (run.SaveDrainOnly && !_network.IsSaving())
+            {
+                // Failed dedicated dispatch: native worker quiescence permits
+                // cleanup, never a successful checkpoint or subsequent mutation.
+                CompleteCommand(run, Result(false, run.SaveFailureCode, "The unconfirmed save is now idle; review is required."));
+                return;
+            }
             // Listen-host saves begin in a next-frame vanilla coroutine. Observe
             // the next checkpoint after admission; do not call request acceptance success.
             if (string.IsNullOrEmpty(run.SaveId) && save != null && save.OperationId != run.BaselineSave)
@@ -483,13 +586,25 @@ internal static class ServerScheduleRuntime
             if (save != null && !string.IsNullOrEmpty(run.SaveId))
             {
                 if (save.OperationId != run.SaveId)
-                { CompleteCommand(run, Result(false, "save_observation_lost", "A newer save replaced the observed checkpoint.")); return; }
+                {
+                    if (run.LeaseToken.Length != 0)
+                    { HoldUnconfirmedSave(run, "save_observation_lost"); return; }
+                    CompleteCommand(run, Result(false, "save_observation_lost", "A newer save replaced the observed checkpoint.")); return;
+                }
                 if (save.State == ServerManagerSaveState.Failed)
-                { CompleteCommand(run, Result(false, "save_failed", "The observed checkpoint failed.")); return; }
+                {
+                    // The event tracker can label an operation Failed after its
+                    // own observation timeout. That does not terminate a worker.
+                    if (run.LeaseToken.Length != 0 && _network.IsSaving())
+                    { HoldUnconfirmedSave(run, "save_failed_worker_active"); return; }
+                    CompleteCommand(run, Result(false, "save_failed", "The observed checkpoint failed.")); return;
+                }
                 if (save.State == ServerManagerSaveState.CheckpointCompleted)
                 {
                     bool complete = save.CharacterCommitScope == ServerManagerCharacterCommitScope.AllRetainedShadowsAtCutoff &&
                         save.PendingCharacterCount == 0;
+                    if (run.SaveTimedOut)
+                    { CompleteCommand(run, Result(false, "save_unconfirmed", "The checkpoint ended after its deadline; review is required.")); return; }
                     CompleteCommand(run, new ServerManagerCommandResult(complete,
                         complete ? "checkpoint_completed" : "checkpoint_partial",
                         complete ? "World and retained-character checkpoint completed." : "Some retained characters were not committed.",
@@ -498,7 +613,24 @@ internal static class ServerScheduleRuntime
                 }
             }
             if (Stopwatch.GetTimestamp() >= run.Deadline)
-                CompleteCommand(run, Result(false, "save_unconfirmed", "Checkpoint completion was not confirmed; no retry was issued."));
+            {
+                if (run.LeaseToken.Length != 0) HoldUnconfirmedSave(run, "save_unconfirmed");
+                else CompleteCommand(run, Result(false, "save_unconfirmed", "Checkpoint completion was not confirmed; no retry was issued."));
+            }
+        }
+
+        private void HoldUnconfirmedSave(Run run, string code)
+        {
+            // A known-started save need not prove success to release exclusion.
+            // Once its native worker is idle, fail the job without continuing it.
+            // An empty-ID deferred host request still needs evidence of its start.
+            run.SaveDrainOnly |= run.SaveId.Length != 0 || _network.IsSaving();
+            if (run.SaveTimedOut) return;
+            run.SaveTimedOut = true;
+            run.SaveFailureCode = code;
+            Warn("Job '" + run.Occurrence.Job.Id + "' cannot confirm its checkpoint (" + code +
+                "). The FreshWorld lease is retained until native save termination is known; no mutation or save retry. Review is required.");
+            Audit(run, Result(false, code, "Checkpoint unresolved; coordination lease retained."));
         }
 
         private void CompleteCommand(Run run, ServerManagerCommandResult result)
@@ -508,20 +640,15 @@ internal static class ServerScheduleRuntime
             if (!run.Common) Audit(run, result);
             run.SaveRequested = run.WaitingSave = run.WaitingUpgrade = false;
             run.Pending = null;
-            if (run.SavingPartialChanges)
-            {
-                run.PartialSaveResult = result.Code;
-                run.PartialChangesPersisted = result.Success && result.Code == "checkpoint_completed";
-                EndRun(run, false, run.PartialChangesPersisted ? "uw_partial_failure_persisted" : "uw_partial_failure_save_unconfirmed");
-                return;
-            }
             if (!result.Success || run.Retired)
             {
                 if (!result.Success) Warn("Job '" + run.Occurrence.Job.Id + "' stopped: " + result.Code + ". No automatic retry.");
                 EndRun(run, false, result.Code);
                 return;
             }
-            if (++run.Index >= run.Commands.Length) EndRun(run, true, run.UntrackedUpgrade ? "cron_dispatched_untracked" : "cron_completed");
+            ++run.Index;
+            if (run.LeaseToken.Length != 0) run.AdmissionDeadline = Stopwatch.GetTimestamp() + 120 * Stopwatch.Frequency;
+            if (run.Index >= run.Commands.Length) EndRun(run, true, run.UntrackedUpgrade ? "cron_dispatched_untracked" : "cron_completed");
         }
 
         private static void Audit(Run run, ServerManagerCommandResult result) =>
@@ -533,8 +660,23 @@ internal static class ServerScheduleRuntime
         {
             if (!Current || run.Finishing || !_runs.Contains(run)) return;
             if (!run.PendingDurable) { Finish(run); return; }
+            // Every terminal path, including a cancelled queued request, obeys
+            // the same lease cleanup boundary. A failure result is not evidence
+            // that native saves or the observed UW executor have become idle.
+            if (run.LeaseToken.Length != 0 && (_network.IsSaving() || _upgradeBridge == null ||
+                !_upgradeBridge.TryGetIdle(out bool idle, out _) || !idle))
+            {
+                if (!run.TerminalPending)
+                    Warn("Job '" + run.Occurrence.Job.Id + "' ended (" + code +
+                        ") but native work is not confirmed idle. Retaining the FreshWorld lease until cleanup is safe.");
+                run.TerminalPending = true; run.TerminalSuccess = success; run.TerminalCode = code;
+                run.Cancellation.Cancel();
+                return;
+            }
+            run.TerminalPending = false;
             run.Finishing = true;
-            bool review = run.Occurrence.Job.Maintenance && run.Started && !success;
+            bool review = run.Occurrence.Job.Maintenance &&
+                run.Started && !success;
             DateTime coveredThrough = run.Occurrence.Job.UseGameTime ? CaptureGameTime(_network) : DateTime.UtcNow;
             BeginWrite(() => _journal!.MarkFinished(run.Occurrence.Job, success, review, coveredThrough), () =>
             {
@@ -565,12 +707,6 @@ internal static class ServerScheduleRuntime
             };
             if (!multiple) data["cron_verb"] = job.AllowClientHide &&
                 ServerScheduleSettings.TryGetCenterBroadcast(job.Commands[0], out _) ? "broadcast" : FirstVerb(job.Commands[0]);
-            if (run.PartialFailureCode.Length != 0)
-            {
-                data["cron_failure_code"] = run.PartialFailureCode;
-                data["cron_partial_changes"] = run.PartialChangesPersisted ? "persisted" : "not_confirmed";
-                data["cron_save_result"] = run.PartialSaveResult;
-            }
             return data;
         }
 
@@ -589,6 +725,25 @@ internal static class ServerScheduleRuntime
 
         private void Finish(Run run)
         {
+            if (run.LeaseToken.Length != 0)
+            {
+                // Native work can start while the terminal journal write is on
+                // its worker. Recheck quiescence at the actual release boundary.
+                if (_network.IsSaving() || _upgradeBridge == null ||
+                    !_upgradeBridge.TryGetIdle(out bool idle, out _) || !idle)
+                {
+                    if (!run.ReleasePending) Warn("The terminal cron result is durable, but native work became busy before lease release. Retaining the FreshWorld lease until idle.");
+                    run.ReleasePending = true;
+                    return;
+                }
+                if (run.FreshWorld == null || !run.FreshWorld.Release(WorldId,
+                        run.FreshWorldSession, run.LeaseOwner, run.LeaseToken))
+                {
+                    Warn("FreshWorld lease release could not be confirmed. Scheduling is suspended; the lease is not force-cleared. Inspect the server log before restarting the world.");
+                    Suspend(); return;
+                }
+                run.LeaseToken = "";
+            }
             if (!_runs.Remove(run)) return;
             _engine.Complete(run.Occurrence);
             run.Cancellation.Cancel();
@@ -665,6 +820,10 @@ internal static class ServerScheduleRuntime
             string text = "Jobs: " + _settings.Jobs.Count + "; active: " + _runs.Count +
                 "; settings pending: " + (_pendingSettings != null) + "\nNeeds review: " + (review.Length == 0 ? "none" : review) +
                 "\n" + _journal.GetStatus();
+            foreach (Run run in _runs.Where(run => run.FreshWorld != null))
+                text += "\n" + run.Occurrence.Job.Id + ": " +
+                    (run.LeaseToken.Length == 0 ? "waiting for maintenance admission" : "FreshWorld lease held") +
+                    (run.SaveTimedOut || run.UpgradeTimedOut || run.AdmissionTimedOut ? "; timeout/unconfirmed: waiting for native work, review required" : "");
             return Result(true, "cron_status", ServerCommands.BoundedText(text, ServerCommands.MaximumOutputLength));
         }
 
@@ -705,6 +864,23 @@ internal static class ServerScheduleRuntime
             foreach (Run run in _runs)
             {
                 run.Cancellation.Cancel();
+                // A pre-dispatch journal error must not strand an idle provider.
+                // Deferred/queued requests and unobservable native work still
+                // retain ownership; world shutdown resets the provider's session.
+                if (run.LeaseToken.Length != 0 && run.Pending == null &&
+                    (!(run.SaveRequested || run.WaitingSave) || run.SaveId.Length != 0 || run.SaveDrainOnly))
+                {
+                    try
+                    {
+                        if (ReferenceEquals(_network, ZNet.instance) && _epoch == ServerEventRuntime.CommandWorldEpoch &&
+                            !_network.IsSaving() && _upgradeBridge != null && _upgradeBridge.TryGetIdle(out bool idle, out _) && idle &&
+                            run.FreshWorld != null && run.FreshWorld.Release(WorldId, run.FreshWorldSession, run.LeaseOwner, run.LeaseToken))
+                            run.LeaseToken = "";
+                    }
+                    catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception)) { }
+                }
+                if (run.LeaseToken.Length != 0)
+                    Warn("Coordinated job '" + run.Occurrence.Job.Id + "' stopped with a retained FreshWorld lease. Review is required; no automatic replay or force release.");
                 // Consume eventual faults without touching retired Unity state.
                 run.Pending?.ContinueWith(task => { _ = task.Exception; }, CancellationToken.None,
                     TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);

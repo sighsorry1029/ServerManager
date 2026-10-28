@@ -22,8 +22,10 @@ internal sealed class ServerScheduleSettings
     internal const string AlternateFileName = "cron.yaml";
     internal const string DefaultYaml = @"# Server-local scheduled commands. Valid edits reload; invalid edits keep the last valid settings.
 # local uses the server computer's timezone. UTC and installed timezone IDs also work.
-# Compatible Upgrade World tracking adds verified pre/post saves; maintenance catches up once after downtime.
-# Without a compatible tracker, only a single change command is dispatched, without automatic saves or completion confirmation.
+# Compatible Upgrade World tracking waits for completion; maintenance catches up once after downtime.
+# No saves are added automatically. Add save commands if you need explicit checkpoints.
+# With FreshWorld installed, compatible tracked jobs share its maintenance lock automatically.
+# Without a compatible tracker, single-command dispatch is available only when FreshWorld is absent.
 # Other missed offline occurrences are skipped. A running job never overlaps itself.
 # cron.yml and cron_last.yml are the defaults; .yaml is also accepted. Use only one suffix for each file.
 # cron_last.yml is generated ServerManager progress; do not edit or delete it to retry a job.
@@ -49,7 +51,7 @@ jobs: []
 # Discord messages use ServerManager's discord.yml, not discordConnector.
 
 # Upgrade World with compatible completion tracking: daily batch at 05:35.
-# Verified saves are added before and after the batch; no separate save job is needed.
+# Saves are not added. FreshWorld keeps its own pre-reset save; normal game saves continue.
 # Test on a backed-up world before uncommenting this batch.
 # WARNING: safeZones=0 and force disable base protection.
 # After zones_reset, later resets target zones still generated, including protected bases.
