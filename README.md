@@ -187,11 +187,12 @@ cannot make a client cheat-proof.
 Defensive client checks use `cheatDetection.action` and `security.alert`.
 Admin status does not exempt cheat-tool detections.
 
-On ServerManager servers, `printseeds` is hidden from non-admins and blocked in
-both chat and the F5 console. Verified admins, local hosts and single-player
+On ServerManager servers, `printseeds` and `freefly` are hidden from non-admins
+and blocked in both chat and the F5 console. Verified admins, local hosts and single-player
 games keep their normal access. A blocked attempt only shows a permission
 message; it is not a cheat report or a kick reason. Update both server and clients.
-This restricts the command, not access to seed data by a modified client.
+This restricts the commands; it cannot prevent a modified client from reading
+seed data or moving its camera directly.
 
 Assembly-inspection diagnostics are log-only, not proof of cheating. They are
 separate from the `required`/`optional` folders. The audit log and `security.alert`

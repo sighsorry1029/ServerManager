@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.6
+
+- Restricted `freefly` to server-verified administrators on ServerManager servers, matching `printseeds`. Non-admins cannot run it through chat or the F5 console, and it is hidden from help and autocomplete.
+- Kept normal access for verified administrators, local hosts and single-player games. Denied attempts show a permission message without cheat reports or sanctions.
+- Updated the required BepInExPack Valheim version to 5.4.2360. Added regression coverage for both restricted commands, permission expiry and command visibility.
+- Update ServerManager on both the server and clients. This restricts the commands; it cannot prevent modified clients from reading seed data or moving their camera directly.
+
 ## 1.2.5
 
 - Added automatic overlap prevention between tracked Upgrade World cron jobs and FreshWorld 1.1.9 maintenance. No new YAML settings are needed. This coordinates participating jobs, not direct Upgrade World commands, and does not require a previous FreshWorld run to have succeeded.

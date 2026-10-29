@@ -401,29 +401,29 @@ Assert-True ($null -ne $enqueueCall -and $null -ne $entitlementCall) `
     "The admin command-report path changed."
 Assert-True ($enqueueCall.Offset -lt $entitlementCall.Offset) `
     "Admin commands can bypass reporting before server revalidation."
-$seedPermissionCall = $guardPrefixCalls |
+$adminPermissionCall = $guardPrefixCalls |
     Where-Object {
-        $_.Operand.Name -eq "IsSeedCommand" -and
+        $_.Operand.Name -eq "IsAdminOnlyCommand" -and
         $_.Operand.DeclaringType.FullName -eq "ServerManager.ClientCommandPermissions"
     } |
     Select-Object -First 1
-Assert-True ($null -ne $seedPermissionCall -and
+Assert-True ($null -ne $adminPermissionCall -and
     -not (Test-CecilReachable $guardPrefixDefinition.Body.Instructions[0] `
-        $enqueueCall @($seedPermissionCall))) `
-    "The cheat guard can enqueue printseeds before checking its separate permission boundary."
-$seedPermissionBranch = Get-FirstConditionalBranch $seedPermissionCall $enqueueCall
-Assert-True ($null -ne $seedPermissionBranch -and
-    $seedPermissionBranch.OpCode.Name -in @('brfalse', 'brfalse.s', 'brtrue', 'brtrue.s')) `
-    "The printseeds exclusion no longer has a direct Boolean branch."
-$seedMatchedPath = if ($seedPermissionBranch.OpCode.Name.StartsWith('brtrue')) {
-    $seedPermissionBranch.Operand
-} else { $seedPermissionBranch.Next }
-$otherCommandPath = if ($seedPermissionBranch.OpCode.Name.StartsWith('brtrue')) {
-    $seedPermissionBranch.Next
-} else { $seedPermissionBranch.Operand }
-Assert-True (-not (Test-CecilReachable $seedMatchedPath $enqueueCall) -and
+        $enqueueCall @($adminPermissionCall))) `
+    "The cheat guard can enqueue printseeds/freefly before checking their separate permission boundary."
+$adminPermissionBranch = Get-FirstConditionalBranch $adminPermissionCall $enqueueCall
+Assert-True ($null -ne $adminPermissionBranch -and
+    $adminPermissionBranch.OpCode.Name -in @('brfalse', 'brfalse.s', 'brtrue', 'brtrue.s')) `
+    "The admin-only command exclusion no longer has a direct Boolean branch."
+$adminMatchedPath = if ($adminPermissionBranch.OpCode.Name.StartsWith('brtrue')) {
+    $adminPermissionBranch.Operand
+} else { $adminPermissionBranch.Next }
+$otherCommandPath = if ($adminPermissionBranch.OpCode.Name.StartsWith('brtrue')) {
+    $adminPermissionBranch.Next
+} else { $adminPermissionBranch.Operand }
+Assert-True (-not (Test-CecilReachable $adminMatchedPath $enqueueCall) -and
     (Test-CecilReachable $otherCommandPath $enqueueCall)) `
-    "Matching printseeds can become cheat evidence, or unrelated cheat commands skip reporting."
+    "Matching printseeds/freefly can become cheat evidence, or unrelated cheat commands skip reporting."
 
 $runtimeDefinition = $pluginDefinition.MainModule.Types |
     Where-Object FullName -eq "ServerManager.ServerManagerRuntime"
@@ -5056,6 +5056,14 @@ Assert-True ($shouldAllowCommand.Invoke(
 $configureCommand.Invoke(
     $null,
     [object[]]@($true, $true, $true))
+$permissionGuardPrefix = $commandGuardType.GetMethod('Prefix', $staticNonPublic)
+foreach ($permissionCommand in @('printseeds', 'PRINTSEEDS extra', 'freefly', 'FREEFLY extra')) {
+    Assert-True ($permissionGuardPrefix.Invoke($null, [object[]]@($permissionCommand))) `
+        "The cheat guard must leave $permissionCommand to its separate permission check."
+    $permissionSignal = [object[]]@($null)
+    Assert-True (-not $dequeueCommand.Invoke($null, $permissionSignal)) `
+        "A permission-controlled command became cheat evidence: $permissionCommand"
+}
 Assert-True (-not $hasActiveAdminEntitlement.Invoke(
     $null,
     $null)) "Admin execution was granted without a server entitlement."

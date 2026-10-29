@@ -148,7 +148,7 @@ $smokeTests = @(
         NeedsGamePath = $true
     },
     [pscustomobject]@{
-        Name = "Server-verified seed command permissions"
+        Name = "Server-verified seed and free-camera command permissions"
         File = "SeedCommandPermissionsSmoke.ps1"
         NeedsGamePath = $true
     },

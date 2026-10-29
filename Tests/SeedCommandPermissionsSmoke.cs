@@ -46,94 +46,114 @@ internal static class SeedCommandPermissionsSmoke
             foreign.Patch(showCommand, postfix: new HarmonyMethod(typeof(SeedCommandPermissionsSmoke), nameof(HideForeign)));
             Check(Harmony.GetPatchInfo(runCommand).Owners.Contains(Owner), "Actual Harmony execution hook installed.");
 
+            foreach (string commandName in new[] { "printseeds", "freefly" })
+                CheckCommandPermissions(commandName);
+
+            Check(_foreignCalls > 0 && Harmony.GetPatchInfo(runCommand).Owners.Contains(ForeignOwner),
+                "Other owner's execution patch is preserved.");
+            harmony.UnpatchSelf();
+            Check(Harmony.GetPatchInfo(runCommand).Owners.Contains(ForeignOwner), "Removing only our hooks preserves other owners.");
+        }
+        finally { ClientCommandPermissions.Reset(); harmony.UnpatchSelf(); foreign.UnpatchSelf(); }
+    }
+
+    private static void CheckCommandPermissions(string commandName)
+    {
+            string partial = commandName.Substring(0, 3);
             var terminal = new Terminal();
             var chat = new Chat();
             Terminal.Commands.Clear();
-            var seed = new Terminal.ConsoleCommand("printseeds");
+            var restricted = new Terminal.ConsoleCommand(commandName);
+            var secondRestricted = new Terminal.ConsoleCommand(commandName == "printseeds" ? "freefly" : "printseeds");
             var unrelated = new Terminal.ConsoleCommand("other");
             var hidden = new Terminal.ConsoleCommand("foreign_hidden");
             new Terminal.ConsoleCommand("help");
             ZNet.instance = new ZNet { Server = false };
 
             ClientCommandPermissions.Reset();
-            terminal.TryRunCommand("printseeds");
-            Check(terminal.Executions == 1 && seed.ShowCommand(terminal), "Non-ServerManager remote servers unchanged.");
+            terminal.TryRunCommand(commandName);
+            Check(terminal.Executions == 1 && restricted.ShowCommand(terminal), "Non-ServerManager remote servers unchanged: " + commandName);
             ClientCommandPermissions.ApplyAdminStatus(true, 5000);
             Check(!ClientCommandPermissions.HasActiveAdminStatus(), "Grant outside a managed session cannot survive into one.");
-            terminal.Pump("pri");
-            Check(terminal.Search.Contains("printseeds"), "Initial vanilla autocomplete contains seed command.");
+            terminal.Pump(partial);
+            Check(terminal.Search.Contains(commandName), "Initial vanilla autocomplete contains command: " + commandName);
 
             ClientCommandPermissions.BeginSession();
             Check(!ClientCommandPermissions.HasActiveAdminStatus(), "New session starts without authority.");
-            terminal.TryRunCommand("printseeds");
-            terminal.TryRunCommand("PRINTSEEDS  arguments", false, true);
+            terminal.TryRunCommand(commandName);
+            terminal.TryRunCommand(commandName.ToUpperInvariant() + "  arguments", false, true);
             Check(terminal.Executions == 1 && terminal.Messages.Count == 2,
                 "F5 uppercase/arguments and skipAllowedCheck cannot bypass permissions.");
             Check(terminal.Messages.All(message => message == "sm_command_admin_required"),
                 "Refusal is only the localized permission message.");
-            chat.Enter("/printseeds");
+            chat.Enter("/" + commandName);
             Check(chat.Executions == 0 && chat.Messages.Count == 1,
                 "Slash chat command is blocked with refusal even when Chat supplies silentFail=true.");
-            Check(!seed.ShowCommand(terminal) && unrelated.ShowCommand(terminal), "Help filter targets only printseeds.");
+            Check(!restricted.ShowCommand(terminal) && !secondRestricted.ShowCommand(terminal) && unrelated.ShowCommand(terminal),
+                "Help filter targets both administrator-only commands, not unrelated commands.");
             Check(!hidden.ShowCommand(terminal), "Another owner's visibility restriction remains in place.");
             terminal.TryRunCommand("help");
-            Check(!terminal.LastHelp.Contains("printseeds") && terminal.LastHelp.Contains("other"),
-                "Help enumeration really excludes the command.");
+            Check(!terminal.LastHelp.Contains("printseeds") && !terminal.LastHelp.Contains("freefly") && terminal.LastHelp.Contains("other"),
+                "Help enumeration really excludes both commands.");
 
-            terminal.Pump("pri");
-            Check(!terminal.Search.Contains("printseeds") && !terminal.TabOptions.Contains("printseeds"),
+            terminal.Pump(partial);
+            Check(!terminal.Search.Contains(commandName) && !terminal.TabOptions.Contains(commandName),
                 "Beginning a session invalidates stale same-length search and tab candidates.");
             int rebuilds = terminal.Rebuilds;
-            terminal.Pump("pri");
+            terminal.Pump(partial);
             Check(terminal.Rebuilds == rebuilds, "Steady permission state does not rebuild cached command lists per frame.");
             terminal.TryRunCommand("other");
             Check(terminal.LastExecuted == "other", "Unrelated command execution remains available.");
 
-            Check(ClientCommandPermissions.IsSeedCommand("printseeds") &&
-                  ClientCommandPermissions.IsSeedCommand("PRINTSEEDS x") &&
-                  ClientCommandPermissions.IsSeedCommand("printseeds "), "Vanilla space/case forms match.");
-            foreach (string candidate in new[] { " printseeds", "/printseeds", "\tprintseeds", "printseeds\tx", "printseedsx", "", "say printseeds" })
-                Check(!ClientCommandPermissions.IsSeedCommand(candidate), "Not a vanilla seed command: " + candidate);
-            Check(!ClientCommandPermissions.IsSeedCommand(null!), "Null parser input is safe.");
+            Check(ClientCommandPermissions.IsAdminOnlyCommand(commandName) &&
+                  ClientCommandPermissions.IsAdminOnlyCommand(commandName.ToUpperInvariant() + " x") &&
+                  ClientCommandPermissions.IsAdminOnlyCommand(commandName + " "), "Vanilla space/case forms match: " + commandName);
+            foreach (string candidate in new[] { " " + commandName, "/" + commandName, "\t" + commandName, commandName + "\tx", commandName + "x", "", "say " + commandName })
+                Check(!ClientCommandPermissions.IsAdminOnlyCommand(candidate), "Not a vanilla restricted command: " + candidate);
+            Check(!ClientCommandPermissions.IsAdminOnlyCommand(null!), "Null parser input is safe.");
             CultureInfo previousCulture = CultureInfo.CurrentCulture;
             try
             {
                 CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("tr-TR");
-                Check(!ClientCommandPermissions.IsSeedCommand("PRINTSEEDS"), "Current-culture lowercasing exactly follows Terminal, including Turkish I.");
-                Check(ClientCommandPermissions.IsSeedCommand("printseeds"), "Lowercase command remains valid in Turkish culture.");
+                Check(ClientCommandPermissions.IsAdminOnlyCommand(commandName.ToUpperInvariant()) == (commandName != "printseeds"),
+                    "Current-culture lowercasing exactly follows Terminal, including Turkish I: " + commandName);
+                Check(ClientCommandPermissions.IsAdminOnlyCommand(commandName), "Lowercase command remains valid in Turkish culture.");
             }
             finally { CultureInfo.CurrentCulture = previousCulture; }
 
             ClientCommandPermissions.ApplyAdminStatus(true, 5000);
-            Check(ClientCommandPermissions.HasActiveAdminStatus() && seed.ShowCommand(terminal),
-                "Validated admin grant allows seed permissions without a cheat-policy flag.");
-            terminal.TryRunCommand("printseeds");
-            chat.Enter("/printseeds");
-            Check(terminal.LastExecuted == "printseeds" && chat.Executions == 1, "Admin F5/chat command execution unchanged.");
-            terminal.Pump("pri");
-            Check(terminal.Search.Contains("printseeds") && terminal.TabOptions.Contains("printseeds"),
+            Check(ClientCommandPermissions.HasActiveAdminStatus() && restricted.ShowCommand(terminal),
+                "Validated admin grant allows command without a cheat-policy flag: " + commandName);
+            terminal.TryRunCommand(commandName);
+            chat.Enter("/" + commandName);
+            Check(terminal.LastExecuted == commandName && chat.Executions == 1, "Admin F5/chat command execution unchanged.");
+            terminal.Pump(partial);
+            Check(terminal.Search.Contains(commandName) && terminal.TabOptions.Contains(commandName),
                 "Grant restores cached autocomplete even at the same input length.");
             rebuilds = terminal.Rebuilds;
             ClientCommandPermissions.ApplyAdminStatus(true, 5000);
-            terminal.Pump("pri");
+            terminal.Pump(partial);
             Check(terminal.Rebuilds == rebuilds, "Grant refresh does not churn UI caches.");
-            seed.Visible = false;
-            Check(!seed.ShowCommand(terminal), "Admin grant never overrides an existing vanilla visibility restriction.");
-            seed.Visible = true;
+            restricted.Visible = false;
+            Check(!restricted.ShowCommand(terminal), "Admin grant never overrides an existing vanilla visibility restriction.");
+            restricted.Visible = true;
 
             FieldInfo expiry = typeof(ClientCommandPermissions).GetField("_adminEntitlementExpiryTimestamp", BindingFlags.Static | BindingFlags.NonPublic)!;
             expiry.SetValue(null, 1L);
-            terminal.Pump("pri");
-            Check(!ClientCommandPermissions.HasActiveAdminStatus() && !terminal.Search.Contains("printseeds"),
+            terminal.Pump(partial);
+            Check(!ClientCommandPermissions.HasActiveAdminStatus() && !terminal.Search.Contains(commandName),
                 "Expired grant removes unchanged-input autocomplete without receiving another packet.");
             int executions = terminal.Executions;
-            terminal.TryRunCommand("printseeds");
+            terminal.TryRunCommand(commandName);
             Check(terminal.Executions == executions, "Expired authority blocks execution.");
             ClientCommandPermissions.ApplyAdminStatus(true, 5000);
-            terminal.Pump("pri");
+            terminal.Pump(partial);
             ClientCommandPermissions.ApplyAdminStatus(false, 0);
-            terminal.Pump("pri");
-            Check(!terminal.Search.Contains("printseeds"), "Explicit revocation invalidates autocomplete.");
+            terminal.Pump(partial);
+            Check(!terminal.Search.Contains(commandName), "Explicit revocation invalidates autocomplete.");
+            executions = terminal.Executions;
+            terminal.TryRunCommand(commandName);
+            Check(terminal.Executions == executions, "Explicit revocation blocks execution: " + commandName);
             AssertInvalidGrant(0);
             AssertInvalidGrant(999);
             AssertInvalidGrant(10001);
@@ -144,37 +164,33 @@ internal static class SeedCommandPermissionsSmoke
 
             ClientCommandPermissions.BeginSession();
             Check(!ClientCommandPermissions.HasActiveAdminStatus(), "Reconnect clears previous authority.");
-            terminal.Pump("pri");
+            terminal.Pump(partial);
             rebuilds = terminal.Rebuilds;
             ClientCommandPermissions.Reset();
             ClientCommandPermissions.BeginSession();
-            terminal.Pump("pri");
+            terminal.Pump(partial);
             Check(terminal.Rebuilds == rebuilds + 1, "Reconnect invalidates caches even if effective role stayed non-admin.");
 
-            seed.IsCheat = true;
-            seed.OnlyAdmin = true;
-            seed.RemoteCommand = true;
-            terminal.TryRunCommand("printseeds");
-            Check(seed.IsCheat && seed.OnlyAdmin && seed.RemoteCommand, "Permission hooks never mutate foreign command flags.");
-            Check(!seed.ShowCommand(terminal), "Foreign remote-command flag cannot expose denied seed command.");
+            Check(!restricted.IsCheat && !restricted.OnlyAdmin && !restricted.RemoteCommand,
+                "Permission hooks leave vanilla command flags unchanged: " + commandName);
+            restricted.IsCheat = true;
+            restricted.OnlyAdmin = true;
+            restricted.RemoteCommand = true;
+            terminal.TryRunCommand(commandName);
+            Check(restricted.IsCheat && restricted.OnlyAdmin && restricted.RemoteCommand, "Permission hooks never mutate foreign command flags.");
+            Check(!restricted.ShowCommand(terminal), "Foreign remote-command flag cannot expose denied command.");
             ZNet.instance.Server = true;
-            terminal.TryRunCommand("printseeds");
-            Check(terminal.LastExecuted == "printseeds" && seed.ShowCommand(terminal),
+            executions = terminal.Executions;
+            terminal.TryRunCommand(commandName);
+            Check(terminal.Executions == executions + 1 && terminal.LastExecuted == commandName && restricted.ShowCommand(terminal),
                 "Local host, single-player, and dedicated console server paths are unchanged.");
             ZNet.instance = null;
-            terminal.TryRunCommand("printseeds");
-            Check(seed.ShowCommand(terminal), "No-network context remains unchanged.");
+            terminal.TryRunCommand(commandName);
+            Check(restricted.ShowCommand(terminal), "No-network context remains unchanged.");
             ZNet.instance = new ZNet { Server = false };
             ClientCommandPermissions.Reset();
-            terminal.Pump("pri");
-            Check(terminal.Search.Contains("printseeds"), "Reset restores vanilla autocomplete for later unmanaged sessions.");
-
-            Check(_foreignCalls > 0 && Harmony.GetPatchInfo(runCommand).Owners.Contains(ForeignOwner),
-                "Other owner's execution patch is preserved.");
-            harmony.UnpatchSelf();
-            Check(Harmony.GetPatchInfo(runCommand).Owners.Contains(ForeignOwner), "Removing only our hooks preserves other owners.");
-        }
-        finally { ClientCommandPermissions.Reset(); harmony.UnpatchSelf(); foreign.UnpatchSelf(); }
+            terminal.Pump(partial);
+            Check(terminal.Search.Contains(commandName), "Reset restores vanilla autocomplete for later unmanaged sessions.");
     }
 
     private static void AssertInvalidGrant(int milliseconds)

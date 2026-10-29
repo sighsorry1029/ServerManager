@@ -82,7 +82,7 @@ internal static class ClientCommandPermissions
         return true;
     }
 
-    internal static bool IsSeedCommand(string text)
+    internal static bool IsAdminOnlyCommand(string text)
     {
         if (text == null)
         {
@@ -94,8 +94,13 @@ internal static class ClientCommandPermissions
         // slash prefixes, split on tabs, or use ordinal case folding instead.
         int separator = text.IndexOf(' ');
         int length = separator < 0 ? text.Length : separator;
-        return length == 10 &&
-               (separator < 0 ? text : text.Substring(0, separator)).ToLower() == "printseeds";
+        if (length != 10 && length != 7)
+        {
+            return false;
+        }
+
+        string command = (separator < 0 ? text : text.Substring(0, separator)).ToLower();
+        return command == "printseeds" || command == "freefly";
     }
 
     private static bool IsRestricted()
@@ -117,7 +122,7 @@ internal static class ClientCommandPermissions
         [HarmonyPriority(Priority.First)]
         private static bool Prefix(Terminal __instance, string __0)
         {
-            if (!IsRestricted() || !IsSeedCommand(__0))
+            if (!IsRestricted() || !IsAdminOnlyCommand(__0))
             {
                 return true;
             }
@@ -137,7 +142,7 @@ internal static class ClientCommandPermissions
         {
             // Preserve vanilla/foreign restrictions; never make a command
             // visible or change shared IsCheat/OnlyAdmin/RemoteCommand flags.
-            if (__result && IsRestricted() && IsSeedCommand(__instance.Command))
+            if (__result && IsRestricted() && IsAdminOnlyCommand(__instance.Command))
             {
                 __result = false;
             }

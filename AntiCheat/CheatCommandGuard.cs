@@ -79,9 +79,9 @@ internal static class CheatCommandGuard
             return true;
         }
 
-        // Seed visibility is a separate administrator permission, not cheat
-        // evidence. Do not sanction it even if another mod marks it IsCheat.
-        if (ClientCommandPermissions.IsSeedCommand(__0)) return true;
+        // These commands have a separate administrator permission, not cheat
+        // evidence. Do not sanction them even if another mod marks them IsCheat.
+        if (ClientCommandPermissions.IsAdminOnlyCommand(__0)) return true;
 
         ZNet? network = ZNet.instance;
         if (network == null || network.IsServer())
