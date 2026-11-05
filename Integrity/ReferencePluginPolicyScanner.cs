@@ -10,7 +10,7 @@ using Mono.Cecil;
 namespace ServerManager
 {
     /// <summary>
-    /// Reads administrator-provided plugin/library DLLs without loading them into the
+    /// Reads administrator-provided plugin/patcher/library DLLs without loading them into the
     /// CLR. Hashing and deferred metadata reads share one read-only file handle.
     /// File sharing prevents writes/replacement where the platform enforces it;
     /// metadata checks also reject observable changes during the scan.
@@ -394,7 +394,7 @@ namespace ServerManager
 
                                     IntegrityManifestEntry entry = DecodeBepInPluginAttribute(
                                         attribute, sha256, file.FullPath);
-                                    if (!fileGuids.Add(entry.PluginGuid))
+                                    if (!fileGuids.Add(entry.IdentityKey))
                                     {
                                         throw new InvalidDataException(
                                             "The DLL declares BepInPlugin GUID '" +
@@ -409,7 +409,7 @@ namespace ServerManager
                                                 IntegrityDiagnosticCodes.PolicyTooManyRules,
                                                 "Reference DLLs declare more than " +
                                                 _limits.MaxPluginCount +
-                                                " plugin entries."));
+                                                " module entries."));
                                         return;
                                     }
 
@@ -417,6 +417,25 @@ namespace ServerManager
                                         file.Requirement, entry,
                                         attribute.ConstructorArguments[2].Value as string ?? string.Empty));
                                 }
+                            }
+
+                            // A DLL can declare both chainloader plugins and
+                            // preloader patchers. Each gets its own kind-scoped
+                            // identity while attesting the same file bytes.
+                            foreach (PatcherMetadataRecord patcher in
+                                     PatcherMetadata.Read(module, sha256, _limits, cancellationToken))
+                            {
+                                if (!fileGuids.Add(patcher.Entry.IdentityKey))
+                                    throw new InvalidDataException("The DLL declares the same patcher identity more than once.");
+                                if (records.Count + fileRecords.Count >= _limits.MaxPluginCount)
+                                {
+                                    diagnostics.Add(IntegrityCanonical.Error(
+                                        IntegrityDiagnosticCodes.PolicyTooManyRules,
+                                        "Reference DLLs declare more than " + _limits.MaxPluginCount + " module entries."));
+                                    return;
+                                }
+                                fileRecords.Add(new ReferencePluginPolicyRecord(
+                                    file.Requirement, patcher.Entry, patcher.Version));
                             }
 
                             if (fileRecords.Count == 0)
@@ -605,7 +624,7 @@ namespace ServerManager
             cancellationToken.ThrowIfCancellationRequested();
             foreach (IGrouping<string, ReferencePluginPolicyRecord> group in
                      records.GroupBy(
-                         item => item.Entry.PluginGuid,
+                         item => item.Entry.IdentityKey,
                          StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -618,14 +637,14 @@ namespace ServerManager
                     diagnostics.Add(
                         IntegrityCanonical.Error(
                             IntegrityDiagnosticCodes.PolicySourceRoleConflict,
-                            "Plugin GUID '" +
-                            group.Key +
+                            "Module identity '" +
+                            group.First().Entry.PluginGuid +
                             "' appears in both required and optional reference folders.",
-                            group.Key));
+                            group.First().Entry.PluginGuid, group.First().Entry.Kind));
                     continue;
                 }
 
-                // GUID is the security identity. Display names may
+                // Kind + ID is the security identity. Display names may
                 // legitimately change across rolling-upgrade reference DLLs.
             }
         }

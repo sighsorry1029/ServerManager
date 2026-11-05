@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using BepInEx;
@@ -12,8 +11,9 @@ using BepInEx.Bootstrap;
 namespace ServerManager
 {
     /// <summary>
-    /// Builds the local manifest from BepInEx's already loaded PluginInfos.
-    /// Assemblies are never loaded again; PluginInfo.Location is hashed directly.
+    /// Builds the local manifest from BepInEx's already loaded PluginInfos and
+    /// metadata-only discovery of installed preloader patchers. Assemblies are
+    /// never loaded again and patcher entry points are never invoked.
     /// </summary>
     public static class PluginManifestScanner
     {
@@ -47,11 +47,13 @@ namespace ServerManager
             private readonly Stopwatch _elapsed = Stopwatch.StartNew();
             private readonly Task<IntegrityManifestBuildResult> _task;
             private readonly PluginRecord?[] _records = Array.Empty<PluginRecord?>();
+            private readonly string? _patcherRoot;
             private bool _disposed;
 
-            private Preparation(PluginRecord?[] records, IntegrityLimits limits)
+            private Preparation(PluginRecord?[] records, IntegrityLimits limits, string? patcherRoot)
             {
                 _records = records;
+                _patcherRoot = patcherRoot;
                 CancellationToken token = _cancellation.Token;
                 _task = Task.Run(async () =>
                 {
@@ -60,7 +62,7 @@ namespace ServerManager
                         await PreparationGate.WaitAsync(token).ConfigureAwait(false);
                         try
                         {
-                            return BuildSnapshot(records, limits, token);
+                            return BuildSnapshot(records, limits, token, patcherRoot);
                         }
                         finally
                         {
@@ -91,6 +93,8 @@ namespace ServerManager
                 try
                 {
                     PluginRecord?[] current = CaptureRecords(Chainloader.PluginInfos.Values);
+                    if (_patcherRoot != null && !string.Equals(_patcherRoot,
+                            Paths.PatcherPluginPath, StringComparison.Ordinal)) return false;
                     if (_records.Length != current.Length) return false;
                     return OrderRecords(_records).Zip(OrderRecords(current), (left, right) =>
                         left?.Guid == right?.Guid && left?.Name == right?.Name &&
@@ -125,11 +129,12 @@ namespace ServerManager
                     TaskScheduler.Default);
             }
 
-            internal static Preparation Capture(IEnumerable<PluginInfo> pluginInfos, IntegrityLimits limits)
+            internal static Preparation Capture(IEnumerable<PluginInfo> pluginInfos, IntegrityLimits limits,
+                string? patcherRoot = null)
             {
                 try
                 {
-                    return new Preparation(CaptureRecords(pluginInfos), limits);
+                    return new Preparation(CaptureRecords(pluginInfos), limits, patcherRoot);
                 }
                 catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
                 {
@@ -144,7 +149,7 @@ namespace ServerManager
             if (limits == null) throw new ArgumentNullException(nameof(limits));
             try
             {
-                return Begin(Chainloader.PluginInfos.Values, limits);
+                return Preparation.Capture(Chainloader.PluginInfos.Values, limits, Paths.PatcherPluginPath ?? string.Empty);
             }
             catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
             {
@@ -157,6 +162,41 @@ namespace ServerManager
             if (pluginInfos == null) throw new ArgumentNullException(nameof(pluginInfos));
             if (limits == null) throw new ArgumentNullException(nameof(limits));
             return Preparation.Capture(pluginInfos, limits);
+        }
+
+        internal static Preparation Begin(IEnumerable<PluginInfo> pluginInfos, IntegrityLimits limits,
+            string patcherRoot)
+        {
+            if (pluginInfos == null) throw new ArgumentNullException(nameof(pluginInfos));
+            if (limits == null) throw new ArgumentNullException(nameof(limits));
+            return Preparation.Capture(pluginInfos, limits, patcherRoot);
+        }
+
+        // UI callers may take a display-only asynchronous snapshot. Admission
+        // never reuses that snapshot: every preparation scans and hashes anew.
+        internal static InstalledPatcherScanResult ScanInstalledPatchers(
+            IntegrityLimits limits, CancellationToken cancellationToken = default)
+        {
+            if (limits == null) throw new ArgumentNullException(nameof(limits));
+            try
+            {
+                return ScanInstalledPatchers(Paths.PatcherPluginPath, limits, cancellationToken);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+            {
+                return new InstalledPatcherScanResult(false, Array.Empty<PatcherMetadataRecord>(), new[]
+                {
+                    IntegrityCanonical.Error(IntegrityDiagnosticCodes.ManifestUnavailable,
+                        "Could not locate installed preloader patchers: " + exception.Message)
+                });
+            }
+        }
+
+        internal static InstalledPatcherScanResult ScanInstalledPatchers(
+            string patcherRoot, IntegrityLimits limits, CancellationToken cancellationToken = default)
+        {
+            return PatcherMetadata.ScanDirectory(patcherRoot, limits, cancellationToken);
         }
 
         private static PluginRecord?[] CaptureRecords(IEnumerable<PluginInfo> pluginInfos)
@@ -209,7 +249,14 @@ namespace ServerManager
                         exception.Message));
             }
 
-            return Build(pluginInfos, limits);
+            try
+            {
+                return Build(pluginInfos, limits, Paths.PatcherPluginPath ?? string.Empty);
+            }
+            catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+            {
+                return SnapshotFailed(exception);
+            }
         }
 
         /// <summary>
@@ -219,6 +266,15 @@ namespace ServerManager
         public static IntegrityManifestBuildResult Build(
             IEnumerable<PluginInfo> pluginInfos,
             IntegrityLimits limits)
+        {
+            return Build(pluginInfos, limits, null);
+        }
+
+        /// <summary>Builds a deterministic manifest including an explicit patcher tree.</summary>
+        public static IntegrityManifestBuildResult Build(
+            IEnumerable<PluginInfo> pluginInfos,
+            IntegrityLimits limits,
+            string? patcherRoot)
         {
             if (pluginInfos == null)
             {
@@ -246,11 +302,12 @@ namespace ServerManager
                         exception.Message));
             }
 
-            return BuildSnapshot(records, limits, CancellationToken.None);
+            return BuildSnapshot(records, limits, CancellationToken.None, patcherRoot);
         }
 
         private static IntegrityManifestBuildResult BuildSnapshot(
-            PluginRecord?[] records, IntegrityLimits limits, CancellationToken cancellationToken)
+            PluginRecord?[] records, IntegrityLimits limits, CancellationToken cancellationToken,
+            string? patcherRoot)
         {
             cancellationToken.ThrowIfCancellationRequested();
             List<PluginRecord?> orderedPlugins = OrderRecords(records).ToList();
@@ -394,6 +451,28 @@ namespace ServerManager
                     diagnostics);
             }
 
+            if (patcherRoot != null)
+            {
+                InstalledPatcherScanResult patchers = ScanInstalledPatchers(patcherRoot, limits, cancellationToken);
+                if (!patchers.Success)
+                    return new IntegrityManifestBuildResult(false, null, patchers.Diagnostics);
+                if (entries.Count + patchers.Records.Count > limits.MaxPluginCount)
+                    return Failed(IntegrityCanonical.Error(IntegrityDiagnosticCodes.ManifestTooManyEntries,
+                        "Combined plugin and patcher count exceeds the configured limit of " +
+                        limits.MaxPluginCount + "."));
+                HashSet<string> identities = new HashSet<string>(entries.Select(entry => entry.IdentityKey),
+                    StringComparer.Ordinal);
+                foreach (PatcherMetadataRecord patcher in patchers.Records)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!identities.Add(patcher.Entry.IdentityKey))
+                        return Failed(IntegrityCanonical.Error(IntegrityDiagnosticCodes.ManifestDuplicateGuid,
+                            "More than one installed module declares the same kind and identity.",
+                            patcher.Entry.PluginGuid, patcher.Entry.Kind));
+                    entries.Add(patcher.Entry);
+                }
+            }
+
             return new IntegrityManifestBuildResult(
                 true,
                 new IntegrityManifest(entries),
@@ -413,6 +492,14 @@ namespace ServerManager
 
             try
             {
+                FileInfo original = new FileInfo(fullPath);
+                original.Refresh();
+                if (!original.Exists) throw new FileNotFoundException("Plugin DLL no longer exists.", fullPath);
+                if ((original.Attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidDataException("Plugin DLLs cannot be reparse points.");
+                long initialLength = original.Length;
+                DateTime modified = original.LastWriteTimeUtc;
+                DateTime created = original.CreationTimeUtc;
                 using (FileStream stream = new FileStream(
                            fullPath,
                            FileMode.Open,
@@ -421,28 +508,11 @@ namespace ServerManager
                            81920,
                            FileOptions.SequentialScan))
                 {
-                    using (SHA256 hasher = SHA256.Create())
-                    {
-                        byte[] buffer = new byte[81920];
-                        long initialLength = stream.Length;
-                        long totalRead = 0;
-                        // Read only the initial extent so a continuously growing
-                        // file cannot turn this preparation into unbounded work.
-                        while (totalRead < initialLength)
-                        {
-                            cancellationToken.ThrowIfCancellationRequested();
-                            int count = stream.Read(buffer, 0,
-                                (int)Math.Min(buffer.Length, initialLength - totalRead));
-                            if (count == 0) break;
-                            totalRead += count;
-                            hasher.TransformBlock(buffer, 0, count, buffer, 0);
-                        }
-                        cancellationToken.ThrowIfCancellationRequested();
-                        if (totalRead != initialLength || stream.Length != initialLength)
-                            throw new InvalidDataException("The DLL length changed while hashing.");
-                        hasher.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
-                        sha256 = IntegrityCanonical.ToLowerHex(hasher.Hash!);
-                    }
+                    PatcherMetadata.EnsureUnchanged(fullPath, stream, initialLength, modified, created);
+                    // Read only the initial extent; a growing file cannot turn
+                    // one connection's preparation into unbounded work.
+                    sha256 = PatcherMetadata.Hash(stream, initialLength, cancellationToken);
+                    PatcherMetadata.EnsureUnchanged(fullPath, stream, initialLength, modified, created);
                 }
 
                 return true;

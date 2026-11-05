@@ -67,6 +67,7 @@ Dedicated servers and local hosts use the same rule.
 ServerManager/
 ├── ServerManager.yml       Server rules and starting items
 ├── discord.yml             Webhooks, bot commands and chat
+├── log.yml                 Audit, player and chat file logging
 ├── cron.yml                Scheduled commands
 ├── cron_last.yml           Saved scheduling progress — do not edit
 ├── Itemdata.yml            Item custom-data presets
@@ -102,30 +103,52 @@ Copy trusted DLLs into these folders on the server:
 | --- | --- |
 | `required` | Every listed mod, with an approved DLL hash. |
 | `optional` | The mod is optional, but its DLL hash must match if installed. |
-| Neither | Unlisted BepInEx plugins are rejected for non-admin players. |
+| Neither | Unlisted BepInEx plugins and preloader patchers are rejected for non-admin players. |
 
 These are **reference copies**. Putting a DLL here does not install the mod.
-Mods that must run on the server still belong in its `BepInEx/plugins` folder.
+The same `required` and `optional` folders accept ordinary BepInEx plugins and
+standard **BepInEx 5 preloader patchers**, with no new configuration fields.
+ServerManager reads their metadata and file hashes without loading or executing
+the reference DLLs. Approving a client patcher does not run it on the server or
+change the server's game assemblies.
+
+A DLL that declares both plugin and patcher entry points is approved as both
+kinds. In `required`, both must be present in the client's report.
+
+Install ordinary plugins in `BepInEx/plugins` and preloader patchers in
+`BepInEx/patchers` on clients. If a mod must run on the server too, install it
+there separately in the appropriate folder. Restart the game after changing
+patcher DLLs; runtime replacement is not supported.
 
 - ServerManager adds its own running DLL to the required policy automatically.
 - Folder changes reload in the background. Update these copies when changing
   your modpack; the updated policy applies to new connections.
-- Multiple approved versions can share one folder. Do not put the same plugin
+- Multiple approved versions can share one folder. Do not put the same module
   in both folders.
 - Invalid updates keep the previous policy. While the first policy is still
   loading, players may need to retry joining.
-- Verified admins may use extra plugins or mismatched optional mods.
+- Verified admins may use extra plugins/patchers or mismatched optional mods.
   **Required mods still apply to admins.**
 
-Only BepInEx plugins are checked. Standalone libraries such as
+Both module kinds use the same exact approved DLL-hash policy. A patcher's stable
+identity is derived from its assembly name and patcher type, separately from its
+file hash; its preview version is the assembly version. Plugin and patcher
+identities cannot substitute for one another. Update **both server and clients**
+before using this policy; older admission and optional-preview formats are not
+compatible.
+
+Standalone libraries such as
 `Newtonsoft.Json.dll` and `YamlDotNet.dll` are skipped even when copied into
 `required` or `optional`; skipped files are reported when the policy loads or
 reloads. Their presence, version and hash do not affect admission. A companion
-DLL that registers a BepInEx plugin (such as Newtonsoft.Json Detector) still
-follows the normal plugin rules. Libraries merged into a plugin remain part of
-that plugin's file hash. Native DLLs are not supported as references.
+DLL that registers a BepInEx plugin (such as Newtonsoft.Json Detector) or a
+recognized preloader patcher still follows the normal module rules. Libraries
+merged into a module remain part of that module's file hash. Native DLLs are not
+supported as references.
 
-These checks do not prove that a client’s memory or external tools are unmodified.
+File hashes do not prove runtime integrity: they do not establish that a patcher
+executed successfully, that its target assemblies or a client's memory are
+unmodified, or that no external tools are running.
 
 ## Server settings
 
@@ -641,19 +664,21 @@ server-console commands. They run with server authority, not as shell commands.
 
 ### Scheduled-job logging
 
-`logJobs` defaults to **false**. A job's `log` overrides it; when both are omitted,
-`log` is **false**. Existing `logJobs: true` settings are respected.
+Select file records in `log.yml`, not in individual jobs. Remove any per-job
+`log` field from existing `cron.yml`/`cron.yaml` files; it is no longer accepted.
+An invalid edit keeps the last valid schedule and prints a warning.
 
-For jobs containing only `broadcast center` messages, **false** omits successful
-command and job-completion entries from `events-audit.log`. Set `log: true` to keep
-them. Failed, cancelled and skipped jobs remain audited. Other commands, including
-mixed batches, saves and world maintenance, keep their audit records regardless
-of this setting. Discord's `cron.executed` reports and `cron_last.yml` progress
-are unchanged.
+The default audit selection includes `cron.failed`: failed, cancelled, timed-out
+or review-required final results. Use `cron.executed` instead to include all
+final results, including success and skips. Each job writes at most one final
+audit result, not a second line for every intermediate command. Failed batches
+include the failure code and command step when known. A pending operation that cannot yet finish
+still reports its operational warning to the BepInEx console.
 
-The setting also controls successful job messages in the BepInEx console.
-`logSkipped` controls skipped console messages only when the job's `log` is true.
-These settings reload live with `cron.yml`.
+Root `logJobs` (default **false**) and `logSkipped` (default **true**) now affect
+only successful/skipped BepInEx console messages. They do not select file logs.
+Failures still warn on the console. Discord reports and `cron_last.yml`
+progress are independent of both settings. Changes reload live.
 
 A failed step stops its batch. Scheduled `save` waits for a confirmed checkpoint;
 other mods’ commands may finish their background work later. Ordinary jobs skip
@@ -673,11 +698,9 @@ jobs:
   - command: broadcast center <color=yellow>Server restart in two minutes.</color>
     schedule: "28 5,17 * * *"
     allowClientHide: false
-    log: true
   - command: broadcast center <color=yellow><size=32>Use the hammer to save a house blueprint.</size></color>
     schedule: "14-59/30 * * * *"
     allowClientHide: true
-    log: false
 ```
 
 `allowClientHide` defaults to **false**. With **true**, ServerManager delivers
@@ -825,9 +848,12 @@ an already displayed center message finishes normally.
 
 ### Optional-mod preview
 
-The upper-left menu panel shows optional mods from the configured server.
-Already loaded, allowed versions are hidden. The preview refreshes about once a
-minute; it does not replace the exact DLL-hash check when joining.
+The upper-left menu panel shows optional mods from the configured server;
+preloader entries are labeled **Patcher**. Allowed versions already loaded as
+plugins or found in `BepInEx/patchers` are hidden. Patcher detection is a cached,
+background installed-file scan, not confirmation that a patcher executed. The
+server preview refreshes about once a minute; neither version matching nor the
+preview replaces the exact DLL-hash check when joining.
 
 - Dedicated servers: the Steam query port must be reachable, usually UDP 2457
   for game port 2456. DNS must resolve to IPv4.
@@ -847,6 +873,72 @@ restart after changes. For custom webhook languages, install the translation
 on the server too.
 
 ## Logs
+
+Edit the server's `log.yml` to select which records are written. The three keys
+are lists directly, with no nested `events` or `enabled` fields:
+
+```yaml
+audit:
+  - server.started
+  - server.status
+  - server.saved
+  - server.announcement
+  - player.connection
+  - player.death
+  - boss.killed
+  - raid.status
+  - command.executed
+  - moderation.action
+  - cron.failed
+  - connection.rejected
+  - security.alert
+  - security.admin_bypass
+  - character.validation
+  - character.shadow_stalled
+  - character.revision_observed
+
+player:
+  - player.connection
+  - player.position
+  - player.death
+  - combat.damage
+  - inventory.changed
+  - inventory.snapshot
+  - skill.changed
+  - character.save_rejected
+
+chat:
+  - chat.shout
+  - chat.normal
+  - chat.whisper
+  - chat.clan
+  - discord.shout
+```
+
+These are the defaults. Remove a name to stop those records, or use `player: []`
+(likewise `audit` or `chat`) to turn off that file category. An omitted category
+uses its defaults. Unknown names, duplicate entries and invalid YAML keep the
+last valid settings; no existing logs are deleted or rewritten. On an invalid
+first load, defaults remain active and a warning explains the problem.
+Edits reload automatically after a brief stability check.
+
+Audit selectors group existing records: `server.status` selects ready/shutdown;
+`player.connection` selects first join/login/leave; `player.death` includes PvP;
+`raid.status` selects start/end; `security.alert` selects detection/response;
+`character.validation` selects save rejection/validation observations. Actual
+file lines retain their original event names. `command.executed` selects manual
+commands, while `cron.failed` and `cron.executed` select scheduled final results.
+Selecting both cron names never duplicates a record.
+
+Player `inventory.changed` selects item-count deltas, and `inventory.snapshot`
+selects full inventory/custom-data blocks. `combat.damage` covers dealt and
+received damage. `player.position` controls standalone position rows only:
+other activity rows can still include coordinates. Turning off connection rows
+does not disable other player records.
+
+These filters affect only files, not character saves, validation, cheat responses,
+chat delivery, in-game messages, integration events or Discord webhooks.
+`chat.whisper` and `chat.clan` can contain private conversations; keep logs private.
 
 - `events-audit.log`: server events, commands, security findings and rejected
   connections. Uses UTC timestamps and rotates by size.

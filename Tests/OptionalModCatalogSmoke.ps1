@@ -24,6 +24,7 @@ try {
         (Join-Path $ProjectRoot 'Integrity\IntegrityModels.cs'),
         (Join-Path $ProjectRoot 'Integrity\IntegrityPolicyStore.cs'),
         (Join-Path $ProjectRoot 'Integrity\ReferencePluginPolicyScanner.cs'),
+        (Join-Path $ProjectRoot 'Integrity\PatcherMetadata.cs'),
         (Join-Path $ProjectRoot 'Integrity\OptionalModCatalog.cs'),
         (Join-Path $ProjectRoot 'Tests\OptionalModCatalogSmoke.cs'))
     & dotnet @compileArgs

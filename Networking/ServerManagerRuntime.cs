@@ -995,6 +995,7 @@ internal static partial class ServerManagerRuntime
         RunInitializationCleanup(
             "player activity runtime",
             () => PlayerActivityRuntime.Stop("initialization_rollback"));
+        RunInitializationCleanup("log settings", LogSettingsRuntime.Stop);
         RunInitializationCleanup(
             "client detection",
             ClientDetection.Shutdown);
@@ -1048,6 +1049,7 @@ internal static partial class ServerManagerRuntime
         }
 
         RecoverCancelledApplicationQuit();
+        LogSettingsRuntime.Tick();
         TickServerSettings();
         SynchronizeServerPolicies();
         ProcessLocalHostStartupFailure();
@@ -1276,6 +1278,7 @@ internal static partial class ServerManagerRuntime
         ClientDetection.Shutdown();
         CheatCommandGuard.Reset();
         ServerEventRuntime.Shutdown();
+        LogSettingsRuntime.Stop();
 
         _integrityService?.Dispose();
         _integrityService = null;
@@ -1317,6 +1320,19 @@ internal static partial class ServerManagerRuntime
                     ServerManagerPlugin.ConnectionError = string.Empty;
                     try
                     {
+                        LogSettingsRuntime.Start(ServerManagerPlugin.DataRoot,
+                            message => ServerManagerPlugin.Log.LogInfo(message),
+                            message => ServerManagerPlugin.Log.LogWarning(message));
+                    }
+                    catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+                    {
+                        // Log configuration is never a condition of admission or saving.
+                        ServerManagerPlugin.Log.LogWarning(
+                            "Log settings could not start; logging defaults remain active: " +
+                            exception.GetType().Name);
+                    }
+                    try
+                    {
                         PlayerActivityRuntime.Start(ServerManagerPlugin.DataRoot);
                     }
                     catch (Exception exception) when (
@@ -1334,6 +1350,7 @@ internal static partial class ServerManagerRuntime
                     !IntegrityCanonical.IsFatal(exception))
                 {
                     PlayerActivityRuntime.Stop("server_start_failed");
+                    LogSettingsRuntime.Stop();
                     _serverDataRootStartupFailed = true;
                     ValheimPrivateAccess.SetOpenServer(false);
                     ServerManagerPlugin.ConnectionError =
@@ -4382,6 +4399,7 @@ internal static partial class ServerManagerRuntime
             RunNetworkShutdownStep(
                 "player activity log shutdown",
                 () => PlayerActivityRuntime.Stop("server_shutdown"));
+            RunNetworkShutdownStep("log settings shutdown", LogSettingsRuntime.Stop);
             RunNetworkShutdownStep(
                 "Steam authentication callback disposal",
                 DisposeSteamAuthenticationCallback);

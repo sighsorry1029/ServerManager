@@ -20,14 +20,23 @@ namespace ServerManager
     internal sealed class OptionalModCatalogEntry
     {
         internal OptionalModCatalogEntry(string pluginGuid, string name, IEnumerable<string> versions)
+            : this(pluginGuid, name, versions, IntegrityModuleKind.Plugin)
+        {
+        }
+
+        internal OptionalModCatalogEntry(string pluginGuid, string name, IEnumerable<string> versions,
+            IntegrityModuleKind kind)
         {
             PluginGuid = pluginGuid;
+            Kind = kind;
             Name = name;
             Versions = Array.AsReadOnly(versions.ToArray());
         }
 
         // Identity for client-local installed-mod matching, never a display label.
         internal string PluginGuid { get; }
+        internal IntegrityModuleKind Kind { get; }
+        internal string IdentityKey => IntegrityCanonical.GetIdentityKey(Kind, PluginGuid);
         internal string Name { get; }
         internal IReadOnlyList<string> Versions { get; }
     }
@@ -46,14 +55,14 @@ namespace ServerManager
     }
 
     // Advisory Steam rules, entirely separate from the admission protocol. No
-    // file hash, path, password, or other server policy data is serialized. GUIDs
+    // file hash, path, password, or other server policy data is serialized. Kind/IDs
     // support exact client-local installed-mod matching, not admission decisions.
     // The digest detects truncation/mixed publications, not a trustworthy server.
     internal static class OptionalModCatalog
     {
         internal const string KeyPrefix = "sm_optional_";
         internal const string HeaderKey = KeyPrefix + "header";
-        internal const string SchemaVersion = "2";
+        internal const string SchemaVersion = "3";
         internal const string UnavailableHeaderValue = SchemaVersion + "|missing|0|0|";
         internal const int MaximumRuleValueBytes = 96;
         internal const int MaximumChunkCount = 146;
@@ -80,8 +89,8 @@ namespace ServerManager
                 HashSet<string> identities = new HashSet<string>(StringComparer.Ordinal);
                 foreach (IntegrityPolicyRule rule in rules)
                 {
-                    ValidatePluginGuid(rule.PluginGuid);
-                    if (!identities.Add(rule.PluginGuid)) throw new InvalidDataException();
+                    ValidateIdentifier(rule.PluginGuid, rule.Kind);
+                    if (!identities.Add(rule.IdentityKey)) throw new InvalidDataException();
                     ValidateText(rule.DisplayName, MaximumNameBytes);
                     if (rule.AllowedVersions.Count > MaximumVersionsPerEntry) throw new CatalogTooLargeException();
                     if (rule.AllowedVersions.Count == 0) throw new InvalidDataException();
@@ -90,12 +99,13 @@ namespace ServerManager
                 rules = rules
                     .OrderBy(rule => rule.DisplayName, StringComparer.Ordinal)
                     .ThenBy(rule => string.Join("\0", rule.AllowedVersions), StringComparer.Ordinal)
-                    .ThenBy(rule => rule.PluginGuid, StringComparer.Ordinal)
+                    .ThenBy(rule => rule.IdentityKey, StringComparer.Ordinal)
                     .ToList();
                 List<byte> bytes = new List<byte>();
                 WriteLength(bytes, rules.Count);
                 foreach (IntegrityPolicyRule rule in rules)
                 {
+                    bytes.Add((byte)rule.Kind);
                     WriteText(bytes, rule.PluginGuid, MaximumGuidBytes);
                     WriteText(bytes, rule.DisplayName, MaximumNameBytes);
                     if (rule.AllowedVersions.Count > MaximumVersionsPerEntry) throw new CatalogTooLargeException();
@@ -193,12 +203,14 @@ namespace ServerManager
                 HashSet<string> identities = new HashSet<string>(StringComparer.Ordinal);
                 string? previousName = null;
                 string? previousVersions = null;
-                string? previousGuid = null;
+                string? previousIdentity = null;
                 for (int index = 0; index < entryCount; index++)
                 {
+                    IntegrityModuleKind kind = (IntegrityModuleKind)ReadByte(payload, ref offset);
                     string pluginGuid = ReadText(payload, ref offset, MaximumGuidBytes);
-                    ValidatePluginGuid(pluginGuid);
-                    if (!identities.Add(pluginGuid)) return Result(OptionalModCatalogStatus.Invalid);
+                    ValidateIdentifier(pluginGuid, kind);
+                    string identity = IntegrityCanonical.GetIdentityKey(kind, pluginGuid);
+                    if (!identities.Add(identity)) return Result(OptionalModCatalogStatus.Invalid);
                     string name = ReadText(payload, ref offset, MaximumNameBytes);
                     int versionCount = ReadByte(payload, ref offset);
                     if (versionCount > MaximumVersionsPerEntry) throw new CatalogTooLargeException();
@@ -216,12 +228,12 @@ namespace ServerManager
                     int versionsOrder = StringComparer.Ordinal.Compare(previousVersions, versionOrder);
                     if (previousName != null && (nameOrder > 0 ||
                         (nameOrder == 0 && (versionsOrder > 0 ||
-                            (versionsOrder == 0 && StringComparer.Ordinal.Compare(previousGuid, pluginGuid) >= 0)))))
+                            (versionsOrder == 0 && StringComparer.Ordinal.Compare(previousIdentity, identity) >= 0)))))
                         return Result(OptionalModCatalogStatus.Invalid);
-                    entries.Add(new OptionalModCatalogEntry(pluginGuid, name, versions));
+                    entries.Add(new OptionalModCatalogEntry(pluginGuid, name, versions, kind));
                     previousName = name;
                     previousVersions = versionOrder;
-                    previousGuid = pluginGuid;
+                    previousIdentity = identity;
                 }
                 return offset == payload.Length
                     ? new OptionalModCatalogResult(OptionalModCatalogStatus.Available, entries)
@@ -259,12 +271,12 @@ namespace ServerManager
             using (SHA256 sha = SHA256.Create()) return IntegrityCanonical.ToLowerHex(sha.ComputeHash(bytes));
         }
 
-        private static void ValidatePluginGuid(string value)
+        private static void ValidateIdentifier(string value, IntegrityModuleKind kind)
         {
             if (value == null) throw new InvalidDataException();
             if (value.Length > MaximumGuidBytes) throw new CatalogTooLargeException();
-            if (!IntegrityCanonical.TryNormalizeGuid(value, IntegrityLimits.Default,
-                    IntegrityDiagnosticCodes.ManifestInvalidGuid, out string canonical, out _) ||
+            if (!IntegrityCanonical.TryNormalizeIdentifier(value, kind, IntegrityLimits.Default,
+                    out string canonical, out _) ||
                 !string.Equals(value, canonical, StringComparison.Ordinal))
                 throw new InvalidDataException();
         }

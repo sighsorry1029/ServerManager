@@ -58,8 +58,9 @@ internal static class OptionalModCatalogSmoke
         var result = Status(rules, OptionalModCatalogStatus.Available, "Valid catalog unavailable");
         Assert(result.Entries.Count == 2 && result.Entries[0].Name == "Alpha" && result.Entries[1].Name == "한글 Mod 🚀", "Optional plugin filtering/order failed");
         Assert(result.Entries[0].PluginGuid == "second.guid" && result.Entries[1].PluginGuid == "private.guid", "Stable GUIDs did not round-trip");
-        Assert(rules[OptionalModCatalog.HeaderKey].StartsWith("2|available|", StringComparison.Ordinal) &&
-            OptionalModCatalog.UnavailableHeaderValue == "2|missing|0|0|", "Preview schema was not upgraded to version two");
+        Assert(rules[OptionalModCatalog.HeaderKey].StartsWith("3|available|", StringComparison.Ordinal) &&
+            OptionalModCatalog.UnavailableHeaderValue == "3|missing|0|0|", "Preview schema was not upgraded to version three");
+        Assert(result.Entries.All(entry => entry.Kind == IntegrityModuleKind.Plugin), "Plugin kind did not round-trip");
         Assert(result.Entries[1].Versions.SequenceEqual(new[] { "1.0.0", "2.0.0" }), "Versions not sorted distinct");
         Assert(optional.AllowedSha256.SequenceEqual(new[] { Hash }), "Metadata changed allowed hashes");
         Assert(Stable(rules) == Stable(OptionalModCatalog.Encode(Snapshot(second, optional, required))), "Output depends on input order");
@@ -74,6 +75,35 @@ internal static class OptionalModCatalogSmoke
             "Same-name plugins were combined or lost stable identity ordering");
         Assert(Stable(OptionalModCatalog.Encode(sameName)) == Stable(OptionalModCatalog.Encode(Snapshot(sameName.Rules.Reverse().ToArray()))),
             "Same-name identity ordering depends on input order");
+        string patcherId = new string('b', 64);
+        var patcher = new IntegrityPolicyRule(patcherId, "Same module", IntegrityRequirement.Optional,
+            new[] { Hash }, new[] { "1.0.0.0" }, IntegrityModuleKind.Patcher);
+        var sameIdentifier = Snapshot(patcher, Rule(patcherId, "Same module", "1.0.0.0"));
+        var kindResult = Status(OptionalModCatalog.Encode(sameIdentifier), OptionalModCatalogStatus.Available,
+            "Distinct plugin/patcher namespaces collided");
+        Assert(kindResult.Entries.Count == 2 && kindResult.Entries[0].Kind == IntegrityModuleKind.Plugin &&
+            kindResult.Entries[1].Kind == IntegrityModuleKind.Patcher &&
+            kindResult.Entries[0].IdentityKey != kindResult.Entries[1].IdentityKey,
+            "Module kind was lost or cross-kind identities were combined");
+        Assert(Stable(OptionalModCatalog.Encode(sameIdentifier)) ==
+            Stable(OptionalModCatalog.Encode(Snapshot(sameIdentifier.Rules.Reverse().ToArray()))),
+            "Cross-kind identity ordering depends on input order");
+        Status(Wrap(RawPayloadWithKind((IntegrityModuleKind)9, patcherId, "Unknown", "1.0.0.0"), 1),
+            OptionalModCatalogStatus.Invalid, "Unknown remote module kind accepted");
+        foreach (string badPatcherId in new[] { "plugin.guid", new string('b', 63), new string('B', 64), new string('z', 64) })
+        {
+            Status(Wrap(RawPayloadWithKind(IntegrityModuleKind.Patcher, badPatcherId, "Patcher", "1.0.0.0"), 1),
+                OptionalModCatalogStatus.Invalid, "Invalid/noncanonical remote patcher identity accepted");
+            Status(OptionalModCatalog.Encode(Snapshot(new IntegrityPolicyRule(badPatcherId, "Patcher", IntegrityRequirement.Optional,
+                new[] { Hash }, new[] { "1.0.0.0" }, IntegrityModuleKind.Patcher))), OptionalModCatalogStatus.Invalid,
+                "Invalid/noncanonical local patcher identity accepted");
+        }
+        Status(Wrap(CombinePayloads(RawPayloadWithKind(IntegrityModuleKind.Patcher, patcherId, "Alpha", "1.0.0.0"),
+            RawPayloadWithKind(IntegrityModuleKind.Patcher, patcherId, "Zulu", "2.0.0.0")), 2),
+            OptionalModCatalogStatus.Invalid, "Duplicate patcher identity accepted");
+        Status(Wrap(CombinePayloads(RawPayloadWithKind(IntegrityModuleKind.Patcher, patcherId, "Same", "1"),
+            RawPayloadWithGuid(patcherId, "Same", "1")), 2), OptionalModCatalogStatus.Invalid,
+            "Noncanonical cross-kind identity ordering accepted");
         bool immutable = false;
         try { ((IList<string>)result.Entries[1].Versions).Add("3"); } catch (NotSupportedException) { immutable = true; }
         Assert(immutable, "Decoded version list is mutable");
@@ -124,19 +154,22 @@ internal static class OptionalModCatalogSmoke
         modified.Remove(OptionalModCatalog.KeyPrefix + "000");
         Status(modified, OptionalModCatalogStatus.Invalid, "Missing chunk accepted");
         modified = Copy(rules);
-        modified[OptionalModCatalog.HeaderKey] = modified[OptionalModCatalog.HeaderKey].Replace("2|available", "3|available");
+        modified[OptionalModCatalog.HeaderKey] = modified[OptionalModCatalog.HeaderKey].Replace("3|available", "4|available");
         Status(modified, OptionalModCatalogStatus.Invalid, "Unknown schema accepted");
         modified = Copy(rules);
-        modified[OptionalModCatalog.HeaderKey] = modified[OptionalModCatalog.HeaderKey].Replace("2|available", "1|available");
+        modified[OptionalModCatalog.HeaderKey] = modified[OptionalModCatalog.HeaderKey].Replace("3|available", "2|available");
+        Status(modified, OptionalModCatalogStatus.Invalid, "Legacy kind-free preview schema accepted");
+        modified = Copy(rules);
+        modified[OptionalModCatalog.HeaderKey] = modified[OptionalModCatalog.HeaderKey].Replace("3|available", "1|available");
         Status(modified, OptionalModCatalogStatus.Invalid, "Legacy identity-free preview schema accepted");
         Status(new Dictionary<string, string> { [OptionalModCatalog.HeaderKey] = "1|missing|0|0|" }, OptionalModCatalogStatus.Invalid,
             "Legacy unavailable header bypassed schema check");
         modified = Copy(rules);
-        modified[OptionalModCatalog.HeaderKey] = "2|available|129|1|" + new string('a', 64);
+        modified[OptionalModCatalog.HeaderKey] = "3|available|129|1|" + new string('a', 64);
         Status(modified, OptionalModCatalogStatus.TooLarge, "Remote oversized count accepted");
-        modified[OptionalModCatalog.HeaderKey] = "2|available|1|147|" + new string('a', 64);
+        modified[OptionalModCatalog.HeaderKey] = "3|available|1|147|" + new string('a', 64);
         Status(modified, OptionalModCatalogStatus.TooLarge, "Remote oversized chunk count accepted");
-        modified[OptionalModCatalog.HeaderKey] = "2|available|01|1|" + new string('a', 64);
+        modified[OptionalModCatalog.HeaderKey] = "3|available|01|1|" + new string('a', 64);
         Status(modified, OptionalModCatalogStatus.Invalid, "Noncanonical count accepted");
         modified = Copy(rules);
         modified[OptionalModCatalog.HeaderKey] = modified[OptionalModCatalog.HeaderKey].Substring(0, modified[OptionalModCatalog.HeaderKey].Length - 1) + "z";
@@ -163,8 +196,8 @@ internal static class OptionalModCatalogSmoke
         Status(Wrap(RawPayload("Name"), 1), OptionalModCatalogStatus.Invalid, "Remote missing versions accepted");
         Status(Wrap(RawPayload("Name", "1"), 2), OptionalModCatalogStatus.Invalid, "Count mismatch accepted");
         Status(Wrap(RawPayload("Name", "1").Concat(new byte[] { 0 }).ToArray(), 1), OptionalModCatalogStatus.Invalid, "Trailing data accepted");
-        Status(Wrap(new byte[] { 1, 0, 5, 0, 65 }, 1), OptionalModCatalogStatus.Invalid, "Truncated text accepted");
-        Status(Wrap(new byte[] { 1, 0, 1, 0, 0xff, 1, 1, 0, 49 }, 1), OptionalModCatalogStatus.Invalid, "Invalid UTF8 accepted");
+        Status(Wrap(new byte[] { 1, 0, 0, 5, 0, 65 }, 1), OptionalModCatalogStatus.Invalid, "Truncated text accepted");
+        Status(Wrap(new byte[] { 1, 0, 0, 1, 0, 0xff, 1, 1, 0, 49 }, 1), OptionalModCatalogStatus.Invalid, "Invalid UTF8 accepted");
         modified = Wrap(new byte[] { 0, 0 }, 0);
         modified[OptionalModCatalog.KeyPrefix + "000"] = "AAB=";
         Status(modified, OptionalModCatalogStatus.Invalid, "Noncanonical Base64 padding accepted");
@@ -234,12 +267,16 @@ internal static class OptionalModCatalogSmoke
 
     private static byte[] RawPayload(string name, params string[] versions) => RawPayloadWithGuid("mod.fixture", name, versions);
 
-    private static byte[] RawPayloadWithGuid(string pluginGuid, string name, params string[] versions)
+    private static byte[] RawPayloadWithGuid(string pluginGuid, string name, params string[] versions) =>
+        RawPayloadWithKind(IntegrityModuleKind.Plugin, pluginGuid, name, versions);
+
+    private static byte[] RawPayloadWithKind(IntegrityModuleKind kind, string pluginGuid, string name, params string[] versions)
     {
         using (var stream = new MemoryStream())
         using (var writer = new BinaryWriter(stream, Encoding.UTF8))
         {
             writer.Write((ushort)1);
+            writer.Write((byte)kind);
             RawText(writer, pluginGuid);
             RawText(writer, name);
             writer.Write((byte)versions.Length);
@@ -276,7 +313,7 @@ internal static class OptionalModCatalogSmoke
         using (SHA256 sha = SHA256.Create()) digest = BitConverter.ToString(sha.ComputeHash(payload)).Replace("-", "").ToLowerInvariant();
         var rules = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            [OptionalModCatalog.HeaderKey] = "2|available|" + count + "|" + chunks + "|" + digest
+            [OptionalModCatalog.HeaderKey] = "3|available|" + count + "|" + chunks + "|" + digest
         };
         for (int index = 0; index < chunks; index++)
             rules[OptionalModCatalog.KeyPrefix + index.ToString("D3")] = encoded.Substring(index * 96, Math.Min(96, encoded.Length - index * 96));

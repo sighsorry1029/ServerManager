@@ -389,7 +389,7 @@ Assert-True (Test-Path -LiteralPath $bepInExPath) `
 # Reference-folder scanning executes Cecil code and reads BepInPlugin metadata.
 # Load those exact build-time dependencies before loading the merged plugin.
 [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($bepInExPath)) | Out-Null
-[Reflection.Assembly]::LoadFrom($cecilPath) | Out-Null
+[Reflection.Assembly]::Load([IO.File]::ReadAllBytes($cecilPath)) | Out-Null
 $plugin = [Reflection.Assembly]::LoadFrom($pluginPath)
 
 $instanceAll = [Reflection.BindingFlags]::Instance -bor
@@ -585,8 +585,8 @@ Assert-True (
 
 Assert-True (
     $manifestWireSchemaField.IsLiteral -and
-    $manifestWireSchemaField.GetRawConstantValue() -eq 2) `
-    "The version-free exact-hash manifest is not protected by schema 2."
+    $manifestWireSchemaField.GetRawConstantValue() -eq 3) `
+    "The module-kind exact-hash manifest is not protected by schema 3."
 
 Assert-True (
     $defaultEnforceModPolicyField.IsLiteral -and
@@ -1063,7 +1063,7 @@ Assert-DiagnosticCode `
     "An unsupported manifest schema was not rejected."
 
 $nonCanonicalGuid = [byte[]]$validPayload.Clone()
-$nonCanonicalGuid[16] = [byte][char]'E'
+$nonCanonicalGuid[20] = [byte][char]'E'
 $nonCanonicalGuidResult = Invoke-Decode $nonCanonicalGuid
 Assert-DiagnosticCode `
     @($nonCanonicalGuidResult.Diagnostics) `
@@ -1071,7 +1071,7 @@ Assert-DiagnosticCode `
     "A noncanonical manifest GUID was not rejected."
 
 $invalidUtf8Guid = [byte[]]$validPayload.Clone()
-$invalidUtf8Guid[16] = 255
+$invalidUtf8Guid[20] = 255
 $invalidUtf8GuidResult = Invoke-Decode $invalidUtf8Guid
 Assert-DiagnosticCode `
     @($invalidUtf8GuidResult.Diagnostics) `

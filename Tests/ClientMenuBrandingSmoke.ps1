@@ -914,7 +914,7 @@ foreach ($guideLayoutCall in @('GetPreferredValues', 'CalculateGuideSize', 'set_
 $guideCreateText = $menuTextPanelType.Methods | Where-Object Name -eq 'CreateText' | Select-Object -First 1
 Assert-InactiveTmpCreation $guideCreateText
 $guideCreateTextInstructions = @($guideCreateText.Body.Instructions)
-foreach ($optionalCall in @('Tick', 'get_DisplayRevision', 'FormatOptionalList', 'CaptureLoadedOptionalModVersions', 'SetText', 'UpdateLayout')) {
+foreach ($optionalCall in @('Tick', 'get_DisplayRevision', 'UpdateInstalledPatcherVersions', 'FormatOptionalList', 'CaptureLoadedOptionalModVersions', 'SetText', 'UpdateLayout')) {
     $optionalUpdate = $menuGuideType.Methods | Where-Object Name -eq 'UpdateOptionalList' | Select-Object -First 1
     Assert-True (@($optionalUpdate.Body.Instructions | Where-Object {
         $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq $optionalCall
@@ -955,6 +955,36 @@ foreach ($metadataCall in @('get_PluginInfos', 'get_Metadata', 'get_GUID', 'get_
 }
 Assert-True (@($loadedCaptureCalls | Where-Object { $_ -in @('Scan', 'ComputeHash', 'LoadFile', 'ReadAllBytes', 'GetFiles') }).Count -eq 0) `
     'The optional menu filter must not scan DLLs or repeat admission hashing.'
+Assert-True ($loadedCaptureCalls -contains 'GetIdentityKey') `
+    'Loaded plugins must use a kind-qualified identity, not a shared plugin/patcher identifier namespace.'
+$patcherUpdate = $menuGuideType.Methods | Where-Object Name -eq 'UpdateInstalledPatcherVersions' | Select-Object -First 1
+Assert-True ($null -ne $patcherUpdate -and
+    $null -ne (Get-MethodCall $patcherUpdate 'System.Threading.Tasks.Task' 'Run') -and
+    $null -ne (Get-MethodCall $patcherUpdate 'ServerManager.OptionalModCatalogEntry' 'get_Kind')) `
+    'Installed patcher preview must start its background snapshot only for patcher catalog entries.'
+$patcherUpdateInstructions = @($patcherUpdate.Body.Instructions)
+foreach ($cacheField in @('_optionalPatcherScan', '_optionalPatcherVersions')) {
+    Assert-True (@($patcherUpdateInstructions | Where-Object {
+        $_.OpCode.Code -eq [Mono.Cecil.Cil.Code]::Ldfld -and
+        $_.Operand -is [Mono.Cecil.FieldReference] -and $_.Operand.Name -eq $cacheField
+    }).Count -gt 0) ('Installed patcher preview lost its one-snapshot cache: ' + $cacheField)
+}
+Assert-True ($null -eq (Get-MethodCall $patcherUpdate 'ServerManager.PluginManifestScanner' 'ScanInstalledPatchers')) `
+    'The menu update must not perform installed patcher scans synchronously.'
+Assert-True ($null -ne (Get-MethodCall $menuGuideMethods['Dispose'] 'System.Threading.CancellationTokenSource' 'Cancel') -and
+    $null -ne (Get-MethodCall $menuGuideMethods['Dispose'] 'System.Threading.CancellationTokenSource' 'Dispose')) `
+    'The menu owner must cancel and release its installed patcher scan on destruction.'
+$patcherCapture = $brandingType.Methods | Where-Object Name -eq 'CaptureInstalledPatcherVersions' | Select-Object -First 1
+foreach ($scanCall in @('ScanInstalledPatchers', 'get_Success', 'get_Records', 'get_IdentityKey', 'get_Version')) {
+    Assert-True (@($patcherCapture.Body.Instructions | Where-Object {
+        $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq $scanCall
+    }).Count -gt 0) ('Patcher preview lost its complete metadata snapshot boundary: ' + $scanCall)
+}
+Assert-True (@($patcherCapture.Body.Instructions | Where-Object {
+    $_.Operand -is [Mono.Cecil.MethodReference] -and
+    ($_.Operand.DeclaringType.FullName -match '^(UnityEngine|BepInEx\.Bootstrap\.Chainloader)' -or
+        $_.Operand.Name -in @('LoadFile', 'LoadFrom', 'Invoke'))
+}).Count -eq 0) 'Patcher preview worker must not use Unity, the live plugin registry, or execute patcher code.'
 foreach ($queryTypeName in @('ServerManager.OptionalModQuery', 'ServerManager.OptionalModLobbyQuery')) {
     Assert-True ($null -ne (Get-MethodCall $menuGuideMethods['SetVisible'] $queryTypeName 'Pause') -and
         $null -ne (Get-MethodCall $menuGuideMethods['Dispose'] $queryTypeName 'Dispose')) `

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.7
+
+- Added `log.yml` with separate `audit`, `player` and `chat` lists. Valid edits reload automatically; invalid edits keep the last valid settings. File-log selection does not change character saves, security checks, game messages or Discord delivery.
+- Reduced scheduled-job audit noise: `cron.failed` is enabled by default, while `cron.executed` includes all final results. Failed jobs retain their failure code and command step when known, without a second audit line for each intermediate command.
+- Removed per-job `log` from `cron.yml`/`cron.yaml`. Remove that field from existing jobs and use `log.yml` instead. Root `logJobs` and `logSkipped` remain console-only settings.
+- Added standard BepInEx 5 preloader patcher DLL checks through the existing `required` and `optional` folders. Clients report hashes from `BepInEx/patchers`, including subfolders; server reference copies are never executed.
+- Added patchers to the optional-mod preview and improved mismatch messages. Required patchers remain mandatory for admins, with existing admin exceptions for optional or unlisted modules. These checks verify installed files, not successful patch execution or runtime memory.
+- Update ServerManager on both the server and all clients, then restart. The connection and optional-preview formats have changed.
+
 ## 1.2.6
 
 - Restricted `freefly` to server-verified administrators on ServerManager servers, matching `printseeds`. Non-admins cannot run it through chat or the F5 console, and it is hidden from help and autocomplete.

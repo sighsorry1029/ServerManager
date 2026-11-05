@@ -332,6 +332,9 @@ internal static class ClientMenuBranding
         private bool _optionalFailed;
         private long _optionalRevision = -1;
         private string? _optionalLanguage;
+        private Task<IReadOnlyDictionary<string, SystemVersion>>? _optionalPatcherScan;
+        private CancellationTokenSource? _optionalPatcherCancellation;
+        private IReadOnlyDictionary<string, SystemVersion>? _optionalPatcherVersions;
         private string? _language;
         private string? _hintEndpoint;
         private bool _visible;
@@ -461,12 +464,15 @@ internal static class ClientMenuBranding
                 }
                 _optionalPanel ??= new MenuTextPanel(_startup, left: true);
                 if (_customMenuActive) _optionalPanel.UseDialog(_dialog!.transform);
-                if (refreshText || _optionalRevision != revision ||
-                    !string.Equals(_optionalLanguage, language, StringComparison.Ordinal))
+                bool refreshOptionalText = refreshText || _optionalRevision != revision ||
+                    !string.Equals(_optionalLanguage, language, StringComparison.Ordinal);
+                bool installedPatchersChanged = UpdateInstalledPatcherVersions(entries, refreshOptionalText);
+                if (refreshOptionalText || installedPatchersChanged)
                 {
                     _optionalRevision = revision;
                     _optionalLanguage = language;
-                    string body = FormatOptionalList(state, stale, entries, CaptureLoadedOptionalModVersions());
+                    string body = FormatOptionalList(state, stale, entries,
+                        CaptureLoadedOptionalModVersions(_optionalPatcherVersions));
                     if (lobbyMode && (state == OptionalModQueryState.Unavailable || state == OptionalModQueryState.Unsupported))
                         body += "\n\n" + PlayerLocalizer.Text("sm_menu_optional_host_help");
                     _optionalPanel.SetText(PlayerLocalizer.Text("sm_menu_optional_title"),
@@ -485,8 +491,31 @@ internal static class ClientMenuBranding
                 _optionalFailed = true;
                 _optionalLobbyQuery?.Dispose();
                 _optionalLobbyQuery = null;
+                _optionalPatcherCancellation?.Cancel();
                 ServerManagerPlugin.Log.LogWarning("Optional-mod menu preview unavailable: " + exception.Message);
             }
+        }
+
+        // Patcher files are static for a supported game session. Capture their
+        // metadata once per menu owner, off the Unity thread, only when needed.
+        // This is an installed-file preview, not evidence that a patcher ran.
+        private bool UpdateInstalledPatcherVersions(IReadOnlyList<OptionalModCatalogEntry> entries,
+            bool refreshCatalog)
+        {
+            if (_optionalPatcherScan == null)
+            {
+                if (!refreshCatalog) return false;
+                bool hasPatchers = false;
+                foreach (OptionalModCatalogEntry entry in entries)
+                    if (entry.Kind == IntegrityModuleKind.Patcher) { hasPatchers = true; break; }
+                if (!hasPatchers) return false;
+                _optionalPatcherCancellation = new CancellationTokenSource();
+                CancellationToken token = _optionalPatcherCancellation.Token;
+                _optionalPatcherScan = Task.Run(() => CaptureInstalledPatcherVersions(token));
+            }
+            if (_optionalPatcherVersions != null || !_optionalPatcherScan.IsCompleted) return false;
+            _optionalPatcherVersions = _optionalPatcherScan.GetAwaiter().GetResult();
+            return true;
         }
 
         internal void Reflow() => _panel?.Reflow();
@@ -574,6 +603,9 @@ internal static class ClientMenuBranding
             _optionalQuery = null;
             _optionalLobbyQuery?.Dispose();
             _optionalLobbyQuery = null;
+            _optionalPatcherCancellation?.Cancel();
+            _optionalPatcherCancellation?.Dispose();
+            _optionalPatcherCancellation = null;
             _optionalPanel?.Dispose();
             _optionalPanel = null;
             _panel?.Dispose();
@@ -585,7 +617,8 @@ internal static class ClientMenuBranding
 
     // Main-thread metadata only, once per text/result refresh. No folder search,
     // assembly loading, or additional hashing is needed for this advisory filter.
-    private static IReadOnlyDictionary<string, SystemVersion> CaptureLoadedOptionalModVersions()
+    private static IReadOnlyDictionary<string, SystemVersion> CaptureLoadedOptionalModVersions(
+        IReadOnlyDictionary<string, SystemVersion>? installedPatchers)
     {
         Dictionary<string, SystemVersion> loaded = new(StringComparer.Ordinal);
         try
@@ -595,13 +628,14 @@ internal static class ClientMenuBranding
                 if (plugin?.Metadata?.Version == null || plugin.Instance == null ||
                     !IntegrityCanonical.TryNormalizeGuid(plugin.Metadata.GUID, IntegrityLimits.Default,
                         IntegrityDiagnosticCodes.ManifestInvalidGuid, out string guid, out _)) continue;
-                if (loaded.ContainsKey(guid))
+                string identity = IntegrityCanonical.GetIdentityKey(IntegrityModuleKind.Plugin, guid);
+                if (loaded.ContainsKey(identity))
                 {
                     // Ambiguous canonical identity: leave all preview rows visible.
                     loaded.Clear();
                     return loaded;
                 }
-                loaded.Add(guid, plugin.Metadata.Version);
+                loaded.Add(identity, plugin.Metadata.Version);
             }
         }
         catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
@@ -609,13 +643,44 @@ internal static class ClientMenuBranding
             // An unavailable/changing registry must not hide entries or break UI.
             loaded.Clear();
         }
+        if (installedPatchers != null)
+            foreach (KeyValuePair<string, SystemVersion> patcher in installedPatchers)
+                loaded.Add(patcher.Key, patcher.Value);
         return loaded;
+    }
+
+    private static IReadOnlyDictionary<string, SystemVersion> CaptureInstalledPatcherVersions(
+        CancellationToken cancellationToken)
+    {
+        Dictionary<string, SystemVersion> installed = new(StringComparer.Ordinal);
+        try
+        {
+            var scan = PluginManifestScanner.ScanInstalledPatchers(IntegrityLimits.Default, cancellationToken);
+            if (!scan.Success) return installed;
+            foreach (var patcher in scan.Records)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!SystemVersion.TryParse(patcher.Version, out SystemVersion version) ||
+                    installed.ContainsKey(patcher.Entry.IdentityKey))
+                {
+                    // Incomplete or ambiguous metadata must not hide a row.
+                    installed.Clear();
+                    return installed;
+                }
+                installed.Add(patcher.Entry.IdentityKey, version);
+            }
+        }
+        catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
+        {
+            installed.Clear();
+        }
+        return installed;
     }
 
     internal static bool IsOptionalModLoaded(OptionalModCatalogEntry entry,
         IReadOnlyDictionary<string, SystemVersion>? loaded)
     {
-        if (loaded == null || !loaded.TryGetValue(entry.PluginGuid, out SystemVersion installed)) return false;
+        if (loaded == null || !loaded.TryGetValue(entry.IdentityKey, out SystemVersion installed)) return false;
         foreach (string version in entry.Versions)
             if (SystemVersion.TryParse(version, out SystemVersion allowed) && allowed.Equals(installed)) return true;
         return false;
@@ -642,7 +707,10 @@ internal static class ClientMenuBranding
         {
             if (IsOptionalModLoaded(entry, loaded)) continue;
             ++shown;
-            text.Append("\n\n").Append(entry.Name).Append("\n");
+            text.Append("\n\n").Append(entry.Name);
+            if (entry.Kind == IntegrityModuleKind.Patcher)
+                text.Append(" [").Append(PlayerLocalizer.Text("sm_menu_optional_patcher")).Append("]");
+            text.Append("\n");
             text.Append(entry.Versions.Count == 0
                 ? PlayerLocalizer.Text("sm_menu_optional_version_unknown")
                 : string.Join(", ", entry.Versions));

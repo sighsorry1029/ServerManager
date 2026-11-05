@@ -305,6 +305,21 @@ try {
             $tryEnsureLoginWritten `
             "[unknown] Logged in.") `
         "The per-character stream lost its human-readable login record."
+    foreach ($binding in @(
+            @('TryEnsureLoginWritten', 'player.connection'),
+            @('CompleteState', 'player.connection'),
+            @('WritePosition', 'player.position'),
+            @('TryWriteDamage', 'combat.damage'),
+            @('WriteDeath', 'player.death'),
+            @('WriteInventoryDelta', 'inventory.changed'),
+            @('WriteInventoryDetailSnapshot', 'inventory.snapshot'),
+            @('WriteSkillDelta', 'skill.changed'),
+            @('RecordRejectedSave', 'character.save_rejected'))) {
+        $producer = Get-MethodDefinition $activityType $binding[0]
+        Assert-True ((Test-ContainsString $producer $binding[1]) -and
+            (Test-CallsMethod $producer 'ServerManager.LogSettings' 'AllowsPlayer')) `
+            "Player log producer $($binding[0]) lost its independent selector."
+    }
 
     $writerMessageTryWrite = $writerType.Methods |
         Where-Object {
@@ -996,8 +1011,10 @@ try {
         Join-Path $projectRoot 'PlayerLogging/PlayerActivityRuntime.cs') -Raw
     $coordinateImplementation = foreach ($fieldName in @(
             'CoordinateIntervalSeconds', 'CoordinateInitialDelaySeconds',
-            'InventorySnapshotIntervalSeconds', 'MaximumInventoryDetailEntries', '_coordinateIntervalTicks',
-            '_coordinateInitialDelayTicks', '_inventorySnapshotTicks')) {
+            'InventorySnapshotIntervalSeconds', 'MaximumInventoryDetailEntries',
+            'MaximumInventoryEntries', 'MaximumInventoryListingBytes', 'MaximumSkillEntries',
+            'MaximumLoggedReasonCharacters', 'DamageCooldownSeconds', '_damageCooldownTicks',
+            '_coordinateIntervalTicks', '_coordinateInitialDelayTicks', '_inventorySnapshotTicks')) {
         $declaration = [regex]::Match($activitySource,
             '(?m)^    private (?:const|static readonly) \w+ ' + $fieldName + '\s*=[\s\S]*?;')
         Assert-True $declaration.Success "Cannot source-link coordinate field $fieldName."
@@ -1007,10 +1024,15 @@ try {
             'TickState', 'CompleteState', 'WritePosition', 'ActivityPrefix',
             'TryGetPosition', 'IsFinitePosition', 'SecondsToTicks', 'AddTicks',
             'IsFinite', 'FormatFloat', 'WriteInventoryDetailSnapshot',
-            'HashInventoryDetail', 'AppendInventoryDetail', 'QuoteJsonString', 'Invariant')) {
+            'HashInventoryDetail', 'AppendInventoryDetail', 'QuoteJsonString', 'Invariant',
+            'TryEnsureLoginWritten', 'TryWrite', 'WriteInventoryDelta', 'WriteSkillDelta',
+            'IntegerSkillLevel', 'GetSkillName', 'TryReserveListingBytes',
+            'RecordAcceptedShadow', 'RecordRejectedSave', 'TryWriteDamage', 'AddIncomingDamage',
+            'WriteDeath', 'ClearRecentIncomingDamage', 'DeathReportMatchesSource',
+            'ResolveReportedAttacker', 'GetField', 'FormatDamageAmount', 'DamageCounterpartName')) {
         $declarations = [regex]::Matches($activitySource,
             '(?m)^    private static [^\r\n]*\b' + $methodName + '\([\s\S]*?^    \}')
-        $expectedCount = if ($methodName -eq 'ActivityPrefix') { 2 } elseif ($methodName -eq 'Invariant') { 3 } else { 1 }
+        $expectedCount = if ($methodName -in @('ActivityPrefix', 'TryWrite')) { 2 } elseif ($methodName -eq 'Invariant') { 3 } else { 1 }
         Assert-True ($declarations.Count -eq $expectedCount) `
             "Cannot source-link coordinate method $methodName unambiguously."
         $declarations | ForEach-Object Value
@@ -1019,6 +1041,10 @@ try {
         '(?m)^    private sealed class ActivityPeerState\s*\{[\s\S]*?^    \}')
     Assert-True $stateDeclaration.Success 'Cannot source-link the coordinate state constructor.'
     $coordinateImplementation += $stateDeclaration.Value
+    $counterpartDeclaration = [regex]::Match($activitySource,
+        '(?m)^    private sealed class DamageCounterpart\s*\{[\s\S]*?^    \}')
+    Assert-True $counterpartDeclaration.Success 'Cannot source-link the damage counterpart.'
+    $coordinateImplementation += $counterpartDeclaration.Value
     $coordinateFixture = @'
 #nullable enable
 using System;
@@ -1030,6 +1056,13 @@ using System.Security.Cryptography;
 using System.Text;
 public static class PlayerActivityCoordinateSmoke
 {
+    private sealed class LogSettings
+    {
+        private readonly HashSet<string> Disabled;
+        internal LogSettings(params string[] disabled) { Disabled = new HashSet<string>(disabled); }
+        internal bool AllowsPlayer(string selector) => !Disabled.Contains(selector);
+    }
+    private static class LogSettingsRuntime { internal static LogSettings Current = new LogSettings(); }
     private static readonly List<string> Messages = new List<string>();
     private static readonly List<string[]> InventoryBlocks = new List<string[]>();
     private static TimeZoneInfo _serverTimeZone = TimeZoneInfo.Local;
@@ -1060,7 +1093,20 @@ public static class PlayerActivityCoordinateSmoke
     private sealed class CharacterSemanticSnapshot
     {
         internal List<CharacterSemanticItemState> Items = new List<CharacterSemanticItemState>();
+        internal Dictionary<string, long> ItemTotalsByPrefab = new Dictionary<string, long>();
+        internal Dictionary<int, CharacterSemanticSkillState> Skills = new Dictionary<int, CharacterSemanticSkillState>();
     }
+    private sealed class CharacterSemanticSkillState { internal float Level; }
+    private static class Skills { internal enum SkillType { Swords = 1 } }
+    private sealed class CharacterSaveResult
+    {
+        internal CharacterSemanticSnapshot? CurrentSemanticSnapshot;
+        internal CharacterSemanticSnapshot? PreviousSemanticSnapshot;
+        internal string Status = "Rejected";
+        internal string Error = "invalid save";
+        internal FakeResponse Response = new FakeResponse();
+    }
+    private sealed class FakeResponse { internal long BaseRevision = 1; }
     private sealed class CharacterSemanticItemState
     {
         internal string PrefabName = "Wood";
@@ -1072,30 +1118,43 @@ public static class PlayerActivityCoordinateSmoke
         internal bool Equipped = false;
         internal Dictionary<string, string> CustomData = new Dictionary<string, string>();
     }
-    private sealed class DamageCounterpart { }
+    private sealed class HitData { internal double Raw = 10; }
+    private static class GameplayLimitValidation
+    {
+        internal static int Measurements;
+        internal static bool TryMeasureRawDamage(HitData hit, out double raw) { ++Measurements; raw = hit.Raw; return true; }
+    }
+    private static class ClientEventObservation { internal static string CleanPrefabInstanceName(string value) => value.Replace("(Clone)", ""); }
+    private static int WeaponLookups;
+    private static string ResolveCurrentWeapon(ActivityPeerState state) { ++WeaponLookups; return "Sword"; }
     private static class IntegrityCanonical { internal static bool IsFatal(Exception exception) => false; }
     private static string Clip(string value, int maximumCharacters) => value;
     private static string FormatReason(string reason) => reason.Replace('_', ' ');
-    private static bool TryEnsureLoginWritten(ActivityPeerState state) => true;
-    private static void ClearRecentIncomingDamage(ActivityPeerState state) { }
-    private static string InventoryItemName(CharacterSemanticItemState item) => item.PrefabName;
+    private static bool TryResolvePlayerId(ActivityPeerState state) => state.PlayerId != 0;
+    private static int InventoryNameLookups;
+    private static string InventoryDeltaItemName(string prefab) { ++InventoryNameLookups; return prefab; }
+    private static string InventoryItemName(CharacterSemanticItemState item) { ++InventoryNameLookups; return item.PrefabName; }
     private static bool TryWriteBlock(ActivityPeerState state, DateTime occurredAtUtc, string header, IReadOnlyList<string> lines)
     {
         ++BlockAttempts;
-        if (!AcceptWrites) return false;
+        if (!AcceptWrites || !TryEnsureLoginWritten(state)) return false;
         if (FailDuringNextEnqueue) { ++_writer.WriteFailures; FailDuringNextEnqueue = false; }
         LastBlockOccurredAtUtc = occurredAtUtc;
         InventoryBlocks.Add(lines.ToArray());
         return true;
     }
-    private static bool TryWrite(ActivityPeerState state, string message) { if (!AcceptWrites) return false; Messages.Add(message); return true; }
+    private static bool TryWriteCore(ActivityPeerState state, DateTime occurredAtUtc, string message) { if (!AcceptWrites || state.PlayerId == 0) return false; Messages.Add(message); return true; }
     private static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException("Coordinate fixture: " + message); }
-    private static ActivityPeerState Open(bool remote = true)
+    private static ActivityPeerState Open(bool remote = true, params string[] disabled)
     {
+        LogSettingsRuntime.Current = new LogSettings(disabled);
         Messages.Clear(); AcceptWrites = true; Stopwatch.Now = 100000;
         InventoryBlocks.Clear(); BlockAttempts = 0;
+        WeaponLookups = 0; GameplayLimitValidation.Measurements = 0; InventoryNameLookups = 0;
         _writer = new FakeWriter(); FailDuringNextEnqueue = false;
-        return new ActivityPeerState("account", "character", 1, remote ? new ZNetPeer() : null, remote ? null : new Player(), Stopwatch.Now, DateTime.UtcNow);
+        ActivityPeerState state = new ActivityPeerState("account", "character", 1, remote ? new ZNetPeer() : null, remote ? null : new Player(), Stopwatch.Now, DateTime.UtcNow);
+        TryEnsureLoginWritten(state); Messages.Clear();
+        return state;
     }
     private static void Tick(ActivityPeerState state, long now) { Stopwatch.Now = now; TickState(state, now); }
     public static void Run()
@@ -1222,6 +1281,87 @@ public static class PlayerActivityCoordinateSmoke
         Require(InventoryBlocks.Count == 3 && state.LastInventorySnapshotWriteFailures == 2, "disk-failure recovery must survive an intervening queue rejection");
         Tick(state, 1600000);
         Require(InventoryBlocks.Count == 3, "successful recovery must restore normal deduplication");
+
+        // Connection output is not the identity gate for other selectors.
+        state = Open(true, "player.connection");
+        Require(state.LoginSuppressed && !state.LoginWritten, "disabled login must not claim a written row");
+        Tick(state, 105000);
+        Require(Messages.Count == 1 && Messages[0].EndsWith(" Position."), "connection filtering suppressed another enabled category");
+        LogSettingsRuntime.Current = new LogSettings();
+        Require(TryEnsureLoginWritten(state) && Messages.Count == 1 && !state.LoginWritten, "reenabling connections replayed an old login");
+        CompleteState(state, "connection_closed");
+        Require(Messages.Count == 3 && Messages[2].Contains("Logged out"), "current logout selector did not apply independently");
+        state = Open(true, "player.connection", "player.position");
+        state.PlayerId = 0;
+        Require(!TryWrite(state, "not authenticated character metadata"), "disabled connection selector bypassed character identity readiness");
+        state.PlayerId = 1; Tick(state, 105000);
+        Require(Messages.Count == 0 && state.Peer!.Reads == 0 && state.NextCoordinateTimestamp == 405000, "disabled position must keep cadence without reading coordinates");
+        Require(ActivityPrefix(state) == "[10, 20, 30]", "position filtering removed live prefixes from other activity");
+        CompleteState(state, "connection_closed");
+        Require(Messages.Count == 0, "disabled connection/position selectors leaked logout rows");
+        LogSettingsRuntime.Current = new LogSettings("player.connection");
+        Tick(state, 404999); Require(Messages.Count == 0, "reenabled position ignored its existing deadline");
+        Tick(state, 405000); Require(Messages.Count == 1, "reenabled position did not recover at its existing deadline");
+
+        // Disabled full snapshots do not format, inspect writer statistics, or
+        // establish a content baseline. Reenable at the existing check cadence.
+        state = Open(true, "inventory.snapshot", "player.connection");
+        snapshot = new CharacterSemanticSnapshot(); snapshot.Items.Add(new CharacterSemanticItemState());
+        state.LatestSemanticSnapshot = snapshot;
+        WriteInventoryDetailSnapshot(state, snapshot, 100000);
+        Require(BlockAttempts == 0 && InventoryNameLookups == 0 && _writer.StatisticsReads == 0 && state.LastInventorySnapshotFingerprint == null && state.LastInventorySnapshotCheckTimestamp == 100000, "disabled snapshot rendered data or claimed an accepted baseline");
+        LogSettingsRuntime.Current = new LogSettings("player.connection");
+        Tick(state, 399999); Require(BlockAttempts == 0, "reenabled snapshot ignored the existing cadence");
+        Tick(state, 400000); Require(InventoryBlocks.Count == 1 && !state.LoginWritten, "reenabled snapshot failed independently of connections");
+        LogSettingsRuntime.Current = new LogSettings("inventory.snapshot", "player.connection");
+        Tick(state, 400001);
+        Require(state.LastInventorySnapshotFingerprint == null && _writer.StatisticsReads == 1, "a disabled period between due checks retained the prior snapshot baseline");
+        LogSettingsRuntime.Current = new LogSettings("player.connection");
+        Tick(state, 699999); Require(InventoryBlocks.Count == 1, "filter reload changed the snapshot timer");
+        Tick(state, 700000); Require(InventoryBlocks.Count == 2, "reenabled unchanged inventory needs one fresh baseline");
+        Tick(state, 1000000); Require(InventoryBlocks.Count == 2, "fresh baseline did not resume normal deduplication");
+
+        // The authoritative semantic baseline progresses even while its delta
+        // outputs are disabled; enabling them must never replay old changes.
+        state = Open(true, "inventory.changed", "skill.changed", "character.save_rejected", "player.connection");
+        CharacterSemanticSnapshot original = new CharacterSemanticSnapshot();
+        original.ItemTotalsByPrefab["Wood"] = 1;
+        original.Skills[1] = new CharacterSemanticSkillState { Level = 1 };
+        CharacterSemanticSnapshot silent = new CharacterSemanticSnapshot();
+        silent.ItemTotalsByPrefab["Wood"] = 5;
+        silent.Skills[1] = new CharacterSemanticSkillState { Level = 4 };
+        RecordAcceptedShadow(state, new CharacterSaveResult { PreviousSemanticSnapshot = original, CurrentSemanticSnapshot = silent });
+        RecordRejectedSave(state, new CharacterSaveResult());
+        Require(Messages.Count == 0 && InventoryNameLookups == 0 && ReferenceEquals(state.LatestSemanticSnapshot, silent), "disabled deltas rendered data, logged rejection, or stopped semantic tracking");
+        LogSettingsRuntime.Current = new LogSettings("player.connection");
+        CharacterSemanticSnapshot after = new CharacterSemanticSnapshot();
+        after.ItemTotalsByPrefab["Wood"] = 6;
+        after.Skills[1] = new CharacterSemanticSkillState { Level = 5 };
+        RecordAcceptedShadow(state, new CharacterSaveResult { PreviousSemanticSnapshot = silent, CurrentSemanticSnapshot = after });
+        Require(Messages.Count == 2 && Messages.Any(message => message.Contains("Wood 5 -> 6")) && Messages.Any(message => message.Contains("Swords: 4 -> 5")), "reenabled delta output replayed suppressed historical changes");
+        RecordRejectedSave(state, new CharacterSaveResult());
+        Require(Messages.Count == 3 && Messages[2].Contains("Character save rejected"), "save rejection did not resume independently");
+
+        // Damage output can be disabled without losing evidence for death.
+        state = Open(true, "combat.damage", "player.connection");
+        DamageCounterpart attacker = new DamageCounterpart("player", "Attacker", "Player", "connection_character", null);
+        HitData hit = new HitData();
+        TryWriteDamage(state, hit, true, attacker, 100000);
+        Require(WeaponLookups == 0 && GameplayLimitValidation.Measurements == 0 && Messages.Count == 0, "disabled damage formatting performed weapon or damage work");
+        AddIncomingDamage(state, attacker, hit, false, 100000);
+        Require(Messages.Count == 0 && state.LastIncomingSource != null, "disabled damage removed death corroboration evidence");
+        Dictionary<string, string> death = new Dictionary<string, string> { ["attacker"] = "Attacker", ["attacker_is_player"] = "true" };
+        WriteDeath(state, death, DateTime.UtcNow);
+        Require(Messages.Count == 1 && Messages[0].EndsWith("Killed by: Attacker.") && state.LastIncomingSource == null, "enabled death lost corroboration or failed to consume it");
+        LogSettingsRuntime.Current = new LogSettings("player.death", "player.connection");
+        AddIncomingDamage(state, attacker, hit, false, 100000);
+        Require(Messages.Count == 2 && Messages[1].Contains("was hit by Attacker"), "enabled damage incorrectly depended on death output");
+        WriteDeath(state, death, DateTime.UtcNow);
+        Require(Messages.Count == 2 && state.LastIncomingSource == null, "disabled death leaked output or retained consumed evidence");
+        TryWriteDamage(state, hit, true, attacker, 100000);
+        Require(Messages.Count == 3 && WeaponLookups == 1, "reenabled outgoing damage did not resume");
+        TryWriteDamage(state, hit, true, attacker, 100001);
+        Require(Messages.Count == 3 && WeaponLookups == 1, "enabled damage no longer respects its existing cooldown");
     }
     // SOURCE_LINKED_COORDINATE_IMPLEMENTATION
 }
@@ -1232,7 +1372,7 @@ public static class PlayerActivityCoordinateSmoke
     [PlayerActivityCoordinateSmoke]::Run()
 
     Write-Host (
-        "Player activity integration smoke passed: five-second coordinate grace, five-minute Position cadence, live event prefixes, forced logout, per-character identity, accepted-body inventory deduplication/date rollover/retry cadence, intact custom data, atomic blocks, and no new client telemetry surface.")
+        "Player activity integration smoke passed: independent hot-reloaded selectors, identity/login separation, disabled-formatting guards, semantic delta continuity, death corroboration, existing coordinate/damage/inventory cadence, accepted-body deduplication/date rollover/retry, intact custom data, atomic blocks, and no new client telemetry surface.")
 }
 finally {
     $assembly.Dispose()

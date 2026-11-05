@@ -36,7 +36,7 @@ function Get-NestedTypes($type) {
 }
 
 # Read IL only: none of these lifecycle/RPC methods execute outside Unity.
-[Reflection.Assembly]::LoadFrom((Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll')) | Out-Null
+[Reflection.Assembly]::Load([IO.File]::ReadAllBytes((Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll'))) | Out-Null
 $definition = [Mono.Cecil.AssemblyDefinition]::ReadAssembly($pluginPath)
 try {
     $runtime = $definition.MainModule.Types | Where-Object FullName -eq 'ServerManager.ServerManagerRuntime'
@@ -110,13 +110,17 @@ try {
     $record = $scanner.NestedTypes | Where-Object Name -eq 'PluginRecord'
     Assert-True ($null -ne $record -and @($record.Fields | Where-Object { -not $_.IsInitOnly -or $_.FieldType.FullName -ne 'System.String' }).Count -eq 0) 'Worker plugin records retain mutable or Unity/BepInEx object state.'
     $build = Find-Method $scanner 'BuildSnapshot'
-    $hash = Find-Method $scanner 'TryHashPluginFile'
+    $hashFile = Find-Method $scanner 'TryHashPluginFile'
+    $patcherMetadata = $definition.MainModule.GetType('ServerManager.PatcherMetadata')
+    $hash = Find-Method $patcherMetadata 'Hash'
+    Assert-Calls $hashFile 'Hash'
+    Assert-Calls $hashFile 'EnsureUnchanged'
     Assert-Calls $hash 'ThrowIfCancellationRequested'
     Assert-Calls $hash 'Read'
     Assert-Calls $hash 'TransformBlock'
     Assert-Calls $hash 'TransformFinalBlock'
     Assert-True ($null -eq (Find-Call $hash 'ReadAllBytes')) 'The worker now allocates entire DLLs instead of streaming bounded chunks.'
-    foreach ($method in @($build, $hash)) {
+    foreach ($method in @($build, $hashFile, $hash)) {
         $unsafeCalls = @($method.Body.Instructions | Where-Object {
             $_.Operand -is [Mono.Cecil.MethodReference] -and
             $_.Operand.DeclaringType.FullName -match '^(UnityEngine\.|BepInEx\.|ZRpc$|ZNet$|ServerManager\.ServerManagerRuntime$)'
@@ -139,7 +143,9 @@ try {
     Assert-True ($runtimeSource.Contains('ReferenceEquals(_client.Network, znet)')) 'Shutdown cancellation lost the active network owner guard.'
     Assert-True ($runtimeSource.Contains('if (_client?.Network != null && !ReferenceEquals(_client.Network, znet)) return;')) 'Delayed teardown from an older network can clear the new client session.'
     $scannerSource = [IO.File]::ReadAllText((Join-Path $ProjectRoot 'Integrity\PluginManifestScanner.cs'))
-    Assert-True (-not [regex]::IsMatch($scannerSource, 'LastWriteTime|CreationTime|WriteAllBytes|WriteAllText|Assembly\.Load')) 'Preparation introduced metadata-cache reuse, disk cache writes, or assembly reloading.'
+    Assert-True (-not [regex]::IsMatch($scannerSource, 'WriteAllBytes|WriteAllText|Assembly\.Load')) 'Preparation introduced disk cache writes or assembly reloading.'
+    # Timestamps now reject observable changes during one read; they do not
+    # replace full hashing. The harness checks same-size/same-mtime replacement.
     Write-Host 'Manifest preparation runtime wiring/worker boundary checks passed.'
 }
 finally { $definition.Dispose() }

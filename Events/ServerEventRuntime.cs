@@ -1106,14 +1106,9 @@ namespace ServerManager.Events
         internal static void RecordCommand(
             string source, string actorId, string actorName,
             string action, string target, string result, bool success,
-            IReadOnlyDictionary<string, string> data = null,
-            bool writeAuditLog = true)
+            IReadOnlyDictionary<string, string> data = null)
         {
             if (!_serverStarted || _shutdownStarted) return;
-            // Only successful scheduled broadcast/summary records can opt out
-            // of the file sink. Errors, manual and important commands stay audited.
-            writeAuditLog = writeAuditLog || source != "cron" || !success ||
-                (action != "broadcast" && action != "schedule");
             Dictionary<string, string> fields = Fields("title", "Administrative command", "source", Safe(source, 32),
                     "command", Safe(action, 64), "target", Safe(target, 96),
                     "result_code", Safe(result, 64), "success", success ? "true" : "false",
@@ -1126,8 +1121,7 @@ namespace ServerManager.Events
                     .WithPlayerAccount(source == "ingame" ? CharacterSteamIdentity.AccountPrefix + actorId : string.Empty),
                 string.IsNullOrEmpty(target) ? null :
                     new ServerManagerActor(Safe(target, 96), Safe(target, 96), "command_target")
-                        .WithPlayerAccount(CommandTargetPlayerAccount(action, target, success, data)), fields,
-                writeAuditLog: writeAuditLog);
+                        .WithPlayerAccount(CommandTargetPlayerAccount(action, target, success, data)), fields);
         }
 
         private static string CommandTargetPlayerAccount(string action, string target, bool success,
@@ -1154,6 +1148,10 @@ namespace ServerManager.Events
         {
             if ((action == "schedule" || action == "maintenance") && data != null)
             {
+                bool failed = fields.TryGetValue("success", out string success) && success == "false";
+                if (fields.TryGetValue("source", out string source) && source == "cron" &&
+                    data.TryGetValue("cron_final", out string final) && final == "true")
+                    fields["cron_final"] = "true";
                 if (data.TryGetValue("cron_schedule", out string cronSchedule))
                     fields["cron_schedule"] = Safe(cronSchedule, 256);
                 if (data.TryGetValue("cron_verb", out string cronVerb) && !string.IsNullOrWhiteSpace(cronVerb))
@@ -1164,15 +1162,37 @@ namespace ServerManager.Events
                     int.TryParse(rawCount, NumberStyles.None, CultureInfo.InvariantCulture, out int count) &&
                     count >= 1 && count <= 16 && rawCount == count.ToString(CultureInfo.InvariantCulture))
                     fields["cron_command_count"] = rawCount;
-                if (action == "maintenance" && data.TryGetValue("cron_failure_code", out string failure) && failure == "uw_partial_failure")
+                if (failed &&
+                    data.TryGetValue("cron_step", out string rawStep) &&
+                    int.TryParse(rawStep, NumberStyles.None, CultureInfo.InvariantCulture, out int step) &&
+                    step >= 1 && step <= 16 && rawStep == step.ToString(CultureInfo.InvariantCulture) &&
+                    fields.TryGetValue("cron_command_count", out string total) &&
+                    step <= int.Parse(total, CultureInfo.InvariantCulture))
+                {
+                    fields["cron_step"] = rawStep;
+                    fields["message"] += "; step=" + rawStep + "/" + total;
+                    if (data.TryGetValue("cron_step_verb", out string stepVerb) &&
+                        !string.IsNullOrEmpty(stepVerb) && stepVerb.Length <= 64 &&
+                        SafeToken(stepVerb, 64) == stepVerb)
+                    {
+                        fields["cron_step_verb"] = stepVerb;
+                        fields["message"] += "; step_command=" + stepVerb;
+                    }
+                }
+                if (failed &&
+                    data.TryGetValue("cron_failure_code", out string failure) &&
+                    !string.IsNullOrEmpty(failure) && failure.Length <= 64 && SafeToken(failure, 64) == failure)
                 {
                     fields["cron_failure_code"] = failure;
-                    if (data.TryGetValue("cron_partial_changes", out string persisted) &&
-                        (persisted == "persisted" || persisted == "not_confirmed"))
-                        fields["cron_partial_changes"] = persisted;
-                    if (data.TryGetValue("cron_save_result", out string saveResult) && saveResult.Length > 0 &&
-                        saveResult.Length <= 64 && SafeToken(saveResult, 64) == saveResult)
-                        fields["cron_save_result"] = saveResult;
+                    if (action == "maintenance" && failure == "uw_partial_failure")
+                    {
+                        if (data.TryGetValue("cron_partial_changes", out string persisted) &&
+                            (persisted == "persisted" || persisted == "not_confirmed"))
+                            fields["cron_partial_changes"] = persisted;
+                        if (data.TryGetValue("cron_save_result", out string saveResult) && saveResult.Length > 0 &&
+                            saveResult.Length <= 64 && SafeToken(saveResult, 64) == saveResult)
+                            fields["cron_save_result"] = saveResult;
+                    }
                     // The text audit renders message, not the structured fields.
                     if (fields.TryGetValue("message", out string message))
                     {
@@ -2126,7 +2146,7 @@ namespace ServerManager.Events
 
             // Dedupe by stable code, not the changing quantity or revision in
             // the diagnostic text: inventory fast-path saves may arrive each
-            // second. Only a successfully queued record starts the cooldown.
+            // second. A queued or intentionally filtered record starts the cooldown.
             string key = findingCode == null ? null :
                 accountId + "\0" + characterName + "\0" + source + "\0" + findingCode;
             TryQueueOperatorAudit(value, key);
@@ -2149,8 +2169,9 @@ namespace ServerManager.Events
                     return;
                 }
 
-                // Log and webhook are independent best-effort sinks. Retain the
-                // existing rule: only local queue acceptance starts audit dedupe.
+                // Log and webhook are independent best-effort sinks. Acceptance
+                // includes intentional log.yml suppression, so disabling the
+                // file sink does not disable the existing observation cooldown.
                 bool logged = false;
                 try { logged = LogWriter.TryWrite(value); }
                 catch (Exception exception) when (!IntegrityCanonical.IsFatal(exception))
@@ -2235,8 +2256,7 @@ namespace ServerManager.Events
             ServerManagerActor actor,
             ServerManagerActor target,
             Dictionary<string, string> fields,
-            DateTime? occurredAtUtc = null,
-            bool writeAuditLog = true)
+            DateTime? occurredAtUtc = null)
         {
             ServerManagerEvent value = new(
                 Guid.NewGuid().ToString("N"),
@@ -2252,10 +2272,7 @@ namespace ServerManager.Events
                 TryQueueOperatorAudit(value, null);
                 return value;
             }
-            if (writeAuditLog || kind != "command.executed")
-            {
-                LogWriter.TryWrite(value);
-            }
+            LogWriter.TryWrite(value);
             // These channels are intentionally log-only. Keep this boundary
             // ahead of every public subscriber and in-game broadcast path.
             if (IsLogOnlyChatKind(kind))
@@ -2739,6 +2756,22 @@ namespace ServerManager.Events
             {
                 return false;
             }
+
+            // Filter only this file sink, before enqueueing. Already admitted
+            // records retain their decision across reloads; API, webhook and
+            // in-game notification delivery remain independent.
+            LogSettings settings = LogSettingsRuntime.Current;
+            value.Fields.TryGetValue("source", out string source);
+            value.Fields.TryGetValue("command", out string command);
+            value.Fields.TryGetValue("success", out string success);
+            // Raw commands can themselves be named schedule/maintenance. Only
+            // the scheduler's marked terminal records are final job results.
+            bool cronIntermediate = value.Kind == "command.executed" && source == "cron" &&
+                (!value.Fields.TryGetValue("cron_final", out string final) || final != "true");
+            bool enabled = IsChatKind(value.Kind)
+                ? settings.AllowsChat(value.Kind)
+                : !cronIntermediate && settings.AllowsAudit(value.Kind, source, command, success == "false");
+            if (!enabled) return true;
 
             bool queued;
             try

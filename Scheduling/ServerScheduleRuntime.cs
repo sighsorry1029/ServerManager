@@ -106,7 +106,6 @@ internal static class ServerScheduleRuntime
     private sealed class Run
     {
         internal readonly ServerScheduleOccurrence Occurrence;
-        internal readonly bool QuietCenterBroadcasts;
         internal readonly CancellationTokenSource Cancellation = new();
         internal int Index;
         internal Task<ServerManagerCommandResult>? Pending;
@@ -132,12 +131,6 @@ internal static class ServerScheduleRuntime
             List<string> commands = occurrence.Job.Commands.ToList();
             // Only commands explicitly configured by the operator are dispatched.
             Commands = commands.ToArray();
-            // Only a complete, display-only job can opt out of successful
-            // local audit entries. Mixed jobs and maintenance remain auditable.
-            QuietCenterBroadcasts = !occurrence.Job.Log && !occurrence.Job.Maintenance &&
-                commands.Count > 0 && commands.All(command =>
-                    ServerScheduleSettings.TryGetCenterBroadcast(command, out string message) &&
-                    !string.IsNullOrWhiteSpace(message));
         }
     }
 
@@ -223,7 +216,8 @@ internal static class ServerScheduleRuntime
                     foreach (string id in _journal.ReviewRequiredJobs)
                     {
                         Warn("Job '" + id + "' needs review. Inspect the world, then use cronack to skip the interrupted occurrence.");
-                        ServerEventRuntime.RecordCommand("cron", id, id, "maintenance", "", "cron_needs_review", false);
+                        ServerEventRuntime.RecordCommand("cron", id, id, "maintenance", "", "cron_needs_review", false,
+                            new Dictionary<string, string>(StringComparer.Ordinal) { ["cron_final"] = "true" });
                     }
                 });
                 return;
@@ -653,8 +647,7 @@ internal static class ServerScheduleRuntime
 
         private static void Audit(Run run, ServerManagerCommandResult result) =>
             ServerEventRuntime.RecordCommand("cron", run.Occurrence.Job.Id, run.Occurrence.Job.Id,
-                run.Verb, "", result.Code, result.Success,
-                writeAuditLog: !run.QuietCenterBroadcasts || !result.Success || run.Retired);
+                run.Verb, "", result.Code, result.Success);
 
         private void EndRun(Run run, bool success, string code)
         {
@@ -682,11 +675,10 @@ internal static class ServerScheduleRuntime
             {
                 ServerEventRuntime.RecordCommand("cron", run.Occurrence.Job.Id, run.Occurrence.Job.Id,
                     run.Occurrence.Job.Maintenance ? "maintenance" : "schedule", "",
-                    review ? "cron_needs_review" : code, success, CronResultData(run),
-                    writeAuditLog: !run.QuietCenterBroadcasts || !success || code != "cron_completed");
+                    review ? "cron_needs_review" : code, success, CronResultData(run, success, code));
                 if (review) Warn("Job '" + run.Occurrence.Job.Id + "' needs review (" + code + "). No automatic replay.");
                 else if (!success) Warn("Job '" + run.Occurrence.Job.Id + "' stopped (" + code + ").");
-                else if (run.Occurrence.Job.Log && (code != "cron_skipped" || _settings!.LogSkipped))
+                else if (_settings!.LogJobs && (code != "cron_skipped" || _settings.LogSkipped))
                     ServerManagerPlugin.Log.LogInfo("Cron: Job '" + run.Occurrence.Job.Id + "' " +
                         (code == "cron_skipped" ? "skipped (chance or global-key conditions)." :
                             code == "cron_dispatched_untracked" ? "dispatched; completion not tracked." : "completed."));
@@ -694,21 +686,37 @@ internal static class ServerScheduleRuntime
             });
         }
 
-        private static IReadOnlyDictionary<string, string> CronResultData(Run run)
+        private static IReadOnlyDictionary<string, string> CronResultData(Run run, bool success, string code)
         {
             ServerScheduleJob job = run.Occurrence.Job;
             bool multiple = job.Commands.Count > 1;
             string summary = string.Join(" → ", job.Commands.Select(command => CronCommandSummary(command, multiple, job.AllowClientHide)));
             Dictionary<string, string> data = new Dictionary<string, string>(StringComparer.Ordinal)
             {
+                ["cron_final"] = "true",
                 ["cron_schedule"] = job.Cron,
                 ["cron_command_count"] = job.Commands.Count.ToString(CultureInfo.InvariantCulture),
                 ["cron_summary"] = ServerCommands.BoundedText(summary, 1000)
             };
             if (!multiple) data["cron_verb"] = job.AllowClientHide &&
                 ServerScheduleSettings.TryGetCenterBroadcast(job.Commands[0], out _) ? "broadcast" : FirstVerb(job.Commands[0]);
+            // A review-required status must not hide the original command/save
+            // failure when the file sink retains only the final job result.
+            if (!success) data["cron_failure_code"] = CronResultToken(code);
+            if (run.Started && run.Index < run.Commands.Length)
+            {
+                // Use the indexed command, not the prior dispatch's cached verb:
+                // cancellation may arrive between steps. Never include arguments.
+                string verb = job.AllowClientHide && ServerScheduleSettings.TryGetCenterBroadcast(run.Commands[run.Index], out _)
+                    ? "broadcast" : FirstVerb(run.Commands[run.Index]);
+                data["cron_step"] = (run.Index + 1).ToString(CultureInfo.InvariantCulture);
+                data["cron_step_verb"] = CronResultToken(verb);
+            }
             return data;
         }
+
+        private static string CronResultToken(string value) => !string.IsNullOrEmpty(value) && value.Length <= 64 &&
+            value.All(c => c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') ? value : "unknown";
 
         private static string CronCommandSummary(string line, bool includeVerb, bool allowClientHide)
         {

@@ -218,14 +218,21 @@ internal static class PlayerActivityRuntime
             return;
         }
 
+        LogSettings settings = LogSettingsRuntime.Current;
+        bool logDamage = settings.AllowsPlayer("combat.damage");
+        if (!logDamage && !settings.AllowsPlayer("player.death"))
+        {
+            return;
+        }
+
         long now = Stopwatch.GetTimestamp();
         if (_listenHost == null)
         {
             EnsureListenHost(now);
         }
 
-        DamageCounterpart target = ResolveRoutedTarget(observation);
-        if (attributedPlayerHit && !blocked)
+        DamageCounterpart target = ResolveRoutedTarget(observation, logDamage);
+        if (logDamage && attributedPlayerHit && !blocked)
         {
             TryWriteDamage(
                 sender,
@@ -240,7 +247,8 @@ internal static class PlayerActivityRuntime
             DamageCounterpart source = ResolveRoutedSource(
                 sender,
                 observation.Hit,
-                attributedPlayerHit);
+                attributedPlayerHit,
+                logDamage);
             AddIncomingDamage(
                 target.PlayerState,
                 source,
@@ -261,8 +269,20 @@ internal static class PlayerActivityRuntime
             return;
         }
 
+        LogSettings settings = LogSettingsRuntime.Current;
+        bool logDamage = settings.AllowsPlayer("combat.damage");
+        if (!logDamage && !settings.AllowsPlayer("player.death"))
+        {
+            return;
+        }
+
         long now = Stopwatch.GetTimestamp();
-        DamageCounterpart target = ResolveLocalTarget(targetObject);
+        DamageCounterpart target = ResolveLocalTarget(targetObject, logDamage);
+        if (!logDamage && target.PlayerState == null)
+        {
+            return;
+        }
+
         DamageCounterpart source;
         if (attributedLocalPlayerHit)
         {
@@ -281,7 +301,7 @@ internal static class PlayerActivityRuntime
                 source = DamageCounterpart.ForPlayer(
                     listenHost,
                     "listen_host_local_player");
-                if (!blocked)
+                if (logDamage && !blocked)
                 {
                     TryWriteDamage(
                         listenHost,
@@ -294,7 +314,7 @@ internal static class PlayerActivityRuntime
         }
         else
         {
-            source = ResolveServerLocalSource(hit);
+            source = ResolveServerLocalSource(hit, logDamage);
         }
 
         if (target.PlayerState != null)
@@ -308,7 +328,9 @@ internal static class PlayerActivityRuntime
         }
     }
 
-    private static DamageCounterpart ResolveServerLocalSource(HitData hit)
+    private static DamageCounterpart ResolveServerLocalSource(
+        HitData hit,
+        bool resolveNonPlayerDetails)
     {
         ZDOID attacker = hit.m_attacker;
         if (attacker == ZDOID.None)
@@ -326,7 +348,7 @@ internal static class PlayerActivityRuntime
                 null);
         }
 
-        if (TryResolveZdoPrefab(
+        if (resolveNonPlayerDetails && TryResolveZdoPrefab(
                 attacker,
                 out string prefab,
                 out string kind))
@@ -463,6 +485,11 @@ internal static class PlayerActivityRuntime
 
     private static void RecordRejectedSave(ActivityPeerState state, CharacterSaveResult result)
     {
+        if (!LogSettingsRuntime.Current.AllowsPlayer("character.save_rejected"))
+        {
+            return;
+        }
+
         TryWrite(
             state,
             ActivityPrefix(state) + " Character save rejected (" +
@@ -542,6 +569,13 @@ internal static class PlayerActivityRuntime
         if (!TryEnsureLoginWritten(state))
         {
             return;
+        }
+
+        if (!LogSettingsRuntime.Current.AllowsPlayer("inventory.snapshot"))
+        {
+            // A disabled period must not inherit a previously logged baseline
+            // when logging resumes, even if no snapshot check was due in it.
+            state.LastInventorySnapshotFingerprint = null;
         }
 
         if (state.LastIncomingDamageTimestamp != 0 &&
@@ -686,6 +720,11 @@ internal static class PlayerActivityRuntime
         long now = Stopwatch.GetTimestamp();
         WritePosition(state, now, force: true);
 
+        if (!LogSettingsRuntime.Current.AllowsPlayer("player.connection"))
+        {
+            return;
+        }
+
         TryWrite(
             state,
             ActivityPrefix(state) + " Logged out (" +
@@ -704,6 +743,11 @@ internal static class PlayerActivityRuntime
         }
 
         state.NextCoordinateTimestamp = AddTicks(now, _coordinateIntervalTicks);
+
+        if (!LogSettingsRuntime.Current.AllowsPlayer("player.position"))
+        {
+            return;
+        }
 
         if (!TryGetPosition(state, out Vector3 position) ||
             !IsFinitePosition(position))
@@ -725,6 +769,11 @@ internal static class PlayerActivityRuntime
         DamageCounterpart counterpart,
         long now)
     {
+        if (!LogSettingsRuntime.Current.AllowsPlayer("combat.damage"))
+        {
+            return;
+        }
+
         long nextEligibleTimestamp = outgoing
             ? state.NextOutgoingDamageLogTimestamp
             : state.NextIncomingDamageLogTimestamp;
@@ -794,7 +843,8 @@ internal static class PlayerActivityRuntime
     }
 
     private static DamageCounterpart ResolveRoutedTarget(
-        RoutedDamageObservation observation)
+        RoutedDamageObservation observation,
+        bool resolveNonPlayerDetails)
     {
         if (TryFindPlayerByCharacterId(
                 observation.Target,
@@ -803,6 +853,11 @@ internal static class PlayerActivityRuntime
             return DamageCounterpart.ForPlayer(
                 player!,
                 "server_resolved_target_zdo");
+        }
+
+        if (!resolveNonPlayerDetails)
+        {
+            return DamageCounterpart.UnknownTarget;
         }
 
         string targetPrefab = Clip(observation.TargetPrefabName, 128);
@@ -825,7 +880,8 @@ internal static class PlayerActivityRuntime
     private static DamageCounterpart ResolveRoutedSource(
         ActivityPeerState sender,
         HitData hit,
-        bool attributedPlayerHit)
+        bool attributedPlayerHit,
+        bool resolveNonPlayerDetails)
     {
         if (attributedPlayerHit)
         {
@@ -855,7 +911,7 @@ internal static class PlayerActivityRuntime
                 null);
         }
 
-        if (TryResolveZdoPrefab(
+        if (resolveNonPlayerDetails && TryResolveZdoPrefab(
                 attacker,
                 out string prefab,
                 out string kind))
@@ -876,7 +932,9 @@ internal static class PlayerActivityRuntime
             null);
     }
 
-    private static DamageCounterpart ResolveLocalTarget(object targetObject)
+    private static DamageCounterpart ResolveLocalTarget(
+        object targetObject,
+        bool resolveNonPlayerDetails)
     {
         try
         {
@@ -893,7 +951,7 @@ internal static class PlayerActivityRuntime
                 }
             }
 
-            if (targetObject is Component component)
+            if (resolveNonPlayerDetails && targetObject is Component component)
             {
                 string prefab = Clip(
                     component.gameObject.name,
@@ -1084,6 +1142,12 @@ internal static class PlayerActivityRuntime
         IReadOnlyDictionary<string, string> reportFields,
         DateTime occurredAtUtc)
     {
+        if (!LogSettingsRuntime.Current.AllowsPlayer("player.death"))
+        {
+            ClearRecentIncomingDamage(state);
+            return;
+        }
+
         long now = Stopwatch.GetTimestamp();
         bool corroborated = false;
         DamageCounterpart? source = state.LastIncomingSource;
@@ -1172,6 +1236,11 @@ internal static class PlayerActivityRuntime
         CharacterSemanticSnapshot previous,
         CharacterSemanticSnapshot current)
     {
+        if (!LogSettingsRuntime.Current.AllowsPlayer("inventory.changed"))
+        {
+            return;
+        }
+
         SortedSet<string> prefabs = new(
             previous.ItemTotalsByPrefab.Keys,
             StringComparer.Ordinal);
@@ -1213,6 +1282,12 @@ internal static class PlayerActivityRuntime
         // A skipped or rejected block still completes this five-minute check.
         // The accepted-content baseline below advances only after queue success.
         state.LastInventorySnapshotCheckTimestamp = now;
+        if (!LogSettingsRuntime.Current.AllowsPlayer("inventory.snapshot"))
+        {
+            state.LastInventorySnapshotFingerprint = null;
+            return;
+        }
+
         DateTime occurredAtUtc = DateTime.UtcNow;
         DateTime localDate = TimeZoneInfo.ConvertTimeFromUtc(
             occurredAtUtc, _serverTimeZone).Date;
@@ -1474,6 +1549,11 @@ internal static class PlayerActivityRuntime
         CharacterSemanticSnapshot previous,
         CharacterSemanticSnapshot current)
     {
+        if (!LogSettingsRuntime.Current.AllowsPlayer("skill.changed"))
+        {
+            return;
+        }
+
         SortedSet<int> skillTypes = new(previous.Skills.Keys);
         skillTypes.UnionWith(current.Skills.Keys);
         string prefix = ActivityPrefix(state);
@@ -1740,6 +1820,13 @@ internal static class PlayerActivityRuntime
 
     private static bool TryEnsureLoginWritten(ActivityPeerState state)
     {
+        if (!LogSettingsRuntime.Current.AllowsPlayer("player.connection"))
+        {
+            // Suppression is session-local, not a written login. Re-enabling
+            // logging must not fabricate a login for an already-open session.
+            state.LoginSuppressed = true;
+        }
+
         if (state.LoginWritten)
         {
             return true;
@@ -1748,6 +1835,13 @@ internal static class PlayerActivityRuntime
         if (!TryResolvePlayerId(state))
         {
             return false;
+        }
+
+        if (state.LoginSuppressed)
+        {
+            // Other selectors require a valid character identity, not a login
+            // row. Keep their original authentication/routing boundary intact.
+            return true;
         }
 
         if (!TryWriteCore(
@@ -2004,6 +2098,8 @@ internal static class PlayerActivityRuntime
             Peer = peer;
             LocalPlayer = localPlayer;
             OpenedAtUtc = openedAtUtc;
+            LoginSuppressed = !LogSettingsRuntime.Current.AllowsPlayer(
+                "player.connection");
             FirstCoordinateEligibleTimestamp = peer == null
                 ? openedTimestamp
                 : AddTicks(openedTimestamp, _coordinateInitialDelayTicks);
@@ -2017,6 +2113,7 @@ internal static class PlayerActivityRuntime
         internal Player? LocalPlayer { get; }
         internal DateTime OpenedAtUtc { get; }
         internal bool LoginWritten { get; set; }
+        internal bool LoginSuppressed { get; set; }
         internal long FirstCoordinateEligibleTimestamp { get; }
         internal long NextCoordinateTimestamp { get; set; }
         internal bool HasLoggedPosition { get; set; }

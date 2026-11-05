@@ -257,7 +257,7 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
         if (validation.Allowed && diagnostics.Count == 0)
         {
             _log.LogInfo(
-                $"Accepted plugin manifest for {SafePeerLabel(peerIdentity)} " +
+                $"Accepted module manifest for {SafePeerLabel(peerIdentity)} " +
                 $"using policy generation {snapshot.Generation}.");
             return ManifestValidationDecision.Accept();
         }
@@ -294,20 +294,21 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
     {
         List<IntegrityDiagnostic> entries = diagnostics.Where(item => item != null).ToList();
         Dictionary<string, IntegrityManifestEntry> reported = manifest?.Entries.ToDictionary(
-            item => item.PluginGuid, StringComparer.Ordinal) ?? new Dictionary<string, IntegrityManifestEntry>(StringComparer.Ordinal);
+            item => item.IdentityKey, StringComparer.Ordinal) ?? new Dictionary<string, IntegrityManifestEntry>(StringComparer.Ordinal);
         StringBuilder text = new();
         int shown = 0;
         foreach (IntegrityDiagnostic diagnostic in entries.Take(5))
         {
             string guid = diagnostic.PluginGuid ?? "";
-            snapshot.TryGetRule(guid, out IntegrityPolicyRule rule);
-            reported.TryGetValue(guid, out IntegrityManifestEntry entry);
-            string classification = diagnostic.Code == IntegrityDiagnosticCodes.RequiredPluginMissing ? "missing" :
-                diagnostic.Code == IntegrityDiagnosticCodes.UnlistedPluginPresent ? "unlisted" :
-                diagnostic.Code == IntegrityDiagnosticCodes.HashNotAllowed ? "hash_not_allowed" :
+            snapshot.TryGetRule(guid, diagnostic.Kind, out IntegrityPolicyRule rule);
+            reported.TryGetValue(IntegrityCanonical.GetIdentityKey(diagnostic.Kind, guid), out IntegrityManifestEntry entry);
+            string classification = diagnostic.Code == IntegrityDiagnosticCodes.RequiredPluginMissing || diagnostic.Code == IntegrityDiagnosticCodes.RequiredPatcherMissing ? "missing" :
+                diagnostic.Code == IntegrityDiagnosticCodes.UnlistedPluginPresent || diagnostic.Code == IntegrityDiagnosticCodes.UnlistedPatcherPresent ? "unlisted" :
+                diagnostic.Code == IntegrityDiagnosticCodes.HashNotAllowed || diagnostic.Code == IntegrityDiagnosticCodes.PatcherHashNotAllowed ? "hash_not_allowed" :
                 IsSafeDiagnosticCode(diagnostic.Code) ? diagnostic.Code : "manifest_invalid";
             string line = "name=" + MakeClientSafePluginLabel(rule?.DisplayName ?? entry?.Name) +
                 "; guid=" + (rule?.PluginGuid ?? entry?.PluginGuid ?? "unavailable") + "; mismatch=" + classification;
+            if (diagnostic.Kind == IntegrityModuleKind.Patcher) line += "; kind=patcher";
             if (includeHashes)
             {
                 line += "; expected_sha256=" + (rule == null ? "not_listed" : string.Join(",", rule.AllowedSha256.Take(2))) +
@@ -352,7 +353,7 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
             .ToList() ?? new List<IntegrityDiagnostic>();
         Dictionary<string, IntegrityManifestEntry> manifestEntries =
             manifest?.Entries.ToDictionary(
-                item => item.PluginGuid,
+                item => item.IdentityKey,
                 item => item,
                 StringComparer.Ordinal) ??
             new Dictionary<string, IntegrityManifestEntry>(StringComparer.Ordinal);
@@ -369,30 +370,36 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
             switch (diagnostic.Code)
             {
                 case IntegrityDiagnosticCodes.RequiredPluginMissing:
+                case IntegrityDiagnosticCodes.RequiredPatcherMissing:
                     AddClientPluginLabel(
                         install,
                         installGuids,
                         diagnostic.PluginGuid,
+                        diagnostic.Kind,
                         snapshot,
                         manifestEntries,
                         preferPolicyName: true);
                     break;
 
                 case IntegrityDiagnosticCodes.UnlistedPluginPresent:
+                case IntegrityDiagnosticCodes.UnlistedPatcherPresent:
                     AddClientPluginLabel(
                         remove,
                         removeGuids,
                         diagnostic.PluginGuid,
+                        diagnostic.Kind,
                         snapshot,
                         manifestEntries,
                         preferPolicyName: false);
                     break;
 
                 case IntegrityDiagnosticCodes.HashNotAllowed:
+                case IntegrityDiagnosticCodes.PatcherHashNotAllowed:
                     AddClientPluginLabel(
                         update,
                         updateGuids,
                         diagnostic.PluginGuid,
+                        diagnostic.Kind,
                         snapshot,
                         manifestEntries,
                         preferPolicyName: true);
@@ -439,12 +446,14 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
         ICollection<string> destination,
         ISet<string> seenGuids,
         string pluginGuid,
+        IntegrityModuleKind kind,
         IntegrityPolicySnapshot snapshot,
         IReadOnlyDictionary<string, IntegrityManifestEntry> manifestEntries,
         bool preferPolicyName)
     {
         string canonicalGuid = pluginGuid ?? string.Empty;
-        if (!seenGuids.Add(canonicalGuid))
+        string identityKey = IntegrityCanonical.GetIdentityKey(kind, canonicalGuid);
+        if (!seenGuids.Add(identityKey))
         {
             return;
         }
@@ -453,20 +462,20 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
         IntegrityManifestEntry manifestEntry;
         string? label = null;
         if (preferPolicyName &&
-            snapshot.TryGetRule(canonicalGuid, out policyRule))
+            snapshot.TryGetRule(canonicalGuid, kind, out policyRule))
         {
             label = policyRule.DisplayName;
         }
-        else if (manifestEntries.TryGetValue(canonicalGuid, out manifestEntry))
+        else if (manifestEntries.TryGetValue(identityKey, out manifestEntry))
         {
             label = manifestEntry.Name;
         }
-        else if (snapshot.TryGetRule(canonicalGuid, out policyRule))
+        else if (snapshot.TryGetRule(canonicalGuid, kind, out policyRule))
         {
             label = policyRule.DisplayName;
         }
 
-        destination.Add(MakeClientSafePluginLabel(label));
+        destination.Add((kind == IntegrityModuleKind.Patcher ? "[Patcher] " : "") + MakeClientSafePluginLabel(label));
     }
 
     private static string MakeClientSafePluginLabel(string? value)
@@ -658,7 +667,7 @@ internal sealed class ServerIntegrityService : IManifestValidator, IDisposable
                             _reloadRetryCount = 0;
                             foreach (string library in candidate.SkippedLibraries)
                                 _log.LogInfo("Skipped library in mod policy: " + library +
-                                    ". required/optional checks BepInEx plugins only; library contents are not compared.");
+                                    ". required/optional checks BepInEx plugins and preloader patchers; standalone library contents are not compared.");
                         }
                         else ScheduleFailedReloadRetryLocked(now);
                     }

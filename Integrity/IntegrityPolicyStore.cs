@@ -49,6 +49,11 @@ namespace ServerManager
             SourceRoot = Path.GetFullPath(sourceRoot);
             _referenceScanner = referenceScanner ??
                                 new ReferencePluginPolicyScanner(SourceRoot, _limits);
+            if (selfEntry != null && selfEntry.Kind != IntegrityModuleKind.Plugin)
+            {
+                throw new ArgumentException("The ServerManager self entry must be a plugin.", nameof(selfEntry));
+            }
+
             _selfEntry = selfEntry;
             _referenceScanner.EnsureDirectories();
         }
@@ -131,13 +136,14 @@ namespace ServerManager
             Dictionary<string, IntegrityPolicyRule> effective =
                 new Dictionary<string, IntegrityPolicyRule>(
                     StringComparer.Ordinal);
-            string? selfGuid = _selfEntry?.PluginGuid;
+            string? selfIdentity = _selfEntry?.IdentityKey;
 
             foreach (IGrouping<string, ReferencePluginPolicyRecord> group in
                      sourceRecords.GroupBy(
-                         item => item.Entry.PluginGuid,
+                         item => item.Entry.IdentityKey,
                          StringComparer.Ordinal))
             {
+                IntegrityManifestEntry identity = group.First().Entry;
                 IntegrityRequirement[] requirements = group
                     .Select(item => item.Requirement)
                     .Distinct()
@@ -147,15 +153,17 @@ namespace ServerManager
                     diagnostics.Add(
                         IntegrityCanonical.Error(
                             IntegrityDiagnosticCodes.PolicySourceRoleConflict,
-                            "Plugin GUID '" + group.Key +
+                            (identity.Kind == IntegrityModuleKind.Patcher ? "Patcher identity '" : "Plugin GUID '") +
+                            identity.PluginGuid +
                             "' appears in both required and optional reference folders.",
-                            group.Key));
+                            identity.PluginGuid,
+                            identity.Kind));
                     continue;
                 }
 
                 IntegrityRequirement requirement = requirements[0];
-                if (selfGuid != null &&
-                    StringComparer.Ordinal.Equals(group.Key, selfGuid))
+                if (selfIdentity != null &&
+                    StringComparer.Ordinal.Equals(group.Key, selfIdentity))
                 {
                     if (requirement != IntegrityRequirement.Required)
                     {
@@ -165,7 +173,7 @@ namespace ServerManager
                                 "ServerManager.dll should not be placed in the optional folder. " +
                                 "It is automatically required. A copy in the required folder " +
                                 "is allowed but unnecessary.",
-                                group.Key));
+                                identity.PluginGuid));
                     }
 
                     continue;
@@ -183,11 +191,12 @@ namespace ServerManager
                 effective.Add(
                     group.Key,
                     new IntegrityPolicyRule(
-                        group.Key,
+                        identity.PluginGuid,
                         displayName,
                         requirement,
                         hashes,
-                        group.Select(item => item.Version)));
+                        group.Select(item => item.Version),
+                        identity.Kind));
             }
 
             if (_selfEntry != null)
@@ -201,21 +210,22 @@ namespace ServerManager
                 {
                     if (record.Requirement == IntegrityRequirement.Required &&
                         StringComparer.Ordinal.Equals(
-                            record.Entry.PluginGuid,
-                            _selfEntry.PluginGuid))
+                            record.Entry.IdentityKey,
+                            _selfEntry.IdentityKey))
                     {
                         selfHashes.Add(record.Entry.FileSha256);
                     }
                 }
 
-                effective[_selfEntry.PluginGuid] =
+                effective[_selfEntry.IdentityKey] =
                     new IntegrityPolicyRule(
                         _selfEntry.PluginGuid,
                         _selfEntry.Name,
                         IntegrityRequirement.Required,
                         selfHashes,
-                        sourceRecords.Where(record => record.Entry.PluginGuid == _selfEntry.PluginGuid)
-                            .Select(record => record.Version));
+                        sourceRecords.Where(record => record.Entry.IdentityKey == _selfEntry.IdentityKey)
+                            .Select(record => record.Version),
+                        IntegrityModuleKind.Plugin);
             }
 
             if (effective.Count > _limits.MaxPluginCount)
@@ -231,7 +241,7 @@ namespace ServerManager
             }
 
             return effective.Values
-                .OrderBy(item => item.PluginGuid, StringComparer.Ordinal)
+                .OrderBy(item => item.IdentityKey, StringComparer.Ordinal)
                 .ToList();
         }
 

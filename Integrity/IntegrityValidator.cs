@@ -5,10 +5,10 @@ using System.Linq;
 namespace ServerManager
 {
     /// <summary>
-    /// Pure policy evaluator for BepInEx plugin GUIDs.
+    /// Pure policy evaluator for BepInEx plugin and preloader patcher identities.
     /// Display names are retained for diagnostics but never grant access; an
     /// allowed file SHA-256 is always required for present required rules.
-    /// Optional and unlisted plugins are strict by default, with an explicit
+    /// Optional and unlisted modules are strict by default, with an explicit
     /// exception option for server-authenticated administrators.
     /// </summary>
     public static class IntegrityValidator
@@ -21,7 +21,7 @@ namespace ServerManager
         }
 
         /// <summary>
-        /// Allows only optional-hash and unlisted-plugin discrepancies to be
+        /// Allows only optional-hash and unlisted-module discrepancies to be
         /// exempted. The caller must authenticate administrator status on the
         /// server; this pure evaluator does not establish identity or access.
         /// Required presence and hashes remain mandatory for every caller.
@@ -55,9 +55,9 @@ namespace ServerManager
                     });
             }
 
-            Dictionary<string, IntegrityManifestEntry> entriesByGuid =
+            Dictionary<string, IntegrityManifestEntry> entriesByIdentity =
                 manifest.Entries.ToDictionary(
-                    entry => entry.PluginGuid,
+                    entry => entry.IdentityKey,
                     entry => entry,
                     StringComparer.Ordinal);
             List<IntegrityDiagnostic> diagnostics =
@@ -68,32 +68,38 @@ namespace ServerManager
             foreach (IntegrityPolicyRule rule in policy.Rules)
             {
                 if (rule.Requirement == IntegrityRequirement.Required &&
-                    !entriesByGuid.ContainsKey(rule.PluginGuid))
+                    !entriesByIdentity.ContainsKey(rule.IdentityKey))
                 {
                     diagnostics.Add(
                         IntegrityCanonical.Error(
-                            IntegrityDiagnosticCodes.RequiredPluginMissing,
-                            "Required plugin '" +
+                            rule.Kind == IntegrityModuleKind.Patcher
+                                ? IntegrityDiagnosticCodes.RequiredPatcherMissing
+                                : IntegrityDiagnosticCodes.RequiredPluginMissing,
+                            (rule.Kind == IntegrityModuleKind.Patcher ? "Required patcher '" : "Required plugin '") +
                             rule.DisplayName +
                             "' (" +
                             rule.PluginGuid +
                             ") is not available.",
-                            rule.PluginGuid));
+                            rule.PluginGuid,
+                            rule.Kind));
                 }
             }
 
             foreach (IntegrityManifestEntry entry in manifest.Entries)
             {
                 IntegrityPolicyRule rule;
-                if (!policy.TryGetCanonicalRule(entry.PluginGuid, out rule))
+                if (!policy.TryGetCanonicalRule(entry.PluginGuid, entry.Kind, out rule))
                 {
                     (allowAdminExceptions ? exemptedDiagnostics : diagnostics).Add(
                         IntegrityCanonical.Error(
-                            IntegrityDiagnosticCodes.UnlistedPluginPresent,
-                            "Plugin '" +
+                            entry.Kind == IntegrityModuleKind.Patcher
+                                ? IntegrityDiagnosticCodes.UnlistedPatcherPresent
+                                : IntegrityDiagnosticCodes.UnlistedPluginPresent,
+                            (entry.Kind == IntegrityModuleKind.Patcher ? "Patcher '" : "Plugin '") +
                             entry.Name +
                             "' is not listed by the server policy.",
-                            entry.PluginGuid));
+                            entry.PluginGuid,
+                            entry.Kind));
 
                     continue;
                 }
@@ -104,12 +110,15 @@ namespace ServerManager
                         rule.Requirement == IntegrityRequirement.Optional;
                     (exemptOptionalHash ? exemptedDiagnostics : diagnostics).Add(
                         IntegrityCanonical.Error(
-                            IntegrityDiagnosticCodes.HashNotAllowed,
-                            "Plugin '" + rule.DisplayName +
+                            entry.Kind == IntegrityModuleKind.Patcher
+                                ? IntegrityDiagnosticCodes.PatcherHashNotAllowed
+                                : IntegrityDiagnosticCodes.HashNotAllowed,
+                            (entry.Kind == IntegrityModuleKind.Patcher ? "Patcher '" : "Plugin '") + rule.DisplayName +
                             "' has SHA-256 " +
                             entry.FileSha256 +
                             ", which is not allowed by the server policy.",
-                            entry.PluginGuid));
+                            entry.PluginGuid,
+                            entry.Kind));
                 }
             }
 

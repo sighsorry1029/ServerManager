@@ -53,6 +53,11 @@ if (-not $SkipBuild) {
 
 $smokeTests = @(
     [pscustomobject]@{
+        Name = "File log selection and hot reload"
+        File = "LogSettingsSmoke.ps1"
+        NeedsGamePath = $false
+    },
+    [pscustomobject]@{
         Name = "Valheim serialization metadata and shared wire helpers"
         File = "Valheim107CompatibilitySmoke.ps1"
         NeedsGamePath = $true
@@ -238,6 +243,11 @@ $smokeTests = @(
         NeedsGamePath = $true
     },
     [pscustomobject]@{
+        Name = "Patcher reference approval and client admission"
+        File = "PatcherIntegritySmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
         Name = "Plugin-only manifest protocol"
         File = "PluginManifestProtocolSmoke.ps1"
         NeedsGamePath = $true
@@ -401,7 +411,7 @@ foreach ($smokeTest in $smokeTests) {
         $arguments += @("-GamePath", $GamePath)
     }
 
-    $shellPath = if ($smokeTest.File -in @("CommonCommandsSmoke.ps1", "ChatLoggingSmoke.ps1", "ClientMenuBrandingSmoke.ps1", "MaintenanceSaveSmoke.ps1")) {
+    $shellPath = if ($smokeTest.File -in @("CommonCommandsSmoke.ps1", "ChatLoggingSmoke.ps1", "ClientMenuBrandingSmoke.ps1", "MaintenanceSaveSmoke.ps1", "PatcherIntegritySmoke.ps1")) {
         $powerShell7.Source
     }
     else { "powershell.exe" }

@@ -12,8 +12,9 @@ namespace ServerManager
     ///   4 bytes magic "SMIF"
     ///   int32 schema version
     ///   int32 entry count
-    ///   repeated entries, sorted by canonical GUID:
-    ///     int32 + UTF-8 GUID
+    ///   repeated entries, sorted by kind then canonical identity:
+    ///     int32 module kind (0 plugin, 1 patcher)
+    ///     int32 + UTF-8 identity (plugin GUID or patcher identity SHA-256)
     ///     int32 + UTF-8 display name
     ///     32 raw SHA-256 bytes
     ///
@@ -30,7 +31,7 @@ namespace ServerManager
             (byte)'F'
         };
 
-        public const int WireSchemaVersion = 2;
+        public const int WireSchemaVersion = 3;
 
         public static IntegrityManifestEncodeResult TryEncode(
             IntegrityManifest? manifest)
@@ -75,7 +76,7 @@ namespace ServerManager
                     WriteInt32(stream, WireSchemaVersion);
                     WriteInt32(stream, manifest.Entries.Count);
 
-                    string? previousGuid = null;
+                    string? previousIdentity = null;
                     foreach (IntegrityManifestEntry entry in manifest.Entries)
                     {
                         IntegrityDiagnostic diagnostic;
@@ -91,10 +92,10 @@ namespace ServerManager
                                     "Manifest contains a null entry."));
                         }
 
-                        if (!IntegrityCanonical.TryNormalizeGuid(
+                        if (!IntegrityCanonical.TryNormalizeIdentifier(
                                 entry.PluginGuid,
+                                entry.Kind,
                                 limits,
-                                IntegrityDiagnosticCodes.ManifestInvalidGuid,
                                 out pluginGuid,
                                 out diagnostic))
                         {
@@ -104,13 +105,14 @@ namespace ServerManager
                         if (!IntegrityCanonical.TryNormalizeDisplayString(
                                 entry.Name,
                                 limits.MaxNameUtf8Bytes,
-                                "Plugin name",
+                                entry.Kind == IntegrityModuleKind.Patcher ? "Patcher name" : "Plugin name",
                                 IntegrityDiagnosticCodes.ManifestInvalidName,
                                 pluginGuid,
                                 out name,
                                 out diagnostic))
                         {
-                            return EncodeFailed(diagnostic);
+                            return EncodeFailed(IntegrityCanonical.Error(
+                                diagnostic.Code, diagnostic.Message, diagnostic.PluginGuid, entry.Kind));
                         }
 
                         if (!IntegrityCanonical.TryNormalizeSha256(
@@ -120,22 +122,26 @@ namespace ServerManager
                                 out sha256,
                                 out diagnostic))
                         {
-                            return EncodeFailed(diagnostic);
+                            return EncodeFailed(IntegrityCanonical.Error(
+                                diagnostic.Code, diagnostic.Message, diagnostic.PluginGuid, entry.Kind));
                         }
 
-                        if (previousGuid != null &&
-                            StringComparer.Ordinal.Compare(previousGuid, pluginGuid) >= 0)
+                        string identityKey = IntegrityCanonical.GetIdentityKey(entry.Kind, pluginGuid);
+                        if (previousIdentity != null &&
+                            StringComparer.Ordinal.Compare(previousIdentity, identityKey) >= 0)
                         {
                             return EncodeFailed(
                                 IntegrityCanonical.Error(
-                                    StringComparer.Ordinal.Equals(previousGuid, pluginGuid)
+                                    StringComparer.Ordinal.Equals(previousIdentity, identityKey)
                                         ? IntegrityDiagnosticCodes.ManifestDuplicateGuid
                                         : IntegrityDiagnosticCodes.WireNonCanonical,
-                                    "Manifest entries are not in strictly increasing GUID order.",
-                                    pluginGuid));
+                                    "Manifest entries are not in strictly increasing kind/identity order.",
+                                    pluginGuid,
+                                    entry.Kind));
                         }
 
-                        previousGuid = pluginGuid;
+                        previousIdentity = identityKey;
+                        WriteInt32(stream, (int)entry.Kind);
                         WriteString(stream, pluginGuid);
                         WriteString(stream, name);
                         byte[] hashBytes = IntegrityCanonical.HexToBytes(sha256);
@@ -268,10 +274,28 @@ namespace ServerManager
 
             List<IntegrityManifestEntry> entries =
                 new List<IntegrityManifestEntry>(entryCount);
-            string? previousGuid = null;
+            string? previousIdentity = null;
 
             for (int index = 0; index < entryCount; index++)
             {
+                int rawKind;
+                if (!reader.TryReadInt32(out rawKind))
+                {
+                    return DecodeFailed(
+                        IntegrityCanonical.Error(
+                            IntegrityDiagnosticCodes.WireMalformed,
+                            "Manifest entry " + index + " is missing its module kind."));
+                }
+
+                IntegrityModuleKind kind = (IntegrityModuleKind)rawKind;
+                if (!IntegrityCanonical.IsSupportedKind(kind))
+                {
+                    return DecodeFailed(
+                        IntegrityCanonical.Error(
+                            IntegrityDiagnosticCodes.ManifestInvalidKind,
+                            "Manifest entry " + index + " contains an unsupported module kind."));
+                }
+
                 string rawGuid;
                 string rawName;
                 string readError;
@@ -287,7 +311,9 @@ namespace ServerManager
                     return DecodeFailed(
                         IntegrityCanonical.Error(
                             IntegrityDiagnosticCodes.WireMalformed,
-                            "Manifest entry " + index + " is malformed: " + readError));
+                            "Manifest entry " + index + " is malformed: " + readError,
+                            string.Empty,
+                            kind));
                 }
 
                 byte[] rawHash;
@@ -298,16 +324,18 @@ namespace ServerManager
                             IntegrityDiagnosticCodes.WireMalformed,
                             "Manifest entry " +
                             index +
-                            " has a truncated SHA-256 value."));
+                            " has a truncated SHA-256 value.",
+                            string.Empty,
+                            kind));
                 }
 
                 IntegrityDiagnostic diagnostic;
                 string pluginGuid;
                 string name;
-                if (!IntegrityCanonical.TryNormalizeGuid(
+                if (!IntegrityCanonical.TryNormalizeIdentifier(
                         rawGuid,
+                        kind,
                         limits,
-                        IntegrityDiagnosticCodes.ManifestInvalidGuid,
                         out pluginGuid,
                         out diagnostic))
                 {
@@ -317,13 +345,14 @@ namespace ServerManager
                 if (!IntegrityCanonical.TryNormalizeDisplayString(
                         rawName,
                         limits.MaxNameUtf8Bytes,
-                        "Plugin name",
+                        kind == IntegrityModuleKind.Patcher ? "Patcher name" : "Plugin name",
                         IntegrityDiagnosticCodes.ManifestInvalidName,
                         pluginGuid,
                         out name,
                         out diagnostic))
                 {
-                    return DecodeFailed(diagnostic);
+                    return DecodeFailed(IntegrityCanonical.Error(
+                        diagnostic.Code, diagnostic.Message, diagnostic.PluginGuid, kind));
                 }
 
                 if (!StringComparer.Ordinal.Equals(rawGuid, pluginGuid) ||
@@ -333,23 +362,26 @@ namespace ServerManager
                         IntegrityCanonical.Error(
                             IntegrityDiagnosticCodes.WireNonCanonical,
                             "Manifest entry strings are not in canonical form.",
-                            pluginGuid));
+                            pluginGuid,
+                            kind));
                 }
 
-                if (previousGuid != null)
+                string identityKey = IntegrityCanonical.GetIdentityKey(kind, pluginGuid);
+                if (previousIdentity != null)
                 {
                     int order = StringComparer.Ordinal.Compare(
-                        previousGuid,
-                        pluginGuid);
+                        previousIdentity,
+                        identityKey);
                     if (order == 0)
                     {
                         return DecodeFailed(
                             IntegrityCanonical.Error(
                                 IntegrityDiagnosticCodes.ManifestDuplicateGuid,
-                                "Manifest contains duplicate GUID '" +
-                                pluginGuid +
+                                "Manifest contains duplicate module identity '" +
+                                identityKey +
                                 "'.",
-                                pluginGuid));
+                                pluginGuid,
+                                kind));
                     }
 
                     if (order > 0)
@@ -357,18 +389,20 @@ namespace ServerManager
                         return DecodeFailed(
                             IntegrityCanonical.Error(
                                 IntegrityDiagnosticCodes.WireNonCanonical,
-                                "Manifest entries are not sorted by canonical GUID.",
-                                pluginGuid));
+                                "Manifest entries are not sorted by kind and canonical identity.",
+                                pluginGuid,
+                                kind));
                     }
                 }
 
-                previousGuid = pluginGuid;
+                previousIdentity = identityKey;
                 entries.Add(
                     new IntegrityManifestEntry(
                         pluginGuid,
                         name,
                         IntegrityCanonical.ToLowerHex(rawHash),
-                        limits));
+                        limits,
+                        kind));
             }
 
             if (reader.Remaining != 0)

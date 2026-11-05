@@ -589,9 +589,9 @@ namespace ServerManager
     public static class ProtocolPacketCodec
     {
         private const int Magic = 0x52474D53; // "SMGR" when viewed as little-endian bytes.
-        // Version 25 requires bounded assembly-diagnostic details and separate
-        // partial-inspection evidence, retaining optional center displays.
-        public const ushort WireVersion = 25;
+        // Version 26 requires kind-aware manifests with preloader patchers;
+        // plugin-only peers cannot report a complete admission inventory.
+        public const ushort WireVersion = 26;
         internal const int MaximumReportedCharacterNameCharacters = 96;
         internal const int MaximumReportedCharacterNameBytes = 384;
         internal const int MaximumManifestMetadataBytes = sizeof(ushort) + MaximumReportedCharacterNameBytes;

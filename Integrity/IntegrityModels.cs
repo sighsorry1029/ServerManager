@@ -8,6 +8,15 @@ using System.Text;
 namespace ServerManager
 {
     /// <summary>
+    /// Separates BepInEx plugin GUIDs from preloader patcher identities.
+    /// </summary>
+    public enum IntegrityModuleKind
+    {
+        Plugin = 0,
+        Patcher = 1
+    }
+
+    /// <summary>
     /// Describes how a server policy treats a plugin.
     /// </summary>
     public enum IntegrityRequirement
@@ -25,6 +34,8 @@ namespace ServerManager
         public const string ManifestUnavailable = "manifest.unavailable";
         public const string ManifestTooManyEntries = "manifest.too_many_entries";
         public const string ManifestInvalidGuid = "manifest.invalid_guid";
+        public const string ManifestInvalidKind = "manifest.invalid_kind";
+        public const string ManifestInvalidPatcherId = "manifest.invalid_patcher_id";
         public const string ManifestInvalidName = "manifest.invalid_name";
         public const string ManifestInvalidHash = "manifest.invalid_sha256";
         public const string ManifestDuplicateGuid = "manifest.duplicate_guid";
@@ -57,6 +68,9 @@ namespace ServerManager
         public const string RequiredPluginMissing = "validation.required_plugin_missing";
         public const string UnlistedPluginPresent = "validation.unlisted_plugin_present";
         public const string HashNotAllowed = "validation.hash_not_allowed";
+        public const string RequiredPatcherMissing = "validation.required_patcher_missing";
+        public const string UnlistedPatcherPresent = "validation.unlisted_patcher_present";
+        public const string PatcherHashNotAllowed = "validation.patcher_hash_not_allowed";
     }
 
     /// <summary>
@@ -69,6 +83,15 @@ namespace ServerManager
             string code,
             string message,
             string pluginGuid = "")
+            : this(code, message, pluginGuid, IntegrityModuleKind.Plugin)
+        {
+        }
+
+        public IntegrityDiagnostic(
+            string code,
+            string message,
+            string pluginGuid,
+            IntegrityModuleKind kind)
         {
             if (string.IsNullOrWhiteSpace(code))
             {
@@ -78,6 +101,7 @@ namespace ServerManager
             Code = code;
             Message = message ?? string.Empty;
             PluginGuid = pluginGuid ?? string.Empty;
+            Kind = kind;
         }
 
         public string Code { get; }
@@ -85,6 +109,8 @@ namespace ServerManager
         public string Message { get; }
 
         public string PluginGuid { get; }
+
+        public IntegrityModuleKind Kind { get; }
 
         public override string ToString()
         {
@@ -163,7 +189,7 @@ namespace ServerManager
     }
 
     /// <summary>
-    /// One canonical BepInEx plugin record. The local file path deliberately is
+    /// One canonical BepInEx plugin or preloader patcher record. The local file path deliberately is
     /// not part of this DTO and therefore cannot leak over the network.
     /// </summary>
     public sealed class IntegrityManifestEntry
@@ -176,7 +202,17 @@ namespace ServerManager
                 pluginGuid,
                 name,
                 fileSha256,
-                IntegrityLimits.Default)
+                IntegrityLimits.Default,
+                IntegrityModuleKind.Plugin)
+        {
+        }
+
+        public IntegrityManifestEntry(
+            string pluginGuid,
+            string name,
+            string fileSha256,
+            IntegrityModuleKind kind)
+            : this(pluginGuid, name, fileSha256, IntegrityLimits.Default, kind)
         {
         }
 
@@ -185,6 +221,16 @@ namespace ServerManager
             string name,
             string fileSha256,
             IntegrityLimits limits)
+            : this(pluginGuid, name, fileSha256, limits, IntegrityModuleKind.Plugin)
+        {
+        }
+
+        internal IntegrityManifestEntry(
+            string pluginGuid,
+            string name,
+            string fileSha256,
+            IntegrityLimits limits,
+            IntegrityModuleKind kind)
         {
             if (limits == null)
             {
@@ -196,10 +242,10 @@ namespace ServerManager
             string canonicalName;
             string canonicalHash;
 
-            if (!IntegrityCanonical.TryNormalizeGuid(
+            if (!IntegrityCanonical.TryNormalizeIdentifier(
                     pluginGuid,
+                    kind,
                     limits,
-                    IntegrityDiagnosticCodes.ManifestInvalidGuid,
                     out canonicalGuid,
                     out diagnostic))
             {
@@ -209,7 +255,7 @@ namespace ServerManager
             if (!IntegrityCanonical.TryNormalizeDisplayString(
                     name,
                     limits.MaxNameUtf8Bytes,
-                    "Plugin name",
+                    kind == IntegrityModuleKind.Patcher ? "Patcher name" : "Plugin name",
                     IntegrityDiagnosticCodes.ManifestInvalidName,
                     canonicalGuid,
                     out canonicalName,
@@ -229,11 +275,20 @@ namespace ServerManager
             }
 
             PluginGuid = canonicalGuid;
+            Kind = kind;
             Name = canonicalName;
             FileSha256 = canonicalHash;
         }
 
+        /// <summary>
+        /// Canonical per-kind identity: plugin GUID, or a patcher identity SHA-256.
+        /// The legacy property name is retained for existing plugin consumers.
+        /// </summary>
         public string PluginGuid { get; }
+
+        public IntegrityModuleKind Kind { get; }
+
+        internal string IdentityKey => IntegrityCanonical.GetIdentityKey(Kind, PluginGuid);
 
         public string Name { get; }
 
@@ -241,8 +296,8 @@ namespace ServerManager
     }
 
     /// <summary>
-    /// Canonically ordered manifest. Entries are sorted by normalized BepInEx
-    /// GUID, making wire serialization deterministic.
+    /// Canonically ordered manifest. Entries are sorted by kind then normalized
+    /// per-kind identity, making wire serialization deterministic.
     /// </summary>
     public sealed class IntegrityManifest
     {
@@ -262,17 +317,17 @@ namespace ServerManager
             }
 
             copy.Sort((left, right) =>
-                StringComparer.Ordinal.Compare(left.PluginGuid, right.PluginGuid));
+                StringComparer.Ordinal.Compare(left.IdentityKey, right.IdentityKey));
 
             for (int index = 1; index < copy.Count; index++)
             {
                 if (StringComparer.Ordinal.Equals(
-                        copy[index - 1].PluginGuid,
-                        copy[index].PluginGuid))
+                        copy[index - 1].IdentityKey,
+                        copy[index].IdentityKey))
                 {
                     throw new ArgumentException(
-                        "The manifest contains duplicate plugin GUID '" +
-                        copy[index].PluginGuid +
+                        "The manifest contains duplicate module identity '" +
+                        copy[index].IdentityKey +
                         "'.",
                         nameof(entries));
                 }
@@ -372,8 +427,36 @@ namespace ServerManager
             IntegrityRequirement requirement,
             IEnumerable<string> allowedSha256,
             IEnumerable<string>? allowedVersions)
+            : this(pluginGuid, displayName, requirement, allowedSha256, allowedVersions,
+                IntegrityModuleKind.Plugin)
         {
+        }
+
+        internal IntegrityPolicyRule(
+            string pluginGuid,
+            string displayName,
+            IntegrityRequirement requirement,
+            IEnumerable<string> allowedSha256,
+            IntegrityModuleKind kind)
+            : this(pluginGuid, displayName, requirement, allowedSha256, null, kind)
+        {
+        }
+
+        internal IntegrityPolicyRule(
+            string pluginGuid,
+            string displayName,
+            IntegrityRequirement requirement,
+            IEnumerable<string> allowedSha256,
+            IEnumerable<string>? allowedVersions,
+            IntegrityModuleKind kind)
+        {
+            if (!IntegrityCanonical.IsSupportedKind(kind))
+            {
+                throw new ArgumentOutOfRangeException(nameof(kind));
+            }
+
             PluginGuid = pluginGuid;
+            Kind = kind;
             DisplayName = displayName;
             Requirement = requirement;
 
@@ -389,6 +472,10 @@ namespace ServerManager
         }
 
         public string PluginGuid { get; }
+
+        public IntegrityModuleKind Kind { get; }
+
+        internal string IdentityKey => IntegrityCanonical.GetIdentityKey(Kind, PluginGuid);
 
         /// <summary>
         /// Diagnostic-only label. It is never used as plugin identity.
@@ -425,12 +512,12 @@ namespace ServerManager
             Generation = generation;
 
             List<IntegrityPolicyRule> orderedRules = rules
-                .OrderBy(rule => rule.PluginGuid, StringComparer.Ordinal)
+                .OrderBy(rule => rule.IdentityKey, StringComparer.Ordinal)
                 .ToList();
             _rules = new ReadOnlyCollection<IntegrityPolicyRule>(orderedRules);
             _rulesByGuid = new ReadOnlyDictionary<string, IntegrityPolicyRule>(
                 orderedRules.ToDictionary(
-                    rule => rule.PluginGuid,
+                    rule => rule.IdentityKey,
                     rule => rule,
                     StringComparer.Ordinal));
         }
@@ -441,12 +528,20 @@ namespace ServerManager
 
         public bool TryGetRule(string? pluginGuid, out IntegrityPolicyRule rule)
         {
+            return TryGetRule(pluginGuid, IntegrityModuleKind.Plugin, out rule);
+        }
+
+        public bool TryGetRule(
+            string? pluginGuid,
+            IntegrityModuleKind kind,
+            out IntegrityPolicyRule rule)
+        {
             string canonicalGuid;
             IntegrityDiagnostic ignored;
-            if (!IntegrityCanonical.TryNormalizeGuid(
+            if (!IntegrityCanonical.TryNormalizeIdentifier(
                     pluginGuid,
+                    kind,
                     IntegrityLimits.Default,
-                    IntegrityDiagnosticCodes.ManifestInvalidGuid,
                     out canonicalGuid,
                     out ignored))
             {
@@ -454,12 +549,21 @@ namespace ServerManager
                 return false;
             }
 
-            return _rulesByGuid.TryGetValue(canonicalGuid, out rule);
+            return TryGetCanonicalRule(canonicalGuid, kind, out rule);
         }
 
         internal bool TryGetCanonicalRule(string canonicalGuid, out IntegrityPolicyRule rule)
         {
-            return _rulesByGuid.TryGetValue(canonicalGuid, out rule);
+            return TryGetCanonicalRule(canonicalGuid, IntegrityModuleKind.Plugin, out rule);
+        }
+
+        internal bool TryGetCanonicalRule(
+            string canonicalGuid,
+            IntegrityModuleKind kind,
+            out IntegrityPolicyRule rule)
+        {
+            return _rulesByGuid.TryGetValue(
+                IntegrityCanonical.GetIdentityKey(kind, canonicalGuid), out rule);
         }
     }
 
@@ -544,6 +648,58 @@ namespace ServerManager
             true);
 
         internal static Encoding Utf8 => StrictUtf8;
+
+        internal static bool IsSupportedKind(IntegrityModuleKind kind)
+        {
+            return kind == IntegrityModuleKind.Plugin || kind == IntegrityModuleKind.Patcher;
+        }
+
+        internal static string GetIdentityKey(IntegrityModuleKind kind, string canonicalIdentifier)
+        {
+            return ((int)kind).ToString(CultureInfo.InvariantCulture) + ":" + canonicalIdentifier;
+        }
+
+        internal static bool TryNormalizeIdentifier(
+            string? value,
+            IntegrityModuleKind kind,
+            IntegrityLimits limits,
+            out string canonical,
+            out IntegrityDiagnostic diagnostic)
+        {
+            if (kind == IntegrityModuleKind.Plugin)
+            {
+                return TryNormalizeGuid(value, limits, IntegrityDiagnosticCodes.ManifestInvalidGuid,
+                    out canonical, out diagnostic);
+            }
+
+            canonical = string.Empty;
+            diagnostic = null!;
+            if (kind != IntegrityModuleKind.Patcher)
+            {
+                diagnostic = Error(IntegrityDiagnosticCodes.ManifestInvalidKind,
+                    "Manifest contains an unsupported module kind.");
+                return false;
+            }
+
+            // A patcher ID is the hash of its assembly simple name and full type
+            // name, not a plugin GUID and not the binary's allowed-content hash.
+            if (!TryNormalizeSha256(value, IntegrityDiagnosticCodes.ManifestInvalidPatcherId,
+                    string.Empty, out canonical, out diagnostic))
+            {
+                diagnostic = Error(diagnostic.Code, diagnostic.Message, diagnostic.PluginGuid, kind);
+                return false;
+            }
+
+            if (canonical.Length > limits.MaxGuidUtf8Bytes)
+            {
+                canonical = string.Empty;
+                diagnostic = Error(IntegrityDiagnosticCodes.ManifestInvalidPatcherId,
+                    "Patcher identity exceeds the configured byte limit.", string.Empty, kind);
+                return false;
+            }
+
+            return true;
+        }
 
         internal static bool TryNormalizeGuid(
             string? value,
@@ -783,10 +939,20 @@ namespace ServerManager
             string message,
             string pluginGuid = "")
         {
+            return Error(code, message, pluginGuid, IntegrityModuleKind.Plugin);
+        }
+
+        internal static IntegrityDiagnostic Error(
+            string code,
+            string message,
+            string pluginGuid,
+            IntegrityModuleKind kind)
+        {
             return new IntegrityDiagnostic(
                 code,
                 message,
-                pluginGuid);
+                pluginGuid,
+                kind);
         }
 
         private static int HexValue(char value)

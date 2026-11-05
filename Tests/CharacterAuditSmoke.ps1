@@ -466,10 +466,10 @@ try {
             $fields = [Collections.Generic.Dictionary[string,string]]::new()
             $fields.Add('message', 'private security evidence')
             $runtimePublish.Invoke($null, [object[]]@(
-                $kind, 'observed', $localEvent.Actor, $null, $fields, $null, $false)) | Out-Null
+                $kind, 'observed', $localEvent.Actor, $null, $fields, $null)) | Out-Null
         }
         Assert-True ($queue.Count -eq 8 -and $dispatchQueue.Count -eq 0) `
-            'Security kinds escaped through direct runtime/integration Publish or allowed the command-only audit flag to suppress local audit.'
+            'Security kinds escaped through direct runtime/integration Publish or were lost from the default local audit policy.'
         Invoke-ConnectionAudit
         $publicPublish.Invoke($null, [object[]]@($queue.ToArray()[-1])) | Out-Null
         Assert-True ($dispatchQueue.Count -eq 0) 'Connection diagnostics escaped through the public integration API.'
@@ -551,6 +551,34 @@ try {
         $webhookField.SetValue($inertSession, $null)
         Invoke-ConnectionAudit -Reason 'broken_webhook'
         Assert-True ($queue.Count -eq 1) 'A broken webhook sink prevented local audit or escaped rejection handling.'
+
+        # Disabling file records must not disable webhook delivery or the existing
+        # observation cooldown. A suppressed record is intentionally accepted.
+        $logSettingsType = $assembly.GetType('ServerManager.LogSettings', $true)
+        $logRuntimeType = $assembly.GetType('ServerManager.LogSettingsRuntime', $true)
+        $policyField = $logRuntimeType.GetField('_current', $staticFlags)
+        $previousPolicy = $policyField.GetValue($null)
+        $quietPolicy = $logSettingsType.GetMethod('Parse', [Reflection.BindingFlags]'Static,Public').Invoke(
+            $null, [object[]]@('audit: []'))
+        try {
+            $policyField.SetValue($null, $quietPolicy)
+            $webhookField.SetValue($inertSession, $webhooks)
+            Reset-TestQueue
+            $notificationsBefore = $webhookQueue.Count
+            Invoke-SecurityAudit -Evidence 'quiet_policy_probe'
+            Assert-True ($queue.Count -eq 0 -and $dedupe.Count -eq 1 -and
+                $webhookQueue.Count -eq $notificationsBefore + 1) `
+                'Disabled audit lost the independent webhook or its observation cooldown.'
+            Invoke-SecurityAudit -Evidence 'quiet_policy_probe'
+            Assert-True ($queue.Count -eq 0 -and $dedupe.Count -eq 1 -and
+                $webhookQueue.Count -eq $notificationsBefore + 1) `
+                'Disabled audit caused repeated evidence to bypass the observation cooldown.'
+            Invoke-ConnectionAudit -Reason 'quiet_connection_probe'
+            Assert-True ($queue.Count -eq 0 -and
+                $webhookQueue.Count -eq $notificationsBefore + 2) `
+                'Disabled audit suppressed a separately admitted connection webhook.'
+        }
+        finally { $policyField.SetValue($null, $previousPolicy) }
     }
     finally {
         $sessionField.SetValue($null, $originalDiscordSession)

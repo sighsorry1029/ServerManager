@@ -20,7 +20,7 @@ foreach ($name in @('UnityEngine.CoreModule.dll', 'UnityEngine.PhysicsModule.dll
 foreach ($name in @('BepInEx.dll', '0Harmony.dll')) {
     [Reflection.Assembly]::Load([IO.File]::ReadAllBytes((Join-Path (Split-Path -Parent $pluginPath) $name))) | Out-Null
 }
-[Reflection.Assembly]::LoadFrom((Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll')) | Out-Null
+[Reflection.Assembly]::Load([IO.File]::ReadAllBytes((Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll'))) | Out-Null
 Add-Type -ReferencedAssemblies @((Join-Path $managedRoot 'assembly_valheim.dll'),
     (Join-Path $managedRoot 'assembly_utils.dll'), (Join-Path $managedRoot 'com.rlabrecque.steamworks.net.dll')) -TypeDefinition @'
 using System;

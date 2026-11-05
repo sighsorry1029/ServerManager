@@ -32,6 +32,7 @@ internal sealed class ServerScheduleSettings
 # Keep Upgrade World changes in their own jobs (only save may accompany them; see README).
 timezone: local
 interval: 10
+# These flags control BepInEx console messages only; audit files use log.yml.
 logJobs: false
 logSkipped: true
 jobs: []
@@ -39,10 +40,9 @@ jobs: []
 # jobs:
 #   - command: 'announce Good morning!'
 #     schedule: '0 9 * * *'
-# Optional per job: chance: 1, useGameTime: false, log: false,
-# Omitted log inherits logJobs (default false); controls success console messages.
-# With log: false, center-broadcast-only jobs also omit successful audit-file entries.
-# Failures, skipped jobs and other commands stay audited. Discord reports are independent.
+# Optional per job: chance: 1, useGameTime: false,
+# Configure cron.failed / cron.executed audit-file events in log.yml, not per job.
+# API and Discord events are independent of audit-file and console preferences.
 # globalKeys: '', bannedGlobalKeys: ''. Keys are comma-separated strings.
 # allowClientHide: false by default. Set true only for jobs with broadcast center messages.
 # Only those center messages may be hidden by each client's optional-broadcast setting.
@@ -66,13 +66,15 @@ jobs: []
 
     public TimeZoneInfo TimeZone { get; }
     public double IntervalSeconds { get; }
+    public bool LogJobs { get; }
     public bool LogSkipped { get; }
     public IReadOnlyList<ServerScheduleJob> Jobs { get; }
 
-    private ServerScheduleSettings(TimeZoneInfo timeZone, double intervalSeconds, bool logSkipped, List<ServerScheduleJob> jobs)
+    private ServerScheduleSettings(TimeZoneInfo timeZone, double intervalSeconds, bool logJobs, bool logSkipped, List<ServerScheduleJob> jobs)
     {
         TimeZone = timeZone;
         IntervalSeconds = intervalSeconds;
+        LogJobs = logJobs;
         LogSkipped = logSkipped;
         Jobs = jobs.AsReadOnly();
     }
@@ -126,6 +128,8 @@ jobs: []
             {
                 Dictionary<string, YamlNode> job = Map(entry, "command", "commands", "schedule", "chance",
                     "useGameTime", "log", "globalKeys", "bannedGlobalKeys", "allowClientHide");
+                if (job.ContainsKey("log"))
+                    throw Invalid("per-job log is no longer supported; remove it and configure cron audit-file events in log.yml (root logJobs/logSkipped control BepInEx console messages only)");
                 string[] cronFields = Text(Required(job, "schedule"), 256, true)
                     .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
                 string cron = string.Join(" ", cronFields);
@@ -169,10 +173,10 @@ jobs: []
                 string id = CreateId(cron, commands, chance, gameTime, gameTime ? "UTC" : timeZone.Id, requiredKeys, bannedKeys);
                 if (!ids.Add(id)) throw Invalid("identical job definitions are not supported");
                 jobs.Add(new ServerScheduleJob(id, cron, expression, commands,
-                    chance, gameTime, requiredKeys, bannedKeys, maintenance, Boolean(job, "log", logJobs), allowClientHide));
+                    chance, gameTime, requiredKeys, bannedKeys, maintenance, allowClientHide));
             }
         }
-        return new ServerScheduleSettings(timeZone, interval, logSkipped, jobs);
+        return new ServerScheduleSettings(timeZone, interval, logJobs, logSkipped, jobs);
     }
 
     private static YamlNode Required(Dictionary<string, YamlNode> map, string key) =>
@@ -423,19 +427,17 @@ internal sealed class ServerScheduleJob
     public bool UseGameTime { get; }
     public bool CatchUp => Maintenance;
     public bool Maintenance { get; }
-    public bool Log { get; }
     public bool AllowClientHide { get; }
     public IReadOnlyList<string> GlobalKeys { get; }
     public IReadOnlyList<string> BannedGlobalKeys { get; }
 
     internal ServerScheduleJob(string id, string cron, CronExpression expression, List<string> commands,
         double chance, bool gameTime, List<string> globalKeys, List<string> bannedGlobalKeys,
-        bool maintenance = false, bool log = false, bool allowClientHide = false)
+        bool maintenance = false, bool allowClientHide = false)
     {
         Id = id; Cron = cron; Expression = expression; Commands = commands.AsReadOnly();
         Chance = chance; UseGameTime = gameTime;
         Maintenance = maintenance;
-        Log = log;
         AllowClientHide = allowClientHide;
         GlobalKeys = globalKeys.AsReadOnly(); BannedGlobalKeys = bannedGlobalKeys.AsReadOnly();
     }
@@ -489,7 +491,7 @@ internal sealed class ServerScheduleEngine
             if (_states.TryGetValue(job.Id, out State state) && job.SameAs(state.Job) &&
                 zone.Id == state.Zone.Id && zone.HasSameRules(state.Zone))
             {
-                // Logging/display preferences are not execution identity. Publish them while
+                // Display preferences are not execution identity. Publish them while
                 // retaining the existing due boundary and any active claim.
                 state.Job = job;
                 next.Add(job.Id, state);

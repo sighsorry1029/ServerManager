@@ -529,9 +529,11 @@ $partialMetadata.Add('cron_partial_changes', 'persisted')
 $partialMetadata.Add('cron_save_result', 'checkpoint_completed')
 $partialMetadata.Add('path', 'DO_NOT_PUBLISH_PARTIAL_SAVE_PATH')
 $partialAudit = [Collections.Generic.Dictionary[string,string]]::new()
+$partialAudit.Add('success', 'false')
 $partialAudit.Add('message', 'cron maintenance; result_code=cron_needs_review; success=false')
 $auditFields.Invoke($null, @('maintenance', $partialMetadata, $partialAudit)) | Out-Null
-Assert-True ($partialAudit.Count -eq 4 -and $partialAudit['message'].Contains('success=false') -and
+Assert-True ($partialAudit.Count -eq 5 -and $partialAudit['success'] -ceq 'false' -and
+    $partialAudit['message'].Contains('success=false') -and
     $partialAudit['message'].Contains('cron_partial_changes=persisted') -and
     $partialAudit['message'].Contains('cron_save_result=checkpoint_completed') -and
     -not (($partialAudit.Values -join '|').Contains('DO_NOT_PUBLISH'))) `
@@ -539,12 +541,96 @@ Assert-True ($partialAudit.Count -eq 4 -and $partialAudit['message'].Contains('s
 $partialMetadata['cron_partial_changes'] = 'anything'
 $partialMetadata['cron_save_result'] = "save failed`nsecret"
 $partialAudit.Clear()
+$partialAudit.Add('success', 'false')
 $auditFields.Invoke($null, @('maintenance', $partialMetadata, $partialAudit)) | Out-Null
-Assert-True ($partialAudit.Count -eq 1 -and $partialAudit['cron_failure_code'] -ceq 'uw_partial_failure') `
+Assert-True ($partialAudit.Count -eq 2 -and $partialAudit['cron_failure_code'] -ceq 'uw_partial_failure') `
     'Malformed persistence state and non-token save result cannot enter audit.'
 $partialAudit.Clear()
+$partialAudit.Add('success', 'false')
+$partialMetadata['cron_partial_changes'] = 'persisted'
+$partialMetadata['cron_save_result'] = 'checkpoint_completed'
 $auditFields.Invoke($null, @('schedule', $partialMetadata, $partialAudit)) | Out-Null
-Assert-True ($partialAudit.Count -eq 0) 'Ordinary scheduled commands cannot acquire partial-maintenance result fields.'
+Assert-True ($partialAudit.Count -eq 2 -and $partialAudit['cron_failure_code'] -ceq 'uw_partial_failure' -and
+    -not $partialAudit.ContainsKey('cron_partial_changes') -and -not $partialAudit.ContainsKey('cron_save_result')) `
+    'Ordinary scheduled failures retain a safe cause but cannot acquire maintenance-only persistence fields.'
+
+# Failed final cron records retain one bounded cause and the step verb, never
+# a raw command line, its arguments, or arbitrary result data.
+$failureMetadata = [Collections.Generic.Dictionary[string,string]]::new()
+foreach ($pair in @{
+    cron_command_count = '3'; cron_step = '2'; cron_step_verb = 'save'; cron_failure_code = 'checkpoint_failed'
+    cron_partial_changes = 'persisted'; cron_save_result = 'checkpoint_completed'
+    cron_step_arguments = 'CRON_ARGUMENT_SECRET'; command = 'CRON_COMMAND_SECRET'; payload = 'CRON_PAYLOAD_SECRET'
+    success = 'false'; message = 'CRON_OUTPUT_SECRET'
+}.GetEnumerator()) { $failureMetadata.Add($pair.Key, $pair.Value) }
+$failureAudit = [Collections.Generic.Dictionary[string,string]]::new()
+foreach ($action in @('schedule', 'maintenance')) {
+    $failureAudit.Clear()
+    $failureAudit.Add('success', 'false')
+    $failureAudit.Add('message', 'cron final; success=false')
+    $auditFields.Invoke($null, @($action, $failureMetadata, $failureAudit)) | Out-Null
+    Assert-True ($failureAudit.Count -eq 6 -and $failureAudit['cron_failure_code'] -ceq 'checkpoint_failed' -and
+        $failureAudit['cron_step'] -ceq '2' -and $failureAudit['cron_step_verb'] -ceq 'save' -and
+        $failureAudit['message'].Contains('; step=2/3; step_command=save') -and
+        $failureAudit['message'].Contains('cron_failure_code=checkpoint_failed') -and
+        -not $failureAudit.ContainsKey('cron_partial_changes') -and -not $failureAudit.ContainsKey('cron_save_result') -and
+        -not (($failureAudit.Values -join '|').Contains('SECRET'))) `
+        "Failed $action audit must retain safe cause/step in structured and text output without raw arguments or partial-maintenance extras."
+}
+foreach ($success in @('true', 'False', '')) {
+    $failureAudit.Clear()
+    if ($success.Length -gt 0) { $failureAudit.Add('success', $success) }
+    $failureAudit.Add('message', 'cron final')
+    $auditFields.Invoke($null, @('maintenance', $failureMetadata, $failureAudit)) | Out-Null
+    Assert-True (-not $failureAudit.ContainsKey('cron_failure_code') -and
+        -not $failureAudit.ContainsKey('cron_step') -and -not $failureAudit.ContainsKey('cron_step_verb') -and
+        -not $failureAudit.ContainsKey('cron_partial_changes') -and -not $failureAudit.ContainsKey('cron_save_result') -and
+        $failureAudit['message'] -ceq 'cron final') `
+        'Successful, noncanonical, or missing final outcomes must not acquire failure-only fields from service result data.'
+}
+foreach ($invalidCode in @('', ' ', 'bad failure', "bad`ncode", ('a' * 65))) {
+    $failureAudit.Clear()
+    $failureAudit.Add('success', 'false')
+    $failureAudit.Add('message', 'cron final')
+    $failureMetadata['cron_failure_code'] = $invalidCode
+    $auditFields.Invoke($null, @('schedule', $failureMetadata, $failureAudit)) | Out-Null
+    Assert-True (-not $failureAudit.ContainsKey('cron_failure_code') -and
+        -not $failureAudit['message'].Contains('cron_failure_code=')) `
+        'Malformed or overlong cron failure codes must be omitted, not sanitized into a different cause.'
+}
+$failureMetadata['cron_failure_code'] = 'a' * 64
+$failureMetadata['cron_step_verb'] = 'v' * 64
+$failureMetadata['cron_command_count'] = '16'
+$failureMetadata['cron_step'] = '16'
+$failureAudit.Clear()
+$failureAudit.Add('success', 'false')
+$failureAudit.Add('message', 'cron final')
+$auditFields.Invoke($null, @('schedule', $failureMetadata, $failureAudit)) | Out-Null
+Assert-True ($failureAudit['cron_failure_code'].Length -eq 64 -and $failureAudit['cron_step_verb'].Length -eq 64 -and
+    $failureAudit['cron_step'] -ceq '16' -and $failureAudit['message'].Contains('step=16/16')) `
+    'Canonical failure tokens and cron steps must accept their documented upper bounds.'
+$failureMetadata['cron_command_count'] = '3'
+foreach ($invalidStep in @('0', '4', '17', '02', '-1', '1.0', '2147483648')) {
+    $failureMetadata['cron_step'] = $invalidStep
+    $failureAudit.Clear()
+    $failureAudit.Add('success', 'false')
+    $failureAudit.Add('message', 'cron final')
+    $auditFields.Invoke($null, @('schedule', $failureMetadata, $failureAudit)) | Out-Null
+    Assert-True (-not $failureAudit.ContainsKey('cron_step') -and -not $failureAudit.ContainsKey('cron_step_verb') -and
+        -not $failureAudit['message'].Contains('step=')) `
+        'Cron step and step verb require a canonical step within the validated command count.'
+}
+$failureMetadata['cron_step'] = '2'
+foreach ($invalidVerb in @('', 'save arg', "save`nsecret", ('v' * 65))) {
+    $failureMetadata['cron_step_verb'] = $invalidVerb
+    $failureAudit.Clear()
+    $failureAudit.Add('success', 'false')
+    $failureAudit.Add('message', 'cron final')
+    $auditFields.Invoke($null, @('schedule', $failureMetadata, $failureAudit)) | Out-Null
+    Assert-True ($failureAudit['cron_step'] -ceq '2' -and -not $failureAudit.ContainsKey('cron_step_verb') -and
+        -not $failureAudit['message'].Contains('step_command=')) `
+        'Cron step verbs must be bounded exact tokens; arguments must not be sanitized into an audit verb.'
+}
 $metadata['backup_id'] = '0123456789ABCDEF0123456789ABCDEF'
 $metadata['previous_revision'] = '-1'
 $metadata['restored_revision'] = '9223372036854775808'

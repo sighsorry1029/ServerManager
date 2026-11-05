@@ -111,7 +111,7 @@ foreach ($name in @('BepInEx.dll', '0Harmony.dll')) {
 $gameAssembly = [Reflection.Assembly]::LoadFrom(
     (Join-Path $managedRoot 'assembly_valheim.dll'))
 $assembly = [Reflection.Assembly]::LoadFrom($pluginPath)
-[Reflection.Assembly]::LoadFrom($cecilPath) | Out-Null
+[Reflection.Assembly]::Load([IO.File]::ReadAllBytes($cecilPath)) | Out-Null
 $resolver = [Mono.Cecil.DefaultAssemblyResolver]::new()
 $resolver.AddSearchDirectory((Split-Path -Parent $pluginPath))
 $resolver.AddSearchDirectory((Join-Path $GamePath 'BepInEx\core'))
@@ -329,6 +329,14 @@ $handler = [Delegate]::CreateDelegate($publishedEvent.EventHandlerType,
 $writerStarted = $false
 $dispatcherStarted = $false
 $subscribed = $false
+$logSettingsType = $assembly.GetType('ServerManager.LogSettings', $true)
+$logRuntimeType = $assembly.GetType('ServerManager.LogSettingsRuntime', $true)
+$logPolicyField = @($logRuntimeType.GetFields($staticFlags) | Where-Object FieldType -eq $logSettingsType)[0]
+$parseLogs = $logSettingsType.GetMethod('Parse', [Reflection.BindingFlags]'Static,Public,NonPublic')
+$originalLogPolicy = $logPolicyField.GetValue($null)
+function Set-LogPolicy([string]$Yaml) {
+    $logPolicyField.SetValue($null, $parseLogs.Invoke($null, [object[]]@($Yaml)))
+}
 try {
     [string]$routingRoot = Join-Path $testRoot 'routing'
     [IO.Directory]::CreateDirectory($routingRoot) | Out-Null
@@ -499,12 +507,13 @@ try {
     $apiType.GetMethod('StartDispatcher', $staticFlags).Invoke($null, $null)
     $dispatcherStarted = $true
     $publish = $runtimeType.GetMethod('Publish', $staticFlags)
+    Set-LogPolicy "audit: []`nchat: [chat.shout]"
     foreach ($kind in @('chat.normal', 'chat.whisper', 'chat.clan',
         'chat.shout', 'server.started')) {
         $fields = [Collections.Generic.Dictionary[string, string]]::new()
         $fields.Add('message', "central $kind")
         $null = $publish.Invoke($null, [object[]]@(
-            $kind, 'client_reported', $actor, $null, $fields, [DateTime]::UtcNow, $false))
+            $kind, 'client_reported', $actor, $null, $fields, [DateTime]::UtcNow))
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     while ($collector.Kinds.Count -lt 2 -and [DateTime]::UtcNow -lt $deadline) {
@@ -519,19 +528,19 @@ try {
         $delivered -contains 'chat.shout' -and $delivered -contains 'server.started') `
         'Private/local chat leaked to EventPublished, or public events stopped flowing.'
     $liveChatLines = [IO.File]::ReadAllLines((Join-Path $liveRoot 'logs\events-chat.log'))
-    Assert-True ($liveChatLines.Length -eq 4) `
-        'The command-only audit flag suppressed unrelated chat channels.'
-    Assert-True ([IO.File]::ReadAllText((Join-Path $liveRoot 'logs\events-audit.log')).Contains('central server.started')) `
-        'The command-only audit flag suppressed an unrelated server event.'
+    Assert-True ($liveChatLines.Length -eq 1 -and $liveChatLines[0].Contains('central chat.shout')) `
+        'chat selectors did not affect only the selected file records.'
+    Assert-True (-not [IO.File]::Exists((Join-Path $liveRoot 'logs\events-audit.log'))) `
+        'audit: [] created an audit record or disturbed independent chat routing.'
+    Set-LogPolicy '{}'
 
     # Run the real file writer, public dispatcher and Discord summary router.
     # The Discord session has no worker, Gateway or HTTP calls: inspect its queue.
     $recordCommand = $runtimeType.GetMethod('RecordCommand', $staticFlags)
     $commandParameters = $recordCommand.GetParameters()
-    Assert-True ($commandParameters.Length -eq 9 -and $commandParameters[8].IsOptional -and
-        $commandParameters[8].DefaultValue -eq $true -and
-        $publish.GetParameters().Length -eq 7 -and $publish.GetParameters()[6].DefaultValue -eq $true) `
-        'Command/publication audit defaults no longer preserve existing callers.'
+    Assert-True ($commandParameters.Length -eq 8 -and $commandParameters[7].IsOptional -and
+        $publish.GetParameters().Length -eq 6) `
+        'Obsolete per-command audit flags remain in the publication contract.'
     $commandFlags = @{}
     foreach ($name in @('_serverStarted', '_shutdownStarted')) {
         $field = $runtimeType.GetField($name, $staticFlags)
@@ -561,22 +570,43 @@ try {
     $commandHandler = [Delegate]::CreateDelegate($publishedEvent.EventHandlerType,
         $commandCollector, $commandCollector.GetType().GetMethod('OnEvent'))
     [string]$commandRoot = Join-Path $testRoot 'command-audit'
-    # id, source, action, success, requested file policy, expected file, expected webhook, optional result.
+    # id, source, action, success, file policy, expected file/webhook, optional result/data.
     $commandCases = @(
-        @('quiet-broadcast', 'cron', 'broadcast', $true, $false, $false, $false),
-        @('quiet-summary', 'cron', 'schedule', $true, $false, $false, $true),
-        @('default-broadcast', 'cron', 'broadcast', $true, [Type]::Missing, $true, $false),
-        @('explicit-broadcast', 'cron', 'broadcast', $true, $true, $true, $false),
-        @('failed-broadcast', 'cron', 'broadcast', $false, $false, $true, $false),
-        @('failed-summary', 'cron', 'schedule', $false, $false, $true, $true),
-        @('cancelled-summary', 'cron', 'schedule', $false, $false, $true, $true, 'cron_cancelled'),
-        @('manual-broadcast', 'ingame', 'broadcast', $true, $false, $true, $true),
-        @('discord-broadcast', 'discord', 'broadcast', $true, $false, $true, $true),
-        @('cron-maintenance', 'cron', 'maintenance', $true, $false, $true, $true),
-        @('cron-save', 'cron', 'save', $true, $false, $true, $false),
-        @('cron-ban', 'cron', 'ban', $true, $false, $true, $false),
-        @('cron-restore', 'cron', 'characterrestore', $true, $false, $true, $false),
-        @('source-case', 'Cron', 'broadcast', $true, $false, $true, $true)
+        @('quiet-broadcast', 'cron', 'broadcast', $true, '{}', $false, $false),
+        @('quiet-summary', 'cron', 'schedule', $true, '{}', $false, $true),
+        @('allow-final', 'cron', 'schedule', $true, 'audit: [cron.executed]', $true, $true),
+        @('allow-no-intermediate', 'cron', 'broadcast', $true, 'audit: [cron.executed]', $false, $false),
+        @('raw-schedule', 'cron', 'schedule', $true, 'audit: [cron.executed]', $false, $true, 'rcon_dispatched',
+            @{ cron_final = 'false' }),
+        @('raw-maintenance', 'cron', 'maintenance', $false, '{}', $false, $true, 'rcon_failed',
+            @{ cron_final = 'false' }),
+        @('failed-broadcast', 'cron', 'broadcast', $false, '{}', $false, $false),
+        @('failed-summary', 'cron', 'schedule', $false, '{}', $true, $true),
+        @('cancelled-summary', 'cron', 'schedule', $false, '{}', $true, $true, 'cron_cancelled'),
+        @('manual-broadcast', 'ingame', 'broadcast', $true, '{}', $true, $true),
+        @('discord-broadcast', 'discord', 'broadcast', $true, '{}', $true, $true),
+        @('cron-maintenance', 'cron', 'maintenance', $true, '{}', $false, $true),
+        @('failed-maintenance', 'cron', 'maintenance', $false, '{}', $true, $true),
+        @('cron-save', 'cron', 'save', $true, '{}', $false, $false),
+        @('cron-ban', 'cron', 'ban', $true, '{}', $false, $false),
+        @('cron-restore', 'cron', 'characterrestore', $true, '{}', $false, $false),
+        @('no-manual', 'ingame', 'broadcast', $true, 'audit: []', $false, $true),
+        @('no-failure', 'cron', 'schedule', $false, 'audit: []', $false, $true),
+        @('no-duplicates', 'cron', 'schedule', $false, 'audit: [cron.executed, cron.failed]', $true, $true),
+        @('failed-uw-step', 'cron', 'maintenance', $false, '{}', $true, $true, 'cron_needs_review',
+            @{ cron_command_count = '3'; cron_step = '2'; cron_step_verb = 'zones_reset';
+               cron_failure_code = 'uw_partial_failure'; cron_partial_changes = 'not_confirmed';
+               payload = 'PRIVATE_CRON_ARGUMENTS' }),
+        @('failed-save-step', 'cron', 'maintenance', $false, '{}', $true, $true, 'cron_needs_review',
+            @{ cron_command_count = '3'; cron_step = '1'; cron_step_verb = 'save';
+               cron_failure_code = 'checkpoint_partial'; payload = 'PRIVATE_CRON_ARGUMENTS' }),
+        @('malformed-step', 'cron', 'maintenance', $false, '{}', $true, $true, 'cron_needs_review',
+            @{ cron_command_count = '3'; cron_step = '04'; cron_step_verb = 'save private';
+               cron_failure_code = "bad cause`nprivate" }),
+        @('successful-step', 'cron', 'maintenance', $true, 'audit: [cron.executed]', $true, $true, 'cron_completed',
+            @{ cron_command_count = '3'; cron_step = '1'; cron_step_verb = 'save';
+               cron_failure_code = 'checkpoint_partial' }),
+        @('source-case', 'Cron', 'broadcast', $true, '{}', $true, $true)
     )
     try {
         $runtimeType.GetField('_serverStarted', $staticFlags).SetValue($null, $true)
@@ -588,10 +618,20 @@ try {
         $apiType.GetMethod('StartDispatcher', $staticFlags).Invoke($null, $null)
         $dispatcherStarted = $true
         foreach ($case in $commandCases) {
+            Set-LogPolicy $case[4]
             $beforeWebhooks = $commandWebhookQueue.Count
             [string]$result = if ($case.Length -gt 7) { $case[7] } elseif ($case[3]) { 'cron_completed' } else { 'test_failed' }
+            $data = $null
+            if ($case.Length -gt 8) {
+                $data = [Collections.Generic.Dictionary[string,string]]::new()
+                foreach ($pair in $case[8].GetEnumerator()) { $data.Add($pair.Key, $pair.Value) }
+            }
+            if ($case[1] -ceq 'cron' -and $case[2] -in @('schedule', 'maintenance')) {
+                if ($null -eq $data) { $data = [Collections.Generic.Dictionary[string,string]]::new() }
+                if (-not $data.ContainsKey('cron_final')) { $data.Add('cron_final', 'true') }
+            }
             $recordCommand.Invoke($null, [object[]]@(
-                $case[1], $case[0], $case[0], $case[2], '', $result, $case[3], $null, $case[4])) | Out-Null
+                $case[1], $case[0], $case[0], $case[2], '', $result, $case[3], $data)) | Out-Null
             Assert-True ($commandWebhookQueue.Count -eq $beforeWebhooks + [int][bool]$case[6]) `
                 "Local audit policy changed Discord delivery for $($case[0])."
         }
@@ -608,13 +648,27 @@ try {
         foreach ($case in $commandCases) {
             $matchingLines = @($commandLines | Where-Object { $_.Contains("actor_id=$($case[0]);") })
             Assert-True ($matchingLines.Count -eq [int][bool]$case[5]) `
-                "File audit suppression failed its fail-safe boundary for $($case[0])."
+                "File audit selection failed for $($case[0])."
             $publicEvent = @($publicCommands | Where-Object { $_.Actor.Id -ceq $case[0] })
             Assert-True ($publicEvent.Count -eq 1 -and $publicEvent[0].Kind -eq 'command.executed' -and
                 $publicEvent[0].Fields['source'] -ceq $case[1] -and
                 $publicEvent[0].Fields['command'] -ceq $case[2] -and
                 $publicEvent[0].Fields['success'] -eq ([bool]$case[3]).ToString().ToLowerInvariant()) `
                 "File audit policy changed public command facts for $($case[0])."
+            if ($case[0] -in @('failed-uw-step', 'failed-save-step')) {
+                Assert-True ($matchingLines[0].Contains('result_code=cron_needs_review; success=false') -and
+                    $matchingLines[0].Contains('step=' + $case[8].cron_step + '/3') -and
+                    $matchingLines[0].Contains('step_command=' + $case[8].cron_step_verb) -and
+                    $matchingLines[0].Contains('cron_failure_code=' + $case[8].cron_failure_code) -and
+                    -not $matchingLines[0].Contains('PRIVATE_CRON_ARGUMENTS')) `
+                    'The final-only audit lost its failed step/cause or leaked raw command arguments.'
+            }
+            if ($case[0] -in @('malformed-step', 'successful-step')) {
+                Assert-True (-not $publicEvent[0].Fields.ContainsKey('cron_step') -and
+                    -not $publicEvent[0].Fields.ContainsKey('cron_step_verb') -and
+                    -not $publicEvent[0].Fields.ContainsKey('cron_failure_code')) `
+                    'Invalid or inapplicable failure metadata entered the final audit.'
+            }
         }
     }
     finally {
@@ -635,6 +689,7 @@ try {
     }
 }
 finally {
+    $logPolicyField.SetValue($null, $originalLogPolicy)
     if ($dispatcherStarted) {
         $apiType.GetMethod('StopDispatcher', $staticFlags).Invoke($null, $null)
     }

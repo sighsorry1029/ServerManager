@@ -55,20 +55,18 @@ internal static class ServerScheduleHarness
         Check(ServerScheduleSettings.FileName == "cron.yml" && ServerScheduleSettings.AlternateFileName == "cron.yaml", "Canonical and alternate settings filenames");
         Check(ServerScheduleSettings.Parse(ServerScheduleSettings.DefaultYaml).Jobs.Count == 0, "Default disables jobs");
         ServerScheduleSettings empty = ServerScheduleSettings.Parse("{}");
-        Check(empty.Jobs.Count == 0 && empty.IntervalSeconds == 10 && empty.LogSkipped, "Root defaults");
+        Check(empty.Jobs.Count == 0 && empty.IntervalSeconds == 10 && !empty.LogJobs && empty.LogSkipped, "Root defaults");
         Check(empty.TimeZone.Id == TimeZoneInfo.Local.Id, "Omitted zone uses local");
         ServerScheduleJob job = Config().Jobs.Single();
-        Check(job.Id.StartsWith("save-", StringComparison.Ordinal) && job.Id.Length <= 64 && !job.Log && job.Commands.Single() == "save" && job.Enabled && job.Chance == 1 &&
+        Check(job.Id.StartsWith("save-", StringComparison.Ordinal) && job.Id.Length <= 64 && job.Commands.Single() == "save" && job.Enabled && job.Chance == 1 &&
             !job.UseGameTime && !job.AllowClientHide && job.GlobalKeys.Count == 0 && job.BannedGlobalKeys.Count == 0, "Defaults");
-        job = Config(extra: "    log: false\n    chance: 0.25\n    useGameTime: true\n    globalKeys: 'b, a, a'\n    bannedGlobalKeys: c\n").Jobs.Single();
-        Check(job.Enabled && !job.Log && job.Chance == .25 && job.UseGameTime && job.GlobalKeys.SequenceEqual(new[] { "a", "b" }) &&
+        job = Config(extra: "    chance: 0.25\n    useGameTime: true\n    globalKeys: 'b, a, a'\n    bannedGlobalKeys: c\n").Jobs.Single();
+        Check(job.Enabled && job.Chance == .25 && job.UseGameTime && job.GlobalKeys.SequenceEqual(new[] { "a", "b" }) &&
             job.BannedGlobalKeys.Single() == "c", "Optional fields and canonical key sets");
         Check(Config(extra: "    globalKeys: ''\n    bannedGlobalKeys: ', , '\n").Jobs.Single().GlobalKeys.Count == 0,
             "Empty key strings are supported");
         ServerScheduleSettings logging = ServerScheduleSettings.Parse("interval: 1.5\nlogJobs: false\nlogSkipped: false\ndiscordConnector: false\nzone: []\njoin: []\njobs:\n" + Job());
-        Check(logging.IntervalSeconds == 1.5 && !logging.LogSkipped && !logging.Jobs.Single().Log, "Root interval/logging and empty unsupported hooks");
-        Check(ServerScheduleSettings.Parse("logJobs: false\njobs:\n" + Job(extra: "    log: true\n")).Jobs.Single().Log,
-            "Per-job logging overrides root default");
+        Check(logging.IntervalSeconds == 1.5 && !logging.LogSkipped && !logging.LogJobs, "Root interval/console logging and empty unsupported hooks");
         Check(ServerScheduleSettings.Parse("interval: 1").IntervalSeconds == 1 && ServerScheduleSettings.Parse("interval: 3600").IntervalSeconds == 3600,
             "Interval inclusive bounds");
         job = ServerScheduleSettings.Parse("jobs: [{schedule: '* * * * *', command: 'quit', commands: [save, 'announce ready']}]").Jobs.Single();
@@ -149,25 +147,37 @@ internal static class ServerScheduleHarness
     {
         string defaults = ServerScheduleSettings.DefaultYaml.Replace("\r\n", "\n");
         Check(defaults.Contains("\nlogJobs: false\n") && defaults.Contains("\nlogSkipped: true\n"),
-            "New schedules default job logging off while retaining skipped-event policy");
+            "New schedules default console job logging off while retaining the skipped-console policy");
+        Check(defaults.Contains("BepInEx console messages only") && defaults.Contains("log.yml") &&
+            !defaults.Contains("log: false") && !defaults.Contains("Omitted log inherits"),
+            "Generated cron comments direct audit selection to log.yml without legacy per-job logging examples");
         ServerScheduleSettings baseline = Config();
         ServerScheduleJob original = baseline.Jobs.Single();
         foreach (bool? rootLog in new bool?[] { null, false, true })
-        foreach (bool? jobLog in new bool?[] { null, false, true })
         {
             string root = rootLog.HasValue ? "logJobs: " + rootLog.Value.ToString().ToLowerInvariant() + "\n" : "";
-            string extra = jobLog.HasValue ? "    log: " + jobLog.Value.ToString().ToLowerInvariant() + "\n" : "";
-            ServerScheduleSettings settings = ServerScheduleSettings.Parse(root + "timezone: UTC\njobs:\n" + Job(extra: extra));
+            ServerScheduleSettings settings = ServerScheduleSettings.Parse(root + "timezone: UTC\njobs:\n" + Job());
             ServerScheduleJob actual = settings.Jobs.Single();
-            Check(actual.Log == (jobLog ?? rootLog ?? false) && settings.LogSkipped,
-                "Per-job logging overrides root logging; both omitted mean false; logSkipped remains true");
+            Check(settings.LogJobs == (rootLog ?? false) && settings.LogSkipped,
+                "Root console logging defaults to false; logSkipped remains true");
             Check(actual.Id == original.Id && actual.SameAs(original) &&
                 ServerScheduleJournal.Fingerprint(settings, actual) == ServerScheduleJournal.Fingerprint(baseline, original),
-                "Logging hierarchy never changes job identity or journal fingerprint");
+                "Root console logging never changes job identity or journal fingerprint");
         }
-        ServerScheduleJob constructed = new(original.Id, original.Cron, original.Expression, original.Commands.ToList(),
-            original.Chance, original.UseGameTime, original.GlobalKeys.ToList(), original.BannedGlobalKeys.ToList());
-        Check(!constructed.Log, "Direct model construction uses the same default-off logging policy");
+        foreach (string removedLog in new[] { "false", "true", "null", "{}" })
+        {
+            try
+            {
+                Config(extra: "    log: " + removedLog + "\n");
+                throw new Exception("Removed per-job log field was accepted");
+            }
+            catch (InvalidDataException exception)
+            {
+                Check(exception.Message.Contains("per-job log") && exception.Message.Contains("log.yml") &&
+                    exception.Message.Contains("BepInEx console"), "Per-job log rejection explains the central audit and root console settings");
+            }
+        }
+        Check(typeof(ServerScheduleJob).GetProperty("Log") == null, "Jobs no longer contain a per-job logging property");
     }
 
     private static void OptionalCenterBroadcasts()
@@ -221,8 +231,8 @@ internal static class ServerScheduleHarness
     private static void Identity()
     {
         ServerScheduleJob original = Config(extra: "    globalKeys: 'a,b'\n    bannedGlobalKeys: c\n").Jobs.Single();
-        ServerScheduleJob normalized = Config("  */10  * * * * *  ", "    globalKeys: ' b, a, a '\n    bannedGlobalKeys: ' c '\n    log: false\n").Jobs.Single();
-        Check(original.Id == normalized.Id && original.SameAs(normalized), "Whitespace/key ordering/logging do not change execution identity");
+        ServerScheduleJob normalized = Config("  */10  * * * * *  ", "    globalKeys: ' b, a, a '\n    bannedGlobalKeys: ' c '\n").Jobs.Single();
+        Check(original.Id == normalized.Id && original.SameAs(normalized), "Whitespace/key ordering do not change execution identity");
         Check(Config("*/10\t* * * * *").Jobs.Single().Id == Config().Jobs.Single().Id, "Schedule tabs normalize to spaces");
         Check(Config(extra: "    chance: -0\n").Jobs.Single().Id == Config(extra: "    chance: 0\n").Jobs.Single().Id,
             "Equivalent numeric zero has stable identity");
@@ -239,7 +249,7 @@ internal static class ServerScheduleHarness
         Check(Config("*/20 * * * * *").Jobs.Single().Id != Config().Jobs.Single().Id, "Schedule changes identity");
         Check(ServerScheduleSettings.Parse("timezone: UTC\njobs:\n" + Job("announce save")).Jobs.Single().Id != Config().Jobs.Single().Id,
             "Command changes identity");
-        Bad("jobs:\n" + Job(extra: "    globalKeys: 'a,b'\n") + Job(extra: "    globalKeys: 'b,a,a'\n    log: false\n"));
+        Bad("jobs:\n" + Job(extra: "    globalKeys: 'a,b'\n") + Job(extra: "    globalKeys: 'b,a,a'\n"));
         Bad("jobs:\n" + Job() + "  - schedule: '*/10  * * * * *'\n    commands: [save]\n");
         Check(ServerScheduleSettings.Parse("jobs:\n" + Job("한글")).Jobs.Single().Id.StartsWith("job-", StringComparison.Ordinal),
             "Non-ASCII command verbs still generate bounded ASCII identities");
@@ -426,17 +436,18 @@ internal static class ServerScheduleHarness
         engine.Apply(ServerScheduleSettings.Parse(b), Now.AddSeconds(10), Game);
         Check(engine.ClaimDue(Now.AddSeconds(10), Game).Count == 2, "Reordering uses stable IDs, not index");
         engine.Reset();
-        ServerScheduleSettings logged = Config(extra: "    log: true\n"), quiet = Config(extra: "    log: false\n");
+        ServerScheduleSettings logged = ServerScheduleSettings.Parse("logJobs: true\ntimezone: UTC\njobs:\n" + Job()), quiet = Config();
         engine.Apply(logged, Now, Game);
         engine.Apply(quiet, Now.AddSeconds(10), Game);
         ServerScheduleOccurrence changedLog = engine.ClaimDue(Now.AddSeconds(10), Game).Single();
-        Check(changedLog.OccurrenceUtc == Now.AddSeconds(10) && !changedLog.Job.Log && ReferenceEquals(changedLog.Job, quiet.Jobs.Single()),
-            "Logging-only reload publishes new logging without resetting due boundary");
+        Check(changedLog.OccurrenceUtc == Now.AddSeconds(10) && ReferenceEquals(changedLog.Job, quiet.Jobs.Single()),
+            "Root-console-only reload does not reset the due boundary");
         engine.Apply(logged, Now.AddSeconds(11), Game);
-        Check(!changedLog.Job.Log && engine.ClaimDue(Now.AddSeconds(20), Game).Count == 0,
-            "Logging-only reload retains active claims and captured occurrence definition");
+        Check(ReferenceEquals(changedLog.Job, quiet.Jobs.Single()) && engine.ClaimDue(Now.AddSeconds(20), Game).Count == 0,
+            "Root-console-only reload retains active claims and captured occurrence definition");
         engine.Complete(changedLog);
-        Check(engine.ClaimDue(Now.AddSeconds(30), Game).Single().Job.Log, "New occurrences use the latest logging preference");
+        Check(ReferenceEquals(engine.ClaimDue(Now.AddSeconds(30), Game).Single().Job, logged.Jobs.Single()),
+            "New occurrences use the latest settings definition");
     }
 
     private static void Zones()

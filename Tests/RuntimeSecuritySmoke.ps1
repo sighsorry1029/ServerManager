@@ -3552,8 +3552,8 @@ $allStatic = [Reflection.BindingFlags]"Static,Public,NonPublic"
 $protocolWireVersion = $protocolCodecType.GetField(
     "WireVersion",
     [Reflection.BindingFlags]"Static,Public").GetRawConstantValue()
-Assert-True ($protocolWireVersion -eq 25) `
-    "The main protocol wire version was not bumped to 25 for bounded detector diagnostics."
+Assert-True ($protocolWireVersion -eq 26) `
+    "The main protocol wire version was not bumped to 26 for kind-aware plugin/patcher manifests."
 
 $limitsArguments = [object[]]::new(6)
 $limitsArguments[0] = 512 * 1024

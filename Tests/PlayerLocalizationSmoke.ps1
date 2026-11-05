@@ -128,7 +128,7 @@ try {
             $english[$menuGuideKey] -notmatch '\{[0-9]+\}' -and $korean[$menuGuideKey] -notmatch '\{[0-9]+\}') `
             ('The local menu guide is missing a zero-argument English/Korean message: ' + $menuGuideKey)
     }
-    $optionalKeys = @('title', 'note', 'loading', 'unavailable', 'unsupported', 'host_help', 'too_large', 'stale', 'empty', 'installed', 'version_unknown')
+    $optionalKeys = @('title', 'note', 'loading', 'unavailable', 'unsupported', 'host_help', 'too_large', 'stale', 'empty', 'installed', 'version_unknown', 'patcher')
     foreach ($suffix in $optionalKeys) {
         $key = 'sm_menu_optional_' + $suffix
         Assert-True ($english.ContainsKey($key) -and $korean.ContainsKey($key) -and
@@ -143,7 +143,7 @@ try {
     $catalogEntryType = $plugin.GetType('ServerManager.OptionalModCatalogEntry', $true)
     $emptyEntries = [Array]::CreateInstance($catalogEntryType, 0)
     $sampleEntries = [Array]::CreateInstance($catalogEntryType, 1)
-    $entryConstructor = $catalogEntryType.GetConstructors($allInstance) | Select-Object -First 1
+    $entryConstructor = $catalogEntryType.GetConstructors($allInstance) | Where-Object { $_.GetParameters().Count -eq 3 } | Select-Object -First 1
     $sampleEntries.SetValue($entryConstructor.Invoke([object[]]@('example.mod', 'Example Mod', [string[]]@('1.0.0', '2.0.0'))), 0)
     foreach ($stateName in @('Loading', 'Unavailable', 'Unsupported', 'TooLarge')) {
         $state = [Enum]::Parse($queryStateType, $stateName)
@@ -160,7 +160,7 @@ try {
         -not $emptyText.Contains((Localized 'English' 'sm_menu_optional_unavailable'))) `
         'An empty available catalog must not be represented as a failed request.'
     $loadedVersions = [Collections.Generic.Dictionary[string,Version]]::new([StringComparer]::Ordinal)
-    $loadedVersions.Add('example.mod', [Version]'1.0.0')
+    $loadedVersions.Add('0:example.mod', [Version]'1.0.0')
     $installedText = $formatOptional.Invoke($null, [object[]]@($availableState, $false, $sampleEntries, $loadedVersions))
     Assert-True (-not $installedText.Contains('Example Mod') -and
         $installedText.Contains((Localized 'English' 'sm_menu_optional_installed')) -and
@@ -185,10 +185,29 @@ try {
         Assert-True ([bool]$isLoaded.Invoke($null, [object[]]@($entry, $loadedVersions)) -eq $fixture.Expected) `
             ('Loaded preview filtering must use GUID and exact parsed version, not display name: ' + $fixture.Guid + '/' + ($fixture.Versions -join ','))
     }
-    $loadedVersions['example.mod'] = [Version]'9.0.0'
+    $loadedVersions['0:example.mod'] = [Version]'9.0.0'
     $wrongVersionText = $formatOptional.Invoke($null, [object[]]@($availableState, $false, $sampleEntries, $loadedVersions))
     Assert-True ($wrongVersionText.Contains('Example Mod') -and $wrongVersionText.Contains('1.0.0, 2.0.0')) `
         'A loaded but non-allowed version must remain visible.'
+    $kindType = $plugin.GetType('ServerManager.IntegrityModuleKind', $true)
+    $patcherKind = [Enum]::Parse($kindType, 'Patcher')
+    $kindConstructor = $catalogEntryType.GetConstructors($allInstance) | Where-Object { $_.GetParameters().Count -eq 4 } | Select-Object -First 1
+    $patcherId = 'a' * 64
+    $patcherEntry = $kindConstructor.Invoke([object[]]@($patcherId, 'Example Patcher', [string[]]@('1.0.0.0'), $patcherKind))
+    $patcherEntries = [Array]::CreateInstance($catalogEntryType, 1)
+    $patcherEntries.SetValue($patcherEntry, 0)
+    $patcherText = $formatOptional.Invoke($null, [object[]]@($availableState, $false, $patcherEntries, $null))
+    Assert-True ($patcherText.Contains('Example Patcher [' + (Localized 'English' 'sm_menu_optional_patcher') + ']')) `
+        'Optional patchers must be visibly distinguished from ordinary plugins.'
+    $loadedVersions['0:' + $patcherId] = [Version]'1.0.0.0'
+    Assert-True (-not [bool]$isLoaded.Invoke($null, [object[]]@($patcherEntry, $loadedVersions))) `
+        'A plugin with the same identifier must not hide a patcher preview row.'
+    $loadedVersions['1:' + $patcherId] = [Version]'1.0.0.0'
+    Assert-True ([bool]$isLoaded.Invoke($null, [object[]]@($patcherEntry, $loadedVersions))) `
+        'Installed patchers must match their own kind, stable identity and assembly version.'
+    $loadedVersions['1:' + $patcherId] = [Version]'2.0.0.0'
+    Assert-True (-not [bool]$isLoaded.Invoke($null, [object[]]@($patcherEntry, $loadedVersions))) `
+        'An installed patcher with a different assembly version must remain visible.'
     foreach ($key in $english.Keys) {
         Assert-True ($key -cmatch '^sm_[a-z0-9_]+$' -and $key.Length -le 64) 'An embedded message key is not a bounded namespaced token.'
         Assert-True (-not [string]::IsNullOrWhiteSpace($english[$key]) -and -not [string]::IsNullOrWhiteSpace($korean[$key])) 'An embedded translation is empty.'

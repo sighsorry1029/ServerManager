@@ -47,7 +47,7 @@ internal static class ServerScheduleRuntimeSmoke
     {
         try
         {
-            Lifecycle(); GuardsAndFiles(); AlternateConfiguration(); CanonicalJournalStartup(); RoutingAndBudget(); OptionalCenterBroadcasts(); CenterBroadcastAuditPolicy(); Gates(); PollingAndLogging(); Saves(); ReloadAndRetirement(); ReentrancyAndSuspension();
+            Lifecycle(); GuardsAndFiles(); AlternateConfiguration(); CanonicalJournalStartup(); RoutingAndBudget(); FinalResultMarker(); OptionalCenterBroadcasts(); CenterBroadcastAuditPolicy(); Gates(); PollingAndLogging(); Saves(); ReloadAndRetirement(); ReentrancyAndSuspension();
             DurableDispatchAndCatchup(); AutomaticUpgradeWorldPolicies(); UpgradeWorldOwnership(); UntrackedUpgrade(); CommandCapabilities(); SynchronousMutationAbort(); MaintenanceSequence(); MaintenanceFailureAndRecovery(); MaintenancePartialPersistence(); MaintenanceTimeoutDrain(); MaintenanceReload(); MaintenanceReviewBarrier(); MaintenanceAdmission();
             FreshWorldContract(); FreshWorldOrdering(); FreshWorldFailures(); FreshWorldTimeoutAndRecovery(); FreshWorldNativeSaveDrain(); FreshWorldBusyBounds(); FreshWorldAdmissionBounds();
             Console.WriteLine("ServerScheduleRuntimeSmoke: PASS (" + _checks +
@@ -295,9 +295,10 @@ internal static class ServerScheduleRuntimeSmoke
         Check(ServerEventRuntime.Audits.Count(a => a.Verb == "echo") == 1 &&
             ServerEventRuntime.Audits.All(a => a.Verb == "echo" || a.Verb == "schedule"), "Runtime audits raw command plus job outcome; common queue owns common command audits.");
         ServerEventRuntime.Audit cron = ServerEventRuntime.Audits.Single(a => a.Verb == "schedule");
-        Check(cron.Data["cron_schedule"] == "* * * * * *" && cron.Data["cron_command_count"] == "5" &&
+        Check(cron.Data["cron_final"] == "true" && cron.Data["cron_schedule"] == "* * * * * *" && cron.Data["cron_command_count"] == "5" &&
             cron.Data["cron_summary"] == "echo → announce: hello → status → ban → unban" &&
-            !cron.Data.ContainsKey("cron_verb"),
+            !cron.Data.ContainsKey("cron_verb") && !cron.Data.ContainsKey("cron_step") && !cron.Data.ContainsKey("cron_step_verb") &&
+            !cron.Data.ContainsKey("cron_failure_code"),
             "Final cron audit carries one bounded display summary while hiding non-announcement command arguments.");
         Check(Runs.Count == 0 && Claims == 0, "Successful command chain releases its occurrence claim.");
 
@@ -317,6 +318,24 @@ internal static class ServerScheduleRuntimeSmoke
         ServerConsoleExecutor.NextResult = new(false, "rcon_failed", "failed"); Due(); Tick(); Tick();
         Check(ServerConsoleExecutor.Lines.Count == 1 && Claims == 0 && ServerManagerPlugin.Log.Messages.Any(s => s.Contains("No automatic retry")),
             "Failure stops the chain and does not replay the failed occurrence.");
+        cron = ServerEventRuntime.Audits.Single(a => a.Verb == "schedule");
+        Check(cron.Data["cron_step"] == "1" && cron.Data["cron_step_verb"] == "echo" && cron.Data["cron_failure_code"] == "rcon_failed" &&
+            !string.Join(" ", cron.Data.Values).Contains("forbidden-tail"),
+            "Final failure audit carries a one-based safe command step without private command arguments.");
+
+        Activate(Config("echo first", "sm:status private-second-argument", "echo forbidden-tail"));
+        ServerCommands.NextTask = Task.FromResult(new ServerManagerCommandResult(false, "fixture_failed", "failed")); Due();
+        cron = ServerEventRuntime.Audits.Single(a => a.Verb == "schedule");
+        Check(cron.Data["cron_step"] == "2" && cron.Data["cron_step_verb"] == "status" && cron.Data["cron_failure_code"] == "fixture_failed" &&
+            !string.Join(" ", cron.Data.Values).Contains("private-second-argument") && ServerConsoleExecutor.Lines.Count == 1,
+            "Final audit identifies a failing common command in a later step without retaining its arguments.");
+        foreach (string unsafeCode in new[] { "failure with private detail", "failure\nforged", new string('x', 65) })
+        {
+            Activate(Config("echo first"));
+            ServerConsoleExecutor.NextResult = new(false, unsafeCode, "failed"); Due();
+            Check(ServerEventRuntime.Audits.Single(a => a.Verb == "schedule").Data["cron_failure_code"] == "unknown",
+                "Final failure metadata does not carry oversized or non-token failure details");
+        }
 
         Activate(Config("announce pending", "echo after"));
         var pending = new TaskCompletionSource<ServerManagerCommandResult>(); ServerCommands.NextTask = pending.Task;
@@ -324,6 +343,23 @@ internal static class ServerScheduleRuntimeSmoke
         Check(ServerCommands.Calls.Count == 1 && Runs.Count == 1 && Claims == 1, "Unfinished common command prevents same-ID overlap.");
         pending.SetException(new InvalidOperationException("expected fixture")); Tick();
         Check(Runs.Count == 0 && ServerConsoleExecutor.Lines.Count == 0, "Task fault stops chain without executing tail.");
+    }
+
+    private static void FinalResultMarker()
+    {
+        foreach (string command in new[] { "schedule", "maintenance" })
+        foreach (bool success in new[] { false, true })
+        {
+            Activate(Config(command + " private-arguments"));
+            if (!success) ServerConsoleExecutor.NextResult = new(false, "fixture_failed", "failed");
+            Due();
+            Check(ServerEventRuntime.Audits.Count == 2 && ServerConsoleExecutor.Lines.Count == 1,
+                "A raw command named like a summary still executes once and publishes its intermediate plus final results");
+            ServerEventRuntime.Audit intermediate = ServerEventRuntime.Audits[0], final = ServerEventRuntime.Audits[1];
+            Check(intermediate.Verb == command && !intermediate.Data.ContainsKey("cron_final") &&
+                final.Verb == "schedule" && final.Data["cron_final"] == "true" && final.Success == success,
+                "Only an actual terminal result carries cron_final, never a raw schedule/maintenance command");
+        }
     }
 
     private static void OptionalCenterBroadcasts()
@@ -377,53 +413,51 @@ internal static class ServerScheduleRuntimeSmoke
     {
         foreach (bool? allowHide in new bool?[] { null, false, true })
         foreach (bool? rootLog in new bool?[] { null, false, true })
-        foreach (bool? jobLog in new bool?[] { null, false, true })
         {
             string root = rootLog.HasValue ? "logJobs: " + rootLog.Value.ToString().ToLowerInvariant() + "\n" : "";
-            string extra = (allowHide.HasValue ? "    allowClientHide: " + allowHide.Value.ToString().ToLowerInvariant() + "\n" : "") +
-                (jobLog.HasValue ? "    log: " + jobLog.Value.ToString().ToLowerInvariant() + "\n" : "");
+            string extra = allowHide.HasValue ? "    allowClientHide: " + allowHide.Value.ToString().ToLowerInvariant() + "\n" : "";
             Activate(root + "jobs:\n" + Job("center-audit", new[] { "broadcast center Visible notice" }, extra));
             ServerManagerPlugin.Log.Messages.Clear(); Due();
-            bool expectedLog = jobLog ?? rootLog ?? false;
+            bool expectedLog = rootLog ?? false;
             Check(ServerEventRuntime.Audits.Count == 2 &&
-                ServerEventRuntime.Audits.All(a => a.Success && a.WriteAuditLog == expectedLog),
-                "Both successful center step and job remain published; only their audit-file intent follows effective logging");
+                ServerEventRuntime.Audits.All(a => a.Success),
+                "Successful center step and final job always reach the central event pipeline independent of console logging");
             Check(ServerEventRuntime.Audits.Single(a => a.Verb == "schedule").Data["cron_summary"] == "Visible notice" &&
                 ServerEventRuntime.Audits.All(a => a.Source == "cron" && a.Id == JobId() && a.Name == JobId()),
-                "Quiet file policy does not remove published identity or final API/Discord summary data");
+                "Root console policy does not remove published identity or final API/Discord summary data");
             Check((allowHide == true ? ServerManagerRuntime.CenterMessages.Count : ServerConsoleExecutor.Lines.Count) == 1 &&
                 JournalState() == "ready" && Claims == 0,
-                "Quiet center success still displays once, commits the durable cursor and releases its claim");
+                "Center success displays once, commits the durable cursor and releases its claim");
             Check(ServerManagerPlugin.Log.Messages.Any(line => line.Contains("completed.")) == expectedLog,
-                "Effective logging controls successful center completion console messages");
+                "Root logJobs controls successful center completion console messages only");
         }
 
         foreach (bool allowHide in new[] { false, true })
         {
             string extra = "    allowClientHide: " + allowHide.ToString().ToLowerInvariant() + "\n";
             Activate("jobs:\n" + Job("all-centers", new[] { "broadcast center First", "broadcast center Second" }, extra)); Due();
-            Check(ServerEventRuntime.Audits.Count == 3 && ServerEventRuntime.Audits.All(a => !a.WriteAuditLog) &&
+            Check(ServerEventRuntime.Audits.Count == 3 &&
                 ServerEventRuntime.Audits.Last().Code == "cron_completed" && JournalState() == "ready",
-                "A successful center-only chain suppresses all duplicate file records but publishes every result");
+                "A successful center-only chain publishes every result for independent central file/API/webhook routing");
 
             Activate("jobs:\n" + Job("mixed", new[] { "broadcast center Notice", "echo unrelated" }, extra)); Due();
-            Check(ServerEventRuntime.Audits.Count == 3 && ServerEventRuntime.Audits.All(a => a.WriteAuditLog),
-                "Any unrelated command keeps center-step and final file audits for the whole mixed job");
+            Check(ServerEventRuntime.Audits.Count == 3,
+                "A mixed job publishes every center step, command and final result");
 
             Activate("jobs:\n" + Job("mixed-save", new[] { "broadcast center Notice", "save" }, extra)); Due();
-            Check(ServerEventRuntime.Saves.Count == 1 && ServerEventRuntime.Audits.Single().WriteAuditLog,
-                "Mixed save/broadcast keeps the center audit before the asynchronous save completes");
+            Check(ServerEventRuntime.Saves.Count == 1 && ServerEventRuntime.Audits.Single().Verb == "broadcast",
+                "Mixed save/broadcast publishes the center audit before the asynchronous save completes");
             ServerEventRuntime.Status.LatestSave = Save("center-audit-save", ServerManagerSaveState.CheckpointCompleted); Tick();
-            Check(ServerEventRuntime.Audits.Count == 3 && ServerEventRuntime.Audits.All(a => a.WriteAuditLog) &&
+            Check(ServerEventRuntime.Audits.Count == 3 &&
                 ServerEventRuntime.Audits.Last().Code == "cron_completed" && Claims == 0,
-                "Mixed save/broadcast retains checkpoint and final file audits after completion");
+                "Mixed save/broadcast publishes checkpoint and final audits after completion");
 
             Activate("jobs:\n" + Job("failed-center", new[] { "broadcast center Failed" }, extra));
             if (allowHide) ServerManagerRuntime.AcceptCenterMessages = false;
             else ServerConsoleExecutor.NextResult = new(false, "fixture_failed", "failed");
             Due();
-            Check(ServerEventRuntime.Audits.Count == 2 && ServerEventRuntime.Audits.All(a => !a.Success && a.WriteAuditLog) && Claims == 0,
-                "Center send/console failures retain both failure file records even when logging is omitted");
+            Check(ServerEventRuntime.Audits.Count == 2 && ServerEventRuntime.Audits.All(a => !a.Success) && Claims == 0,
+                "Center send/console failures publish both failure events when console logging is omitted");
 
             Activate("jobs:\n" + Job("partial-center-failure", new[] { "broadcast center First", "broadcast center Failed" }, extra));
             if (allowHide) ServerManagerRuntime.OnCenterBroadcast = () =>
@@ -431,9 +465,9 @@ internal static class ServerScheduleRuntimeSmoke
             else ServerConsoleExecutor.OnExecute = () =>
             { if (ServerConsoleExecutor.Lines.Count == 2) ServerConsoleExecutor.NextResult = new(false, "fixture_failed", "failed"); };
             Due();
-            Check(ServerEventRuntime.Audits.Count == 3 && ServerEventRuntime.Audits[0].Success && !ServerEventRuntime.Audits[0].WriteAuditLog &&
-                ServerEventRuntime.Audits.Skip(1).All(a => !a.Success && a.WriteAuditLog),
-                "Earlier successful center steps may stay quiet but failed steps and failed final results always reach the audit file");
+            Check(ServerEventRuntime.Audits.Count == 3 && ServerEventRuntime.Audits[0].Success &&
+                ServerEventRuntime.Audits.Skip(1).All(a => !a.Success),
+                "Earlier successful steps, failed steps and failed final results all reach the central event pipeline");
 
             Activate("jobs:\n" + Job("retired-center", new[] { "broadcast center Delivered", "broadcast center Retired tail" }, extra));
             Action retire = () =>
@@ -445,9 +479,9 @@ internal static class ServerScheduleRuntimeSmoke
             else ServerConsoleExecutor.OnExecute = retire;
             Due();
             Check(ServerEventRuntime.Audits.Count == 2 && ServerEventRuntime.Audits[0].Success &&
-                !ServerEventRuntime.Audits[1].Success && ServerEventRuntime.Audits.All(a => a.WriteAuditLog) &&
+                !ServerEventRuntime.Audits[1].Success &&
                 (allowHide ? ServerManagerRuntime.CenterMessages.Count : ServerConsoleExecutor.Lines.Count) == 1 && Claims == 0,
-                "A success returned after run retirement stays file-audited and cannot execute its cancelled tail");
+                "A success returned after run retirement remains published and cannot execute its cancelled tail");
 
             Activate("jobs:\n" + Job("cancelled-center", new[] { "broadcast center Never sent" }, extra));
             Due(false); Frame();
@@ -456,24 +490,28 @@ internal static class ServerScheduleRuntimeSmoke
             Set(Runs[0]!, "Retired", true);
             ((CancellationTokenSource)Get(Runs[0]!, "Cancellation")!).Cancel(); Tick();
             Check(ServerEventRuntime.Audits.Count == 1 && ServerEventRuntime.Audits[0].Code == "cron_cancelled" &&
-                !ServerEventRuntime.Audits[0].Success && ServerEventRuntime.Audits[0].WriteAuditLog &&
+                !ServerEventRuntime.Audits[0].Success &&
                 ServerConsoleExecutor.Lines.Count == 0 && ServerManagerRuntime.CenterMessages.Count == 0 && Claims == 0,
-                "A cancelled center occurrence retains its final file audit without dispatching");
+                "A cancelled center occurrence publishes its final audit without dispatching");
 
             foreach (string gate in new[] { "    chance: 0\n", "    globalKeys: absent\n" })
             {
                 Activate("logSkipped: false\njobs:\n" + Job("skipped-center", new[] { "broadcast center Skipped" }, extra + gate)); Due();
                 Check(ServerEventRuntime.Audits.Count == 1 && ServerEventRuntime.Audits[0].Code == "cron_skipped" &&
-                    ServerEventRuntime.Audits[0].Success && ServerEventRuntime.Audits[0].WriteAuditLog && Claims == 0,
-                    "Chance/key skips remain file-audited despite quiet logging and successful skip status");
+                    ServerEventRuntime.Audits[0].Success && Claims == 0,
+                    "Chance/key skips remain published despite quiet console logging and successful skip status");
+                Check(ServerEventRuntime.Audits[0].Data["cron_final"] == "true" &&
+                    !ServerEventRuntime.Audits[0].Data.ContainsKey("cron_step") && !ServerEventRuntime.Audits[0].Data.ContainsKey("cron_step_verb") &&
+                    !ServerEventRuntime.Audits[0].Data.ContainsKey("cron_failure_code"),
+                    "A pre-execution skip never claims a command step was started");
             }
         }
 
         foreach (string command in new[] { "broadcast top Notice", "broadcast center", "broadcast centered Notice", "announce Notice", "echo Notice", "sm:broadcast center Notice", "\"broadcast\" center Notice" })
         {
             Activate(Config(command)); Due();
-            Check(ServerEventRuntime.Audits.Count != 0 && ServerEventRuntime.Audits.All(a => a.WriteAuditLog),
-                "Quiet file policy does not cover another channel/verb, alias or an empty/non-exact center command: " + command);
+            Check(ServerEventRuntime.Audits.Count != 0,
+                "Every channel/verb, alias or empty/non-exact center command still reaches central event routing: " + command);
         }
     }
 
@@ -511,25 +549,23 @@ internal static class ServerScheduleRuntimeSmoke
         Due(); Check(ServerConsoleExecutor.Lines.Last() == "echo updated-interval", "The reloaded polling configuration remains executable.");
 
         foreach (bool? logJobs in new bool?[] { null, false, true })
-        foreach (bool? jobLog in new bool?[] { null, false, true })
         {
-            string extra = jobLog.HasValue ? "    log: " + jobLog.Value.ToString().ToLowerInvariant() + "\n" : "";
             string rootLog = logJobs.HasValue ? "logJobs: " + logJobs.Value.ToString().ToLowerInvariant() + "\n" : "";
-            Activate(rootLog + "jobs:\n" + Job("logging", new[] { "echo logged" }, extra));
+            Activate(rootLog + "jobs:\n" + Job("logging", new[] { "echo logged" }));
             ServerManagerPlugin.Log.Messages.Clear(); Due();
-            Check(ServerManagerPlugin.Log.Messages.Any(line => line.Contains("completed.")) == (jobLog ?? logJobs ?? false),
-                "Per-job log override or root default controls only successful completion console messages.");
-            Check(ServerEventRuntime.Audits.Any(a => a.Code == "cron_completed" && a.Success) && ServerEventRuntime.Audits.All(a => a.WriteAuditLog),
+            Check(ServerManagerPlugin.Log.Messages.Any(line => line.Contains("completed.")) == (logJobs ?? false),
+                "Root logJobs controls only successful completion console messages.");
+            Check(ServerEventRuntime.Audits.Any(a => a.Code == "cron_completed" && a.Success),
                 "Non-center success audit remains enabled independently of console logging.");
         }
         foreach (bool logSkipped in new[] { false, true })
-        foreach (bool jobLog in new[] { false, true })
+        foreach (bool logJobs in new[] { false, true })
         {
-            Activate("logJobs: false\nlogSkipped: " + logSkipped.ToString().ToLowerInvariant() + "\njobs:\n" +
-                Job("skipped", new[] { "echo skipped" }, "    chance: 0\n    log: " + jobLog.ToString().ToLowerInvariant() + "\n"));
+            Activate("logJobs: " + logJobs.ToString().ToLowerInvariant() + "\nlogSkipped: " + logSkipped.ToString().ToLowerInvariant() + "\njobs:\n" +
+                Job("skipped", new[] { "echo skipped" }, "    chance: 0\n"));
             ServerManagerPlugin.Log.Messages.Clear(); Due();
-            Check(ServerManagerPlugin.Log.Messages.Any(line => line.Contains("skipped (")) == (jobLog && logSkipped),
-                "Skipped console messages require both effective job logging and root logSkipped.");
+            Check(ServerManagerPlugin.Log.Messages.Any(line => line.Contains("skipped (")) == (logJobs && logSkipped),
+                "Skipped console messages require both root logJobs and root logSkipped.");
             Check(ServerEventRuntime.Audits.Any(a => a.Code == "cron_skipped" && a.Success) && ServerConsoleExecutor.Lines.Count == 0,
                 "Skipped jobs remain audited and never execute when console logging is disabled.");
         }
@@ -594,6 +630,19 @@ internal static class ServerScheduleRuntimeSmoke
         settings = Get(Session!, "_settings")!; Reload("jobs: [broken");
         Check(ReferenceEquals(settings, Get(Session!, "_settings")), "Malformed YAML retains last valid runtime snapshot.");
         Due(); Check(ServerConsoleExecutor.Lines.Count == 2 && ServerConsoleExecutor.Lines.Last() == "echo new", "Good schedule continues after malformed edit.");
+        foreach (string removedLog in new[] { "false", "true" })
+        {
+            string priorId = JobId();
+            byte[] priorJournal = File.ReadAllBytes(JournalPath);
+            Reload("jobs:\n" + Job("obsolete-log", new[] { "echo rejected" }, "    log: " + removedLog + "\n"));
+            Check(ReferenceEquals(settings, Get(Session!, "_settings")) && JobId() == priorId &&
+                File.ReadAllBytes(JournalPath).SequenceEqual(priorJournal) &&
+                ServerManagerPlugin.Log.Messages.Any(line => line.Contains("per-job log") && line.Contains("log.yml")),
+                "Rejected per-job log retains the last good settings, job identity and journal while explaining log.yml migration");
+            int before = ServerConsoleExecutor.Lines.Count; Due();
+            Check(ServerConsoleExecutor.Lines.Count == before + 1 && ServerConsoleExecutor.Lines.Last() == "echo new",
+                "Last-good schedule continues executing after obsolete per-job log is rejected");
+        }
         File.WriteAllBytes(FilePath, new byte[] { 0xC3, 0x28 }); ObserveFile();
         Check(ReferenceEquals(settings, Get(Session!, "_settings")), "Read/UTF8 error also retains good snapshot.");
 
@@ -889,6 +938,10 @@ internal static class ServerScheduleRuntimeSmoke
             UpgradeWorldScheduleBridge.Observation = failure; Tick();
             Check(UpgradeWorldScheduleBridge.Begun.Count == 1 && ServerEventRuntime.Saves.Count == 1 && JournalState() == "needs_review",
                 "Failed/stopped/foreign operation prevents tail and records needs_review: " + failure.Code);
+            ServerEventRuntime.Audit final = ServerEventRuntime.Audits.Single(a => a.Verb == "maintenance");
+            Check(!final.Success && final.Code == "cron_needs_review" && final.Data["cron_final"] == "true" && final.Data["cron_failure_code"] == failure.Code &&
+                final.Data["cron_step"] == "2" && final.Data["cron_step_verb"] == "zones_reset",
+                "Final maintenance review record preserves its actual failure cause and step for the final-only file sink");
             Due(); Check(UpgradeWorldScheduleBridge.Begun.Count == 1 && ServerScheduleRuntime.GetStatus().Message.Contains(JobId()),
                 "Review marker suppresses future automatic execution and is visible in cronstatus.");
         }
@@ -896,9 +949,13 @@ internal static class ServerScheduleRuntimeSmoke
         Activate(Maintenance("zones_reset start")); Due();
         ServerEventRuntime.Status.LatestSave = Save("pre", ServerManagerSaveState.CheckpointCompleted); Tick();
         int calls = ServerEventRuntime.Saves.Count;
+        int priorAudits = ServerEventRuntime.Audits.Count;
         Restart(60);
         Check(JournalState() == "needs_review" && ServerEventRuntime.Saves.Count == calls && UpgradeWorldScheduleBridge.Begun.Count == 1,
             "Restart never replays a maintenance job that was already running.");
+        ServerEventRuntime.Audit recovered = ServerEventRuntime.Audits.Skip(priorAudits).Single(a => a.Verb == "maintenance");
+        Check(!recovered.Success && recovered.Code == "cron_needs_review" && recovered.Data.Count == 1 && recovered.Data["cron_final"] == "true",
+            "Recovery review is marked as a final result without inventing a lost command step or failure cause");
         Task<ServerManagerCommandResult> denied = ServerScheduleRuntime.Acknowledge(JobId(), () => false, CancellationToken.None);
         Check(!denied.Result.Success && JournalState() == "needs_review", "Revoked operator cannot clear the marker.");
         UpgradeWorldScheduleBridge.Idle = false;
@@ -956,6 +1013,10 @@ internal static class ServerScheduleRuntimeSmoke
         Check(JournalState() == "needs_review" && UpgradeWorldScheduleBridge.Begun.Count == 1 &&
             ServerConsoleExecutor.Lines.Contains("echo after") && ServerEventRuntime.Saves.Count == 1,
             "Confirmed idle releases ordinary scheduling but review still blocks other UW maintenance and no post-save is certified.");
+        ServerEventRuntime.Audit timedOut = ServerEventRuntime.Audits.Single(a => a.Verb == "maintenance");
+        Check(timedOut.Code == "cron_needs_review" && timedOut.Data["cron_failure_code"] == "uw_unconfirmed" &&
+            timedOut.Data["cron_step"] == "2" && timedOut.Data["cron_step_verb"] == "zones_generate",
+            "Drained timeout retains its specific cause in the final review record");
     }
 
     private static void MaintenanceReload()
@@ -980,6 +1041,10 @@ internal static class ServerScheduleRuntimeSmoke
         ServerEventRuntime.Status.LatestSave = partial; Tick();
         Check(JournalState() == "needs_review" && ServerEventRuntime.Audits.Any(a => a.Code == "checkpoint_partial" && !a.Success) &&
             !ServerEventRuntime.Audits.Any(a => a.Verb == "maintenance" && a.Success), "Partial post-save never advances maintenance as a success.");
+        ServerEventRuntime.Audit failedSave = ServerEventRuntime.Audits.Single(a => a.Verb == "maintenance");
+        Check(failedSave.Code == "cron_needs_review" && failedSave.Data["cron_failure_code"] == "checkpoint_partial" &&
+            failedSave.Data["cron_step"] == "3" && failedSave.Data["cron_step_verb"] == "save",
+            "Final maintenance review record preserves a failed checkpoint cause and save step");
         using (var canceled = new CancellationTokenSource())
         {
             canceled.Cancel(); int guards = 0;
@@ -1657,7 +1722,7 @@ namespace ServerManager.Events
     internal static class ServerEventRuntime
     {
         internal sealed class SaveCall { internal CancellationToken Cancellation; internal Func<bool> Authorized = null!; internal bool Maintenance; }
-        internal sealed class Audit { internal string Source = "", Id = "", Name = "", Verb = "", Target = "", Code = ""; internal bool Success, WriteAuditLog; internal Dictionary<string, string> Data = new(); }
+        internal sealed class Audit { internal string Source = "", Id = "", Name = "", Verb = "", Target = "", Code = ""; internal bool Success; internal Dictionary<string, string> Data = new(); }
         internal static long CommandWorldEpoch;
         internal static ServerManagerStatusSnapshot Status = new();
         internal static readonly List<SaveCall> Saves = new();
@@ -1682,8 +1747,8 @@ namespace ServerManager.Events
             return result;
         }
         internal static void RecordCommand(string source, string id, string name, string verb, string target, string code, bool success,
-            IReadOnlyDictionary<string, string>? data = null, bool writeAuditLog = true)
-        { Audits.Add(new Audit { Source = source, Id = id, Name = name, Verb = verb, Target = target, Code = code, Success = success, WriteAuditLog = writeAuditLog,
+            IReadOnlyDictionary<string, string>? data = null)
+        { Audits.Add(new Audit { Source = source, Id = id, Name = name, Verb = verb, Target = target, Code = code, Success = success,
             Data = data == null ? new Dictionary<string, string>() : data.ToDictionary(pair => pair.Key, pair => pair.Value) }); }
     }
 }

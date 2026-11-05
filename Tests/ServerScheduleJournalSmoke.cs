@@ -57,9 +57,9 @@ internal static class ServerScheduleJournalSmoke
         ServerScheduleSettings previous = ServerScheduleSettings.Parse("logJobs: true\n" + yaml);
         ServerScheduleSettings current = ServerScheduleSettings.Parse(yaml);
         ServerScheduleJob oldJob = previous.Jobs.Single(), newJob = current.Jobs.Single();
-        Check(oldJob.Log && !newJob.Log && oldJob.Id == newJob.Id && oldJob.SameAs(newJob) &&
+        Check(previous.LogJobs && !current.LogJobs && oldJob.Id == newJob.Id && oldJob.SameAs(newJob) &&
             ServerScheduleJournal.Fingerprint(previous, oldJob) == ServerScheduleJournal.Fingerprint(current, newJob),
-            "New omitted-false logging preserves the prior explicit-true job ID and durable fingerprint");
+            "Root console logging preserves the prior explicit-true job ID and durable fingerprint");
         string path = Fresh("logging-history");
         using ServerScheduleJournal journal = ServerScheduleJournal.Open(path, "world");
         journal.Reconcile(previous, Now, Game);
@@ -69,7 +69,7 @@ internal static class ServerScheduleJournalSmoke
         byte[] retained = File.ReadAllBytes(file);
         journal.Reconcile(current, Now.AddHours(1), Game); journal.Flush();
         Check(File.ReadAllBytes(file).SequenceEqual(retained),
-            "Changing only effective logging leaves existing cron_last.yml progress bytes untouched");
+            "Changing only root console logging leaves existing cron_last.yml progress bytes untouched");
     }
 
     private static void CanonicalFileName()

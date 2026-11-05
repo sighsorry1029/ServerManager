@@ -466,7 +466,10 @@ internal static class OptionalModPublicationSmoke
     }
     private static Type Type(string name) => _plugin.GetType("ServerManager." + name, true)!;
     private static object Construct(Type type, params object?[] args) =>
-        type.GetConstructors(All).Single(ctor => ctor.GetParameters().Length == args.Length).Invoke(args);
+        type.GetConstructors(All).Single(ctor => ctor.GetParameters().Length == args.Length &&
+            ctor.GetParameters().Select((parameter, index) => args[index] == null
+                ? !parameter.ParameterType.IsValueType
+                : parameter.ParameterType.IsInstanceOfType(args[index])).All(matches => matches)).Invoke(args);
     private static object? Call(object target, string name, params object?[] args) =>
         target.GetType().GetMethod(name, All)!.Invoke(target, args);
     private static void Assert(bool condition, string message)

@@ -215,6 +215,7 @@ internal static class ManifestPreparationSmoke
         // those incidental writes stay inside our owned temporary directory.
         paths.GetField("<BepInExConfigPath>k__BackingField", StaticAll)!.SetValue(null, Path.Combine(root, "BepInEx-test.cfg"));
         paths.GetField("<ConfigPath>k__BackingField", StaticAll)!.SetValue(null, root);
+        paths.GetField("<PatcherPluginPath>k__BackingField", StaticAll)!.SetValue(null, Path.Combine(root, "patchers"));
         Type chainloader = bep.GetType("BepInEx.Bootstrap.Chainloader", true)!;
         IDictionary registry = (IDictionary)chainloader.GetProperty("PluginInfos", StaticAll)!.GetValue(null, null)!;
         var previous = new List<DictionaryEntry>();

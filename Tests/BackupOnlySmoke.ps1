@@ -69,7 +69,8 @@ $binaryRoot = Join-Path $projectRoot "bin\$Configuration"
 $managedRoot = Join-Path $GamePath 'valheim_Data\Managed'
 $pluginPath = Join-Path $binaryRoot 'ServerManager.dll'
 Assert-True (Test-Path -LiteralPath $pluginPath) 'Build ServerManager first.'
-[Reflection.Assembly]::LoadFrom((Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll')) | Out-Null
+[Reflection.Assembly]::Load([IO.File]::ReadAllBytes(
+    (Join-Path $GamePath 'BepInEx\core\Mono.Cecil.dll'))) | Out-Null
 [Reflection.Assembly]::Load([IO.File]::ReadAllBytes((Join-Path $GamePath 'BepInEx\core\BepInEx.dll'))) | Out-Null
 foreach ($name in @('netstandard.dll', 'com.rlabrecque.steamworks.net.dll', 'Splatform.dll')) {
     [Reflection.Assembly]::LoadFrom((Join-Path $managedRoot $name)) | Out-Null
@@ -496,7 +497,7 @@ try {
     $limits = $limitsCtor.Invoke($limitArgs)
     $packetCodec = $plugin.GetType('ServerManager.ProtocolPacketCodec')
     $decode = $packetCodec.GetMethods() | Where-Object { $_.Name -eq 'TryDecode' -and $_.GetParameters()[0].ParameterType.Name -eq 'ZPackage' }
-    Assert-True ($packetCodec.GetField('WireVersion', $allStatic).GetRawConstantValue() -eq 25) 'The current backup handshake and bounded detector diagnostics require wire version 25.'
+    Assert-True ($packetCodec.GetField('WireVersion', $allStatic).GetRawConstantValue() -eq 26) 'The module-kind admission handshake requires wire version 26.'
     foreach ($kind in @('BackupCaptureRequest', 'BackupCaptureCommitted')) {
         $kindValue = [Enum]::Parse($plugin.GetType('ServerManager.ProtocolPacketKind'), $kind)
         $sequence = [uint32]$plugin.GetType('ServerManager.ProtocolSequence').GetField($kind).GetRawConstantValue()
