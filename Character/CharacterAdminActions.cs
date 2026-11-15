@@ -12,6 +12,10 @@ namespace ServerManager
     internal static class CharacterAdminActions
     {
         internal const float MaximumMagnitude = 1000000f;
+        // Keep the v1 action/preset packet shape. Older owners reject these
+        // unknown operations before mutating anything instead of notifying anyway.
+        internal const string SilentGive = "give-silent";
+        internal const string SilentSet = "set-silent";
         private static readonly MethodInfo ShallowClone = typeof(object).GetMethod(
             "MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!;
         private static readonly MethodInfo AddItemAt = typeof(Inventory).GetMethod(
@@ -21,8 +25,9 @@ namespace ServerManager
             "Changed", BindingFlags.Instance | BindingFlags.NonPublic,
             null, new[] { typeof(bool), typeof(bool) }, null);
 
-        internal static ServerManagerCommandResult Apply(Player player, string[] action)
+        internal static ServerManagerCommandResult Apply(Player player, string[] action, out CharacterAdminReceipt? receipt)
         {
+            receipt = null;
             if (player == null || action == null || action.Length == 0)
                 return Result(false, "invalid_action", "An active player and action are required.");
             try
@@ -30,7 +35,7 @@ namespace ServerManager
                 switch (action[0].ToLowerInvariant())
                 {
                     case "item":
-                        return GiveItem(player, action);
+                        return GiveItem(player, action, out receipt);
                     case "teleport":
                         if (action.Length != 4 || !TryNumber(action[1], -MaximumMagnitude, MaximumMagnitude, out float x) ||
                             !TryNumber(action[2], -MaximumMagnitude, MaximumMagnitude, out float y) ||
@@ -40,7 +45,7 @@ namespace ServerManager
                             ? Result(true, "applied", "Teleport started; arrival is asynchronous.")
                             : Result(false, "teleport_busy", "Teleport was not started (ownership, cooldown, or teleport in progress).");
                     case "skill":
-                        return ApplySkill(player.GetSkills(), action);
+                        return ApplySkill(player.GetSkills(), action, out receipt);
                     case "heal":
                     case "damage":
                         if (action.Length != 2 || !TryNumber(action[1], 0f, MaximumMagnitude, out float amount) || amount <= 0f)
@@ -76,9 +81,11 @@ namespace ServerManager
             }
         }
 
-        private static ServerManagerCommandResult GiveItem(Player player, string[] action)
+        private static ServerManagerCommandResult GiveItem(Player player, string[] action, out CharacterAdminReceipt? receipt)
         {
-            if ((action.Length != 5 && action.Length != 6) || !action[1].Equals("give", StringComparison.OrdinalIgnoreCase) ||
+            receipt = null;
+            if ((action.Length != 5 && action.Length != 6) ||
+                !(action[1].Equals("give", StringComparison.OrdinalIgnoreCase) || action[1] == SilentGive) ||
                 string.IsNullOrWhiteSpace(action[2]) || action[2].Length > 256 ||
                 !int.TryParse(action[3], NumberStyles.None, CultureInfo.InvariantCulture, out int amount) || amount < 1 || amount > 1000 ||
                 !int.TryParse(action[4], NumberStyles.None, CultureInfo.InvariantCulture, out int quality) || quality < 1 || quality > 100)
@@ -90,12 +97,19 @@ namespace ServerManager
                 return Result(false, "invalid_item", "Unknown item prefab or quality exceeds this item's maximum.");
 
             Inventory inventory = player.GetInventory();
-            if (action.Length == 6)
-            {
-                Dictionary<string, string> customData = ItemDataPresets.DecodeData(action[5]);
-                return GivePresetItems(inventory, drop.m_itemData, prefab!, amount, quality, customData);
-            }
-            ItemDrop.ItemData template = drop.m_itemData.Clone();
+            string displayName = drop.m_itemData.m_shared.m_name;
+            ServerManagerCommandResult result = action.Length == 6
+                ? GivePresetItems(inventory, drop.m_itemData, prefab!, amount, quality, ItemDataPresets.DecodeData(action[5]))
+                : GivePlainItems(inventory, drop.m_itemData, prefab!, amount, quality, action[2]);
+            if (result.Success && action[1] != SilentGive)
+                receipt = CharacterAdminReceipt.ForItem(displayName, action[2], amount, quality);
+            return result;
+        }
+
+        private static ServerManagerCommandResult GivePlainItems(Inventory inventory, ItemDrop.ItemData source,
+            GameObject prefab, int amount, int quality, string prefabName)
+        {
+            ItemDrop.ItemData template = source.Clone();
             template.m_dropPrefab = prefab;
             template.m_quality = quality;
             template.m_worldLevel = (byte)Game.m_worldLevel;
@@ -140,7 +154,7 @@ namespace ServerManager
                 InventoryChanged?.Invoke(inventory, new object[] { false, false });
                 throw;
             }
-            return Result(true, "applied", "Added " + amount + " " + action[2] + " at quality " + quality + ".");
+            return Result(true, "applied", "Added " + amount + " " + prefabName + " at quality " + quality + ".");
         }
 
         private static ItemDrop.ItemData CloneBeforeMetadataLoad(ItemDrop.ItemData source)
@@ -244,11 +258,14 @@ namespace ServerManager
                     throw new InvalidOperationException("An item callback changed the requested custom data.");
         }
 
-        private static ServerManagerCommandResult ApplySkill(Skills skills, string[] action)
+        private static ServerManagerCommandResult ApplySkill(Skills skills, string[] action, out CharacterAdminReceipt? receipt)
         {
+            receipt = null;
             if (skills == null || action.Length < 2 || action.Length > 4)
                 return Result(false, "invalid_skill", "Skill requires get or set.");
             string operation = action[1].ToLowerInvariant();
+            bool silent = operation == SilentSet;
+            if (silent) operation = "set";
             bool get = operation == "get";
             if ((!get && operation != "set") || (get && action.Length > 3) ||
                 (!get && action.Length != 4))
@@ -269,8 +286,10 @@ namespace ServerManager
                         return Result(false, "invalid_skill", "The player has no definition for the requested skill.");
                 skills.Load(new ZPackage(EncodeSkills(updated)));
             }
-            return SkillResult(updated, get ? "skills" : "applied", name,
+            ServerManagerCommandResult result = SkillResult(updated, get ? "skills" : "applied", name,
                 get ? "Raw skill levels and XP accumulators." : "Skill levels updated; changed skills' XP accumulators reset to zero.");
+            if (!get && !silent && result.Success) receipt = CharacterAdminReceipt.ForSkill(name, value);
+            return result;
         }
 
         internal static List<CharacterSemanticSkillState> EditSkills(IEnumerable<CharacterSemanticSkillState> source, string operation, string name, float value)

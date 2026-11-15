@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.8
+
+- Added the `player.first_join` Discord webhook filter for the first login of a new server character. Use it on a private route with `include_steam_id: true` to see Steam IDs only for new characters there. Existing `player.connection` routes still include all remote joins and leaves. Selecting both filters on one route sends only one message per first join.
+- Online players now receive one private chat message when an admin grants them an item or sets their skills. Add `notify=false` in F5 or the server console, or set `notify:false` in Discord, to skip that message for one command. The command result and audit settings are unchanged. Update both server and clients to use the new command options.
+- Rewrote the README for first-time server setup and added an operator guide with command examples, Discord routes, scheduling, logs and character recovery.
+
 ## 1.2.7
 
 - Added `log.yml` with separate `audit`, `player` and `chat` lists. Valid edits reload automatically; invalid edits keep the last valid settings. File-log selection does not change character saves, security checks, game messages or Discord delivery.

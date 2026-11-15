@@ -76,7 +76,7 @@ internal static class DiscordCommonCommandsSmoke
             ServerCommands.BindIdentifierPredicates(args[0]);
             ServerManager.PlayerLocalizer.Bind(args[0]);
             FixedExecutionLimits(); EnglishDefaults(); LocalizedInteractions(); LocalizedFailures(); AdapterArguments(); SpacedCharacterTargets(); RegistrationAndAdmins(); EnglishRegistration(); LocalizationRegistration(); MultiGuildIsolation(); SharedExecution(); TypedParsing();
-            Reauthorization(); RestoreRejectionAudit(); ItemPresetArguments(); ItemPresetRejectionAudit(); RconRouting(); DeferredRevocationAndTimeout();
+            Reauthorization(); RestoreRejectionAudit(); ItemPresetArguments(); ItemPresetRejectionAudit(); NotifyArguments(); RconRouting(); DeferredRevocationAndTimeout();
             Console.WriteLine("PASS: Discord flat command adapter (" + _checks + " assertions)."); return 0;
         }
         catch (Exception exception) { Console.Error.WriteLine(exception); return 1; }
@@ -350,7 +350,7 @@ internal static class DiscordCommonCommandsSmoke
             Check(!DiscordCommands.ValidateArguments(example.Name, extra), "Unknown options rejected " + example.Name);
             JObject definition = Definition(example.Name);
             Check((string?)definition["name"] == example.Name && (int?)definition["type"] == 1, "Flat definition " + example.Name);
-            Check(((JArray)definition["options"]!).All(option => new[] { 3, 4, 10 }.Contains((int)option["type"]!)), "No subcommand groups " + example.Name);
+            Check(((JArray)definition["options"]!).All(option => new[] { 3, 4, 5, 10 }.Contains((int)option["type"]!)), "No subcommand groups " + example.Name);
             foreach (JObject option in ((JArray)definition["options"]!).OfType<JObject>().Where(option => (bool)option["required"]!))
             {
                 var missing = new Dictionary<string, string>(example.Args); missing.Remove((string)option["name"]!);
@@ -477,8 +477,8 @@ internal static class DiscordCommonCommandsSmoke
         Check(fixture.Http.Definitions.Any(item => (string?)item["name"] == "rcon") && fixture.Ids["111:status"] == "888", "RCON registered and unchanged current record reused");
         Check(fixture.Http.RegistrationRequests.Any(request => request.StartsWith("PATCH ", StringComparison.Ordinal) &&
             request.EndsWith("/applications/777/guilds/111/commands/887", StringComparison.Ordinal)) &&
-            ((JArray)fixture.Http.Definitions.Single(item => (string?)item["name"] == "giveitem")["options"]!).Count == 5,
-            "Existing giveitem registration gains data_id through its scoped update");
+            ((JArray)fixture.Http.Definitions.Single(item => (string?)item["name"] == "giveitem")["options"]!).Count == 6,
+            "Existing giveitem registration gains notify through its scoped update");
         Check(fixture.Http.RegistrationRequests.Any(request => request.StartsWith("PATCH ", StringComparison.Ordinal) &&
             request.EndsWith("/applications/777/guilds/111/commands/886", StringComparison.Ordinal)) &&
             ((JArray)fixture.Http.Definitions.Single(item => (string?)item["name"] == "players")["options"]!).Count == 1,
@@ -782,7 +782,7 @@ internal static class DiscordCommonCommandsSmoke
         using var fixture = new Fixture();
         JObject definition = Definition("giveitem");
         Check(string.Join(",", ((JArray)definition["options"]!).Select(option => (string)option["name"]!)) ==
-            "player,prefab,amount,quality,data_id", "Giveitem registers exactly the ordered typed options, never raw metadata");
+            "player,prefab,amount,quality,data_id,notify", "Giveitem registers exactly the ordered typed options, never raw metadata");
         JObject dataOption = (JObject)definition["options"]![4]!;
         Check((int)dataOption["type"]! == 3 && !(bool)dataOption["required"]! &&
             (int)dataOption["min_length"]! == 1 && (int)dataOption["max_length"]! == 64,
@@ -832,6 +832,48 @@ internal static class DiscordCommonCommandsSmoke
         wrongType["data"]!["options"]![3]!["type"] = 3;
         wrongType["data"]!["options"]![3]!["value"] = 123;
         Check(fixture.ParsePayload(wrongType) == null, "Numeric payload cannot spoof text preset ID");
+    }
+    private static void NotifyArguments()
+    {
+        using var fixture = new Fixture();
+        foreach (string name in Names)
+        {
+            JObject? option = ((JArray)Definition(name)["options"]!).OfType<JObject>().SingleOrDefault(o => (string?)o["name"] == "notify");
+            if (name != "giveitem" && name != "skillset")
+            {
+                Check(option == null, name + " does not expose notify"); continue;
+            }
+            Check(option != null && (int)option["type"]! == 5 && !(bool)option["required"]! &&
+                option["min_value"] == null && option["max_value"] == null && option["max_length"] == null,
+                name + " registers an optional Discord BOOLEAN without inapplicable bounds");
+        }
+        foreach (var (name, args, line) in new[]
+        {
+            ("giveitem", A("player", "P", "prefab", "Wood", "amount", "2"), "giveitem \"P\" \"Wood\" \"2\""),
+            ("giveitem", A("player", "P", "prefab", "Wood", "amount", "2", "quality", "4"), "giveitem \"P\" \"Wood\" \"2\" \"4\""),
+            ("giveitem", A("player", "P", "prefab", "Wood", "amount", "2", "data_id", "Rare"), "giveitem \"P\" \"Wood\" \"2\" \"1\" \"Rare\""),
+            ("giveitem", A("player", "P", "prefab", "Wood", "amount", "2", "data_id", "Rare", "quality", "4"), "giveitem \"P\" \"Wood\" \"2\" \"4\" \"Rare\""),
+            ("skillset", A("player", "Two Words", "skill", "all", "value", "42.5"), "skillset \"Two Words\" \"all\" \"42.5\"")
+        })
+        {
+            foreach (string notify in new[] { "", "true", "false" })
+            {
+                if (notify.Length != 0) args["notify"] = notify;
+                var pending = fixture.Parse(name, args);
+                Task executing = fixture.Execute(pending);
+                var recorded = ServerCommands.Calls.Last();
+                Check(!executing.IsCompleted && recorded.Line == line + (notify == "false" ? " notify=false" : ""),
+                    name + ": typed interaction preserves positional args, notifies by default and suppresses only for false");
+                recorded.Completion.SetResult(Result("ok")); executing.Wait();
+            }
+            JObject bad = fixture.Payload(name, args);
+            JObject flag = ((JArray)bad["data"]!["options"]!).OfType<JObject>().Single(o => (string?)o["name"] == "notify");
+            flag["value"] = "false";
+            Check(fixture.ParsePayload(bad) == null, "A quoted string cannot stand in for Discord's boolean");
+            flag["value"] = 0;
+            Check(fixture.ParsePayload(bad) == null, "An integer cannot stand in for Discord's boolean");
+        }
+        Check(!DiscordCommands.ValidateArguments("skillget", A("player", "P", "notify", "false")), "Read-only skills do not accept a notify option");
     }
     private static void ItemPresetRejectionAudit()
     {

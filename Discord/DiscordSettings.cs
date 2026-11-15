@@ -20,7 +20,7 @@ internal sealed class DiscordSettings
     internal static readonly HashSet<string> PublicEvents = new(StringComparer.Ordinal)
     {
         "server.status", "server.saved", "server.announcement",
-        "player.connection", "chat.shout", "discord.shout", "raid.status", "player.death",
+        "player.connection", "player.first_join", "chat.shout", "discord.shout", "raid.status", "player.death",
         "boss.killed", "moderation.action", "command.executed", "cron.executed",
         "security.alert", "security.admin_bypass",
         "character.validation", "character.shadow_stalled",
@@ -33,6 +33,9 @@ internal sealed class DiscordSettings
     {
         "server.ready" or "server.shutdown" => "server.status",
         "player.login" or "player.leave" => "player.connection",
+        // The audit/API publishes this alongside the marked login. Only the
+        // login is delivered to webhooks, even on a first-join-only route.
+        "player.first_join" => null,
         "raid.started" or "raid.ended" => "raid.status",
         "combat.pvp_kill" => "player.death",
         "character.save_rejected" or "character.validation_observed" => "character.validation",
@@ -452,6 +455,7 @@ bot:
 #   server.saved - World saved to disk; pending character saves add a warning.
 #   server.announcement - Server announcement text.
 #   player.connection - Remote player joined (including first-time joins) or disconnected.
+#   player.first_join - First login for a new server character profile only.
 #   chat.shout - In-game shout chat.
 #   discord.shout - Discord chat or an admin chat command delivered to the game.
 #   raid.status - Raid started or ended, with verified center coordinates when available.
@@ -472,6 +476,7 @@ bot:
 # Route names identify last valid settings. Deleted routes are removed.
 # Duplicate routes to one destination can duplicate notifications.
 # Example: events: [chat.shout, player.connection]
+# For a private new-character feed, use events: [player.first_join] and include_steam_id: true.
 # English and Korean are bundled; other languages need ServerManager.<Language>.yml under server BepInEx.
 # anonymous_prefix: '' keeps names; 'Anonymous' uses Anonymous 1, etc.
 # Anonymity does not remove names that people type into chat or announcements.

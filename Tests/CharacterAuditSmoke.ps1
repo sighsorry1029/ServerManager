@@ -503,8 +503,8 @@ try {
     $routeEvents = $routeType.GetProperty('Events').GetValue($route)
     $eventFilter = $settingsType.GetMethod('GetWebhookEventFilter', $staticFlags)
     $selectableEvents = $settingsType.GetField('PublicEvents', $staticFlags).GetValue($null)
-    Assert-True ($null -ne $eventFilter -and $selectableEvents.Count -eq 18 -and
-        $selectableEvents.Contains('discord.shout')) 'Grouped webhook selector catalog is missing.'
+    Assert-True ($null -ne $eventFilter -and $selectableEvents.Count -eq 19 -and
+        $selectableEvents.Contains('discord.shout') -and $selectableEvents.Contains('player.first_join')) 'Grouped webhook selector catalog is missing.'
     foreach ($kind in @('security.detection', 'security.response', 'security.admin_bypass', 'character.save_rejected',
         'character.shadow_stalled', 'character.validation_observed', 'character.revision_observed', 'connection.rejected')) {
         $expectedFilter = switch ($kind) {
@@ -520,9 +520,9 @@ try {
         $routeEvents.Add($filter) | Out-Null
     }
     Assert-True ($routeEvents.Count -eq 6) 'The eight distinct operator audit kinds should select six webhook filters.'
-    foreach ($kind in @('server.status', 'player.connection', 'raid.status', 'security.alert', 'character.validation', 'cron.executed', 'event.unknown')) {
+    foreach ($kind in @('server.status', 'player.connection', 'player.first_join', 'raid.status', 'security.alert', 'character.validation', 'cron.executed', 'event.unknown')) {
         Assert-True ($null -eq $eventFilter.Invoke($null, [object[]]@($kind))) `
-            'Synthetic selector names and unknown names must not become source audit events.'
+            'A selector-only or unknown name must not dispatch a webhook directly from a source with the same name.'
     }
     $settingsType.GetProperty('WebhookRoutes').GetValue($settings).Add($route)
     $inertHttp = [Runtime.Serialization.FormatterServices]::GetUninitializedObject($httpType)

@@ -199,7 +199,9 @@ namespace ServerManager.Discord
             }
             // The positive allowlist deliberately excludes normal, whisper,
             // clan and unknown chat types even if a route explicitly requests them.
-            Route[] matches = configuration.Routes.Where(route => route.Events.Contains(eventFilter)).ToArray();
+            bool firstJoin = IsFirstJoinLogin(value);
+            Route[] matches = configuration.Routes.Where(route => route.Events.Contains(eventFilter) ||
+                (firstJoin && route.Events.Contains("player.first_join"))).ToArray();
             if (matches.Length == 0) return false;
             bool isShout = value.Kind == "chat.shout" || value.Kind == "discord.shout";
             string content = isShout ? BuildShoutContent(value) : string.Empty;
@@ -262,6 +264,9 @@ namespace ServerManager.Discord
             if (dropped) SafeLog("Discord webhook queue is full; an event was dropped.");
             return count > 0;
         }
+
+        private static bool IsFirstJoinLogin(ServerManagerEvent value) =>
+            value.Kind == "player.login" && value.Fields.TryGetValue("first_join", out string? firstJoin) && firstJoin == "true";
 
         private static string? GetWebhookEventFilter(ServerManagerEvent value)
         {
@@ -461,7 +466,7 @@ namespace ServerManager.Discord
                 case "server.saved": title = PlayerLocalizer.TextForLanguage(language, "sm_event_world_saved"); break;
                 case "player.login":
                     title = PlayerLocalizer.TextForLanguage(language,
-                        value.Fields.TryGetValue("first_join", out string? firstJoin) && firstJoin == "true"
+                        IsFirstJoinLogin(value)
                             ? "sm_event_player_first_join" : "sm_event_player_joined", player); break;
                 case "player.leave": title = PlayerLocalizer.TextForLanguage(language, "sm_event_player_left", player); break;
                 case "player.death":

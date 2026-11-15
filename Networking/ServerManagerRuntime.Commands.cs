@@ -64,6 +64,7 @@ internal static partial class ServerManagerRuntime
         internal Player Player = null!;
         internal PlayerProfile Profile = null!;
         internal CharacterClientState Character = null!;
+        internal CharacterAdminReceipt? Receipt;
         internal Guid Id;
         internal ulong Capture;
         internal bool AwaitTeleport;
@@ -77,6 +78,7 @@ internal static partial class ServerManagerRuntime
         internal ZNet Network = null!;
         internal CommandCaller Caller = null!;
         internal ServerManagerCommandResult Result = null!;
+        internal CharacterAdminReceipt? Receipt;
         internal bool AwaitTeleport;
         internal int AppliedFrame;
         internal long Deadline;
@@ -375,14 +377,15 @@ internal static partial class ServerManagerRuntime
         }
         try
         {
-            ServerManagerCommandResult applied = CharacterAdminActions.Apply(Player.m_localPlayer, packet.Arguments);
+            Player player = Player.m_localPlayer;
+            ServerManagerCommandResult applied = CharacterAdminActions.Apply(player, packet.Arguments, out CharacterAdminReceipt? receipt);
             if (!applied.Success || IsReadOnlyPlayerAction(packet.Arguments))
             {
                 SendAdminResult(client.Rpc, packet.RequestId, AdminPacketKind.PlayerResult, applied, client.CharacterState.Revision);
                 return;
             }
             _clientAdminAction = new ClientAdminAction { Client = client, Id = packet.RequestId, Result = applied,
-                Player = Player.m_localPlayer, Profile = client.ManagedProfile, Character = client.CharacterState,
+                Player = player, Profile = client.ManagedProfile, Character = client.CharacterState, Receipt = receipt,
                 AwaitTeleport = packet.Arguments[0] == "teleport", AppliedFrame = Time.frameCount,
                 Deadline = Stopwatch.GetTimestamp() + AdminActionSeconds * Stopwatch.Frequency };
             TickClientAdminAction(Stopwatch.GetTimestamp());
@@ -444,7 +447,9 @@ internal static partial class ServerManagerRuntime
             _clientAdminAction = null;
             SendAdminResult(client.Rpc, action.Id, AdminPacketKind.PlayerResult,
                 ServerCommands.Failure("action_unconfirmed", "Action may have applied but capture failed; inspect target before retrying."));
+            return;
         }
+        action.Receipt?.Show(action.Player);
     }
 
     private static void TickHostAdminAction(long now)
@@ -465,6 +470,7 @@ internal static partial class ServerManagerRuntime
         action.Completion.TrySetResult(accepted
             ? ServerCommands.Success("ram_accepted", action.Result.Message + " Host RAM accepted; disk persistence awaits world checkpoint.")
             : ServerCommands.Failure("ram_unconfirmed", "Host action applied but RAM capture failed; do not automatically repeat."));
+        if (accepted) action.Receipt?.Show(action.Player);
     }
 
     private static void CompletePlayerAdminAction(ZRpc rpc, AdminPacket packet)
@@ -506,6 +512,9 @@ internal static partial class ServerManagerRuntime
             return Done(ServerCommands.Success("mods", "Loaded SERVER plugins (not client attestations):\n" + mods));
         }
         if (args[0] == "character") return Done(QueryAdminCharacters(args));
+        // Keep the audited command intact; positional arguments below only describe the mutation.
+        bool silent = ServerCommands.SuppressTargetReceipt(args);
+        if (silent) args = args.Take(args.Length - 1).ToArray();
         int targetIndex = args[0] == "item" || args[0] == "skill" ? 2 : 1;
         string target = args[targetIndex];
         if (!TryFindAdminTarget(target, out ZRpc? targetRpc, out Player? host, out string error))
@@ -534,7 +543,7 @@ internal static partial class ServerManagerRuntime
         }
         else if (args[0] == "item")
         {
-            action = new[] { "item", "give", args[3], args[4], args.Length >= 6 ? args[5] : "1" };
+            action = new[] { "item", silent ? CharacterAdminActions.SilentGive : "give", args[3], args[4], args.Length >= 6 ? args[5] : "1" };
             if (args.Length == 7)
             {
                 if (!EnsureItemDataPresetsReady() || _itemDataPresets?.Current == null)
@@ -546,7 +555,8 @@ internal static partial class ServerManagerRuntime
                 action = action.Concat(new[] { payload }).ToArray();
             }
         }
-        else if (args[0] == "skill") action = new[] { "skill", args[1] }.Concat(args.Skip(3)).ToArray();
+        else if (args[0] == "skill")
+            action = new[] { "skill", silent ? CharacterAdminActions.SilentSet : args[1] }.Concat(args.Skip(3)).ToArray();
         else action = new[] { args[0], args[2] };
         bool targetPolicyAdmin = host != null
             ? IsCharacterPolicyAdmin(new CharacterIdentity(CharacterSteamIdentity.AccountPrefix +
@@ -559,11 +569,11 @@ internal static partial class ServerManagerRuntime
         if (host != null)
         {
             if (!LocalHostCharacterRuntime.IsActive || _hostAdminAction != null) return Done(ServerCommands.Failure("target_busy", "Managed host character is not ready or an action is pending."));
-            ServerManagerCommandResult result = CharacterAdminActions.Apply(host, action);
+            ServerManagerCommandResult result = CharacterAdminActions.Apply(host, action, out CharacterAdminReceipt? receipt);
             if (result.Success && !IsReadOnlyPlayerAction(action))
             {
                 _hostAdminAction = new HostAdminAction { Player = host, Network = ZNet.instance, Caller = caller,
-                    Result = result, AppliedFrame = Time.frameCount, AwaitTeleport = action[0] == "teleport",
+                    Result = result, Receipt = receipt, AppliedFrame = Time.frameCount, AwaitTeleport = action[0] == "teleport",
                     Deadline = Stopwatch.GetTimestamp() + AdminActionSeconds * Stopwatch.Frequency };
                 return _hostAdminAction.Completion.Task;
             }
@@ -751,8 +761,11 @@ internal static partial class ServerManagerRuntime
         // Native incoming chat resets this timer before AddString. Updating
         // only the text buffer would leave a hidden chat window invisible.
         // Do not activate/focus the input field or create an in-world label.
-        AccessTools.Field(typeof(Chat), "m_hideTimer")?.SetValue(Chat.instance, 0f);
+        WakeChat(Chat.instance);
     }
+
+    private static readonly FieldInfo? ChatHideTimer = typeof(Chat).GetField("m_hideTimer", BindingFlags.Instance | BindingFlags.NonPublic);
+    internal static void WakeChat(Chat chat) => ChatHideTimer?.SetValue(chat, 0f);
 }
 
 [HarmonyPatch(typeof(Terminal), "InitTerminal")]

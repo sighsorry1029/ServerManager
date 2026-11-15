@@ -522,7 +522,13 @@ internal sealed class DiscordCommands : IDisposable
             return "teleport " + Quote(args["player"]) + " to " + Quote(target);
         string line = spec.Name;
         foreach (OptionSpec option in spec.Options)
-            if (args.TryGetValue(option.Name, out string value))
+            if (option.Name == "notify")
+            {
+                // True (including omission) preserves the existing positional command.
+                if (args.TryGetValue("notify", out string notify) && notify == "false")
+                    line += " notify=false";
+            }
+            else if (args.TryGetValue(option.Name, out string value))
                 line += " " + Quote(value);
             else if (name == "giveitem" && option.Name == "quality" && args.ContainsKey("data_id"))
                 // The positional common grammar requires quality before a preset ID.
@@ -783,7 +789,7 @@ internal sealed class DiscordCommands : IDisposable
         {
             string key = Text(option["name"]);
             OptionSpec? spec = Catalog[name].Options.FirstOrDefault(value => value.Name == key);
-            if (args.Count >= 5 || spec == null || args.ContainsKey(key) ||
+            if (spec == null || args.ContainsKey(key) ||
                 (int?)option["type"] != spec.Type || !spec.TryRead(option["value"], out string value)) return null;
             args.Add(key, value);
         }
@@ -862,6 +868,7 @@ internal sealed class DiscordCommands : IDisposable
         OptionSpec Player(bool required = true) => StringOption("player", "player", 128, required);
         OptionSpec SteamId() => new("steam-id", "steam_id", 3, true, 17, rule: "steam");
         OptionSpec Skill(bool required = true) => TokenOption("skill", "skill", required);
+        OptionSpec Notify() => new("notify", "notify", 5, false, 5);
         OptionSpec Coordinate(string name, bool required = true) => NumberOption(name, name, -1000000, 1000000, required);
         CommandSpec[] specs =
         {
@@ -888,11 +895,11 @@ internal sealed class DiscordCommands : IDisposable
                 new OptionSpec("backup_id", "backup_id", 3, true, 32, rule: "backup")),
             new("giveitem", Player(), TokenOption("prefab", "prefab"),
                 IntegerOption("amount", "amount", 1, 1000), IntegerOption("quality", "quality", 1, 100, false),
-                new OptionSpec("data_id", "data_id", 3, false, 64, rule: "item_data")),
+                new OptionSpec("data_id", "data_id", 3, false, 64, rule: "item_data"), Notify()),
             new("teleport", Player(),
                 StringOption("to", "to", 128, false), Coordinate("x", false), Coordinate("y", false), Coordinate("z", false)),
             new("skillget", Player(), Skill(false)),
-            new("skillset", Player(), Skill(), NumberOption("value", "value", 0, 100)),
+            new("skillset", Player(), Skill(), NumberOption("value", "value", 0, 100), Notify()),
             new("heal", Player(), NumberOption("amount", "health", 0.001, 100000)),
             new("damage", Player(), NumberOption("amount", "damage", 0.001, 100000)),
             new("modsstatus"),
@@ -944,12 +951,13 @@ internal sealed class DiscordCommands : IDisposable
                 ["description_localizations"] = new JObject { ["ko"] = Description("Korean", DescriptionKey) },
                 ["required"] = Required };
             if (Type == 3) { definition["min_length"] = Rule == "backup" ? 32 : 1; definition["max_length"] = MaximumLength; }
-            else { definition["min_value"] = Minimum; definition["max_value"] = Maximum; }
+            else if (Type == 4 || Type == 10) { definition["min_value"] = Minimum; definition["max_value"] = Maximum; }
             return definition;
         }
         internal bool Valid(string value)
         {
             if (string.IsNullOrWhiteSpace(value) || value.Length > MaximumLength || value.Any(char.IsControl)) return false;
+            if (Type == 5) return value == "true" || value == "false";
             if (Type == 4)
                 return int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int integer) && integer >= Minimum && integer <= Maximum;
             if (Type == 10)
@@ -966,6 +974,7 @@ internal sealed class DiscordCommands : IDisposable
             value = string.Empty;
             if (token == null || (Type == 3 && token.Type != JTokenType.String) ||
                 (Type == 4 && token.Type != JTokenType.Integer) ||
+                (Type == 5 && token.Type != JTokenType.Boolean) ||
                 (Type == 10 && token.Type != JTokenType.Integer && token.Type != JTokenType.Float)) return false;
             value = Type == 3 ? Text(token) : token.ToString(Newtonsoft.Json.Formatting.None);
             return Valid(value);

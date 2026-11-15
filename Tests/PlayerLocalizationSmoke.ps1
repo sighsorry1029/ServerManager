@@ -217,6 +217,7 @@ try {
         $expectedArguments = if ($englishSlots.Count) { ([int]($englishSlots | Measure-Object -Maximum).Maximum) + 1 } else { 0 }
         $expectedWireMessage = -not $key.StartsWith('sm_menu_', [StringComparison]::Ordinal) -and
             -not $key.StartsWith('sm_event_', [StringComparison]::Ordinal) -and
+            -not $key.StartsWith('sm_receipt_', [StringComparison]::Ordinal) -and
             -not $key.StartsWith('sm_discord_', [StringComparison]::Ordinal)
         Assert-True ([bool]$isKnownMessage.Invoke($null, [object[]]@($key, $expectedArguments)) -eq $expectedWireMessage -and
             -not $isKnownMessage.Invoke($null, [object[]]@($key, ($expectedArguments + 1)))) ('Typed argument count validation disagrees with the English template: ' + $key)
@@ -229,6 +230,31 @@ try {
             }
         }
     }
+    # Owner receipts are local chat lines, never connection-rejection or Discord events.
+    foreach ($receipt in @{ sm_receipt_item = 2; sm_receipt_item_quality = 3; sm_receipt_skill = 2; sm_receipt_skills_all = 1 }.GetEnumerator()) {
+        $key = $receipt.Key
+        Assert-True ($english.ContainsKey($key) -and $korean.ContainsKey($key) -and
+            $english[$key] -cne $korean[$key] -and $korean[$key] -match '[\uac00-\ud7a3]') ('Missing localized owner receipt: ' + $key)
+        $slots = @([regex]::Matches($english[$key], '\{([0-9]+)\}') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        Assert-True (($slots -join ',') -eq ((0..($receipt.Value - 1)) -join ',')) ('Wrong receipt arguments: ' + $key)
+    }
+    $receiptType = $plugin.GetType('ServerManager.CharacterAdminReceipt', $true)
+    $forItem = $receiptType.GetMethod('ForItem', $allStatic)
+    $forSkill = $receiptType.GetMethod('ForSkill', $allStatic)
+    $format = $receiptType.GetMethod('FormatMessage', $allInstance)
+    $itemReceipt = $forItem.Invoke($null, [object[]]@('Iron Sword', 'SwordIron', 2, 4))
+    $plainReceipt = $forItem.Invoke($null, [object[]]@('', 'Torch', 7, 1))
+    $allReceipt = $forSkill.Invoke($null, [object[]]@('ALL', [single]42.5))
+    $skillReceipt = $forSkill.Invoke($null, [object[]]@('Swords', [single]42.5))
+    Assert-True ($format.Invoke($itemReceipt, @()) -ceq (Localized 'English' 'sm_receipt_item_quality' @('Iron Sword','2','4')) -and
+        $format.Invoke($plainReceipt, @()) -ceq (Localized 'English' 'sm_receipt_item' @('Torch','7')) -and
+        $format.Invoke($skillReceipt, @()) -ceq (Localized 'English' 'sm_receipt_skill' @('Swords','42.5')) -and
+        $format.Invoke($allReceipt, @()) -ceq (Localized 'English' 'sm_receipt_skills_all' @('42.5'))) 'Actual receipt formatting lost quality, stack size, label fallback, or the single all-skills summary.'
+    $hostileName = '<b>x</b>' + [char]10 + 'fake' + [char]0x202e + '\n' + ('x' * 190)
+    $safeReceipt = $forItem.Invoke($null, [object[]]@($hostileName, 'ModSword', 1, 1))
+    $safeLine = $format.Invoke($safeReceipt, @())
+    Assert-True ($safeLine.StartsWith('[SERVER]') -and $safeLine -notmatch '[<>\\\r\n\u202e]' -and
+        $safeLine -notmatch 'x{97}' -and (Localized 'Korean' 'sm_receipt_item' @('검','1')).StartsWith('[서버]')) 'A modded name can forge extra lines, markup, or escape the bounded local chat label.'
     # Use the plugin's real embedded dictionaries, not copies of the bot text.
     # Discord presentation must not enlarge the player-message wire allowlist.
     $discordCommandNames = @('status', 'players', 'announce', 'chat', 'banlist', 'adminlist',
@@ -237,7 +263,7 @@ try {
         'characterrestore', 'giveitem', 'teleport', 'skillget', 'skillset', 'heal', 'damage',
         'modsstatus', 'modsreload', 'discordstatus', 'discordtest', 'cronstatus', 'cronack', 'help', 'rcon')
     $discordOptionNames = @('player', 'steam_id', 'skill', 'x', 'y', 'z', 'announcement', 'chat',
-        'key', 'event', 'page', 'backup_id', 'prefab', 'amount', 'quality', 'data_id', 'to', 'value',
+        'key', 'event', 'page', 'backup_id', 'prefab', 'amount', 'quality', 'data_id', 'notify', 'to', 'value',
         'health', 'damage', 'job', 'command')
     $discordNoticeArities = @{
         unauthorized = 0; invalid_arguments = 0; registration_stale = 0; rate_limited = 0
@@ -251,9 +277,9 @@ try {
     foreach ($name in $discordOptionNames) { $discordArities['sm_discord_option_' + $name] = 0 }
     foreach ($entry in $discordNoticeArities.GetEnumerator()) { $discordArities['sm_discord_' + $entry.Key] = [int]$entry.Value }
     [string[]]$discordKeys = @($english.Keys | Where-Object { $_.StartsWith('sm_discord_', [StringComparison]::Ordinal) } | Sort-Object)
-    Assert-True ($discordCommandNames.Count -eq 34 -and $discordOptionNames.Count -eq 22 -and
-        $discordArities.Count -eq 77 -and ($discordKeys -join '|') -ceq (@($discordArities.Keys | Sort-Object) -join '|')) `
-        'The real Discord resources must contain exactly 34 command descriptions, 22 option descriptions and 21 adapter notices.'
+    Assert-True ($discordCommandNames.Count -eq 34 -and $discordOptionNames.Count -eq 23 -and
+        $discordArities.Count -eq 78 -and ($discordKeys -join '|') -ceq (@($discordArities.Keys | Sort-Object) -join '|')) `
+        'The real Discord resources must contain exactly 34 command descriptions, 23 option descriptions and 21 adapter notices.'
     foreach ($discordKey in $discordKeys) {
         $arity = [int]$discordArities[$discordKey]
         [string[]]$literalValues = if ($arity -eq 1) { @('RAW_{0}_sm_discord_success_@everyone_<player>') } else { @() }

@@ -80,6 +80,7 @@ internal static class PlayerLocalizer
             EnsureEnglishLocked();
             return key != null && !key.StartsWith("sm_menu_", StringComparison.Ordinal) &&
                 !key.StartsWith("sm_event_", StringComparison.Ordinal) &&
+                !key.StartsWith("sm_receipt_", StringComparison.Ordinal) &&
                 !key.StartsWith("sm_discord_", StringComparison.Ordinal) && argumentCount >= 0 &&
                 _english.TryGetValue(key, out MessageTemplate? template) && template.ArgumentCount == argumentCount;
         }

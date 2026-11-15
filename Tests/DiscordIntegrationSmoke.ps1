@@ -83,9 +83,8 @@ try {
     $incompatibilities = @($plugin.CustomAttributes | Where-Object {
         $_.AttributeType.FullName -eq 'BepInEx.BepInIncompatibility'
     })
-    Assert-True ($incompatibilities.Count -eq 1 -and
-        $incompatibilities[0].ConstructorArguments[0].Value -ceq 'Azumatt.MaxPlayerCount') `
-        'Only the explicitly incompatible MaxPlayerCount plugin may prevent ServerManager loading; other listener checks remain runtime fail-closed.'
+    Assert-True ($incompatibilities.Count -eq 0) `
+        'The embedded Discord integration must not introduce a plugin-wide incompatibility.'
 
     $runtime = $module.GetType('ServerManager.Discord.DiscordRuntime')
     $settings = $module.GetType('ServerManager.Discord.DiscordSettings')

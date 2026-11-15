@@ -79,11 +79,13 @@ try {
     $playerDataField = $game.GetType("PlayerProfile").GetField("m_playerData", $allInstance)
     [byte[]]$oldInner = $playerDataField.GetValue($oldProfile)
     [byte[]]$newInner = $playerDataField.GetValue($newProfile)
-    # Skills-v2/count, custom-data count, stamina/eitr and empty build-menu state (28 bytes).
-    $skillsOffset = $oldInner.Length - 28
+    # New-ProfilePayload's skill header is followed by custom count, three vitals,
+    # build menu, drop counters, and item upgrade seeds (seven 4-byte fields).
+    $skillTailBytes = 7 * 4
+    $skillsOffset = $oldInner.Length - $skillTailBytes - 8
     Assert-True ($newInner.Length -eq $oldInner.Length + 12 -and
         (Test-Bytes ([byte[]]$oldInner[0..($skillsOffset - 1)]) ([byte[]]$newInner[0..($skillsOffset - 1)])) -and
-        (Test-Bytes ([byte[]]$oldInner[($oldInner.Length - 20)..($oldInner.Length - 1)]) ([byte[]]$newInner[($newInner.Length - 20)..($newInner.Length - 1)]))) "Skill splice changed non-skill player fields."
+        (Test-Bytes ([byte[]]$oldInner[($oldInner.Length - $skillTailBytes)..($oldInner.Length - 1)]) ([byte[]]$newInner[($newInner.Length - $skillTailBytes)..($newInner.Length - 1)]))) "Skill splice changed non-skill player fields."
     $oldOuterLength = $payload.Length - $oldInner.Length - 4
     Assert-True (Test-Bytes ([byte[]]$payload[0..($oldOuterLength - 1)]) ([byte[]]$materialized[0..($oldOuterLength - 1)])) "Skill splice changed outer identity, stats, or metadata."
     $replaceSkill = $plugin.GetType("ServerManager.ValheimPlayerProfileCodec").GetMethod("ReplaceSkillAdmin", $allInstance)
@@ -185,7 +187,7 @@ try {
     }
     [byte[]]$seedSkillBytes = $encodeSkills.Invoke($null, [object[]]@(,$semanticSkills))
     [byte[]]$modInner = [byte[]]$oldInner[0..($skillsOffset - 1)] + $seedSkillBytes +
-        [byte[]]$oldInner[($oldInner.Length - 20)..($oldInner.Length - 1)]
+        [byte[]]$oldInner[($oldInner.Length - $skillTailBytes)..($oldInner.Length - 1)]
     [byte[]]$modPayload = [byte[]]$payload[0..($oldOuterLength - 1)] +
         [BitConverter]::GetBytes([int]$modInner.Length) + $modInner
     $modEditArguments = [object[]]@($identity, $modPayload, "set", "all", [single]25, $null)
@@ -203,7 +205,11 @@ try {
     [byte[]]$vanillaSeedBytes = $encodeSkills.Invoke($null, [object[]]@(,$vanillaSeed))
     $localSkills.Load([ZPackage]::new($vanillaSeedBytes))
     function Invoke-LocalSkill([string[]]$Action) {
-        return $script:applySkill.Invoke($null, [object[]]@($script:localSkills, $Action))
+        $arguments = [object[]]@($script:localSkills, $Action, $null)
+        $result = $script:applySkill.Invoke($null, $arguments)
+        Assert-True (($null -ne $arguments[2]) -eq ($result.Success -and $Action[1] -ieq 'set')) `
+            "Only a completed skill set should produce a target receipt: $Action"
+        return $result
     }
     function Get-LocalSkillBytes {
         $package = [ZPackage]::new()
@@ -237,6 +243,8 @@ try {
     $localAll = Invoke-LocalSkill @("skill", "set", "all", "25")
     Assert-True ($localAll.Success -and $localAll.Data["Swords"] -eq "25" -and $localAll.Data["Swords.xp"] -eq "0" -and
         $localAll.Data["Axes"] -eq "25" -and $localAll.Data["Axes.xp"] -eq "0") "Actual Skills.Load set all failed to update trained and untrained skills."
+    $silentSkill = Invoke-LocalSkill @("skill", "set-silent", "Swords", "37.5")
+    Assert-True ($silentSkill.Success -and (Invoke-LocalSkill @("skill", "get", "Swords")).Data["Swords"] -eq "37.5") "Silent skill set must change the skill without creating a receipt."
     # Missing game definitions must be rejected before Skills.Load clears data.
     $missingSkillDefinition = @($definitions | Where-Object { $_.m_skill.ToString() -eq "Swords" })[0]
     $definitionsType.GetMethod("Remove").Invoke($definitions, [object[]]@($missingSkillDefinition.PSObject.BaseObject)) | Out-Null
@@ -745,9 +753,21 @@ try {
     try {
         $actions = $definition.MainModule.Types | Where-Object FullName -eq "ServerManager.CharacterAdminActions"
         $give = $actions.Methods | Where-Object Name -eq "GiveItem"
-        $calls = @($give.Body.Instructions | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] } | ForEach-Object { $_.Operand.FullName })
+        $grantMethods = @($actions.Methods | Where-Object Name -in @('GiveItem', 'GivePlainItems', 'GivePresetItems'))
+        $calls = @($grantMethods | ForEach-Object { $_.Body.Instructions } | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] } | ForEach-Object { $_.Operand.FullName })
         Assert-True (($calls -join "`n") -notmatch "Instantiate|DropItem|Player::.ctor") "Item grant instantiates/drops a world object or fake Player."
         Assert-True (($calls -join "`n") -match "Inventory::AddItem\(ItemDrop/ItemData\)") "Grant lost its preflighted ItemData AddItem path."
+        $giveCalls = @($give.Body.Instructions | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] })
+        $receipt = @($giveCalls | Where-Object { $_.Operand.Name -eq 'ForItem' })
+        $success = @($giveCalls | Where-Object { $_.Operand.Name -eq 'get_Success' })
+        Assert-True ($receipt.Count -eq 1 -and $success.Count -eq 1) 'Item grants must share one success-only receipt for plain and preset inventory transactions.'
+        . (Join-Path $PSScriptRoot 'CecilControlFlow.ps1')
+        Assert-True (-not (Test-CecilReachable $give.Body.Instructions[0] $receipt[0] $success)) 'An item receipt can bypass the grant result.'
+        $predicate = $success[0]; $opcode = $predicate.OpCode; $operand = $predicate.Operand
+        try {
+            $predicate.OpCode = [Mono.Cecil.Cil.OpCodes]::Ldc_I4_0; $predicate.Operand = $null
+            Assert-True (-not (Test-CecilReachable $predicate $receipt[0])) 'A failed (including rolled-back) item grant can still produce a receipt.'
+        } finally { $predicate.OpCode = $opcode; $predicate.Operand = $operand }
         $apply = $actions.Methods | Where-Object Name -eq "Apply"
         Assert-True (@($apply.Body.Instructions | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq "TeleportTo" }).Count -eq 1) "Teleport no longer calls the verified public player API."
         $offline = ($definition.MainModule.Types | Where-Object FullName -eq "ServerManager.CharacterSnapshotService").Methods | Where-Object Name -eq "ApplyOfflineSkillAdmin"

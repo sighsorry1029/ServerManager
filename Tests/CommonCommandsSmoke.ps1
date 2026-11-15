@@ -213,7 +213,24 @@ foreach ($name in $spaceNames) {
 }
 Assert-Syntax 'sm:giveitem Varg Red Tooth Wood 2' $false
 Assert-True (((Read-Command 'sm:giveitem player Wood 2 3') -join '|') -ceq 'item|give|player|Wood|2|3') 'Existing explicit quality must retain the six-token internal shape.'
-Assert-True ($syntax.Invoke($null, @('giveitem')) -ceq 'sm:giveitem <target> <prefab> <amount> [quality] [dataId]') 'Giveitem help must document the preset ID after quality.'
+Assert-True ($syntax.Invoke($null, @('giveitem')) -ceq 'sm:giveitem <target> <prefab> <amount> [quality] [dataId] [notify=true|false]') 'Giveitem help must document the optional preset and receipt.'
+Assert-True ($syntax.Invoke($null, @('skillset')) -ceq 'sm:skillset <target> <skill> <value> [notify=true|false]') 'Skillset help must document the optional receipt.'
+$suppress = $commands.GetMethod('SuppressTargetReceipt', $flags)
+foreach ($form in @('giveitem "Some Name" Wood 1', 'giveitem player Wood 2 3', 'giveitem player Wood 2 3 notify',
+    'giveitem player Wood 2 3 false', 'skillset player Swords 0', 'skillset player all 33.5')) {
+    $plain = Read-Command $form
+    $enabled = Read-Command ("sm:$form NOTIFY=true")
+    $quiet = Read-Command ("sm:$form notify=FALSE")
+    Assert-True (($enabled -join '|') -ceq ($plain -join '|') -and
+        ($quiet -join '|') -ceq (($plain -join '|') + '|notify=false') -and
+        -not $suppress.Invoke($null, [object[]]@(,$plain)) -and $suppress.Invoke($null, [object[]]@(,$quiet))) "Receipt option changed positional arguments: $form"
+}
+foreach ($line in @('giveitem player Wood 1 notify=off', 'giveitem player Wood 1 notify=false 2',
+    'giveitem player Wood 1 notify=true notify=false', 'skillset player Swords 50 notify=false notify=true',
+    'skillset player Swords notify=false', 'skillset player Swords 50 notify=', 'skillget player Swords notify=false',
+    'heal player 10 notify=false')) {
+    Assert-Syntax $line $false
+}
 $commandItemDataId = $commands.GetMethod('IsItemDataId', $flags)
 $presetItemDataId = $assembly.GetType('ServerManager.Commands.ItemDataPresets', $true).GetMethod('IsValidId', $flags)
 $identifierCases = @($null, '', 'A', 'Az_09-', ('a' * 64), ('a' * 65), 'with space',
@@ -325,6 +342,16 @@ try {
     [CommonCommandSmokeAuthorization]::Allowed = $false
     $tick.Invoke($null, @()) | Out-Null
     Assert-True ($work.Result.Code -eq 'unauthorized' -and $work.Result.Data['data_id'] -ceq 'Mixed-Preset_01') 'Preset selection must retain authorization and only the validated selected ID for auditing.'
+    foreach ($case in @(
+        @{ Line = 'giveitem player Wood 1 1 Mixed-Preset_01 notify=false'; Preset = 'Mixed-Preset_01' },
+        @{ Line = 'giveitem player Wood 1 1 notify=false'; Preset = $null },
+        @{ Line = 'skillset player Swords 50 notify=false'; Preset = $null })) {
+        $work = $execute.Invoke($null, @($case.Line, $caller))
+        $tick.Invoke($null, @()) | Out-Null
+        Assert-True ($work.Result.Code -eq 'unauthorized' -and
+            $work.Result.Data.ContainsKey('data_id') -eq ($null -ne $case.Preset) -and
+            (!$case.Preset -or $work.Result.Data['data_id'] -ceq $case.Preset)) 'Silencing a receipt cannot change authorization or leak the flag as a preset ID.'
+    }
     [CommonCommandSmokeAuthorization]::Allowed = $true
 
     $work = $execute.Invoke($null, @('sm:characterrestore "Some Name" 0123456789abcdef0123456789abcdef', $caller))

@@ -41,6 +41,7 @@ internal static class ServerCommands
     internal const int MaximumLineLength = 2048;
     internal const int MaximumArguments = 16;
     internal const int MaximumOutputLength = 1800;
+    private const string QuietReceiptOption = "notify=false";
     private const int Capacity = 64;
     private const int PerTick = 8;
     private const BindingFlags Members = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
@@ -76,10 +77,10 @@ internal static class ServerCommands
         new("characterinfo", "character info", "<target>", true),
         new("characterbackups", "character backups", "<target> [page]", true),
         new("characterrestore", "character restore", "<target> <backupId>", true),
-        new("giveitem", "item give", "<target> <prefab> <amount> [quality] [dataId]", true),
+        new("giveitem", "item give", "<target> <prefab> <amount> [quality] [dataId] [notify=true|false]", true),
         new("teleport", "teleport", "<target> (<x> <y> <z> | to <player>)", true),
         new("skillget", "skill get", "<target> [skill]", true),
-        new("skillset", "skill set", "<target> <skill> <value>", true),
+        new("skillset", "skill set", "<target> <skill> <value> [notify=true|false]", true),
         new("heal", "heal", "<target> <amount>", true),
         new("damage", "damage", "<target> <amount>", true),
         new("modsstatus", "mods status"),
@@ -458,8 +459,30 @@ internal static class ServerCommands
         }
         else return false;
         NormalizeVerbs(args);
+        if (action == "giveitem" || action == "skillset")
+        {
+            string option = args[args.Length - 1];
+            if (option.StartsWith("notify=", StringComparison.OrdinalIgnoreCase))
+            {
+                bool quiet = Is(option, QuietReceiptOption);
+                if (!quiet && !Is(option, "notify=true"))
+                { error = "Use notify=true or notify=false as the last argument."; return false; }
+                // Validate the original positional grammar exactly once. In particular,
+                // duplicate flags cannot be mistaken for a quality, preset, or skill.
+                string[] positional = args.Take(args.Length - 1).ToArray();
+                if (!Validate(positional, out error)) return false;
+                if (quiet) args[args.Length - 1] = QuietReceiptOption;
+                else args = positional;
+                return true;
+            }
+        }
         return Validate(args, out error);
     }
+
+    // Only used with normalized command arguments, never a free-form player's name/message.
+    internal static bool SuppressTargetReceipt(string[] args) =>
+        args.Length >= 6 && args[args.Length - 1] == QuietReceiptOption &&
+        ((args[0] == "item" && args[1] == "give") || (args[0] == "skill" && args[1] == "set"));
 
     // Route by the first verb, not by successful validation: a malformed ban
     // must fail in the exact-account handler, never fall back to vanilla Ban.
@@ -640,7 +663,8 @@ internal static class ServerCommands
         string key, value;
         if (args.Length >= 4 && args[0] == "character" && args[1] == "restore" && IsBackupId(args[3]))
         { key = "backup_id"; value = args[3]; }
-        else if (args.Length == 7 && args[0] == "item" && args[1] == "give" && IsItemDataId(args[6]))
+        else if ((args.Length == 7 || args.Length == 8 && SuppressTargetReceipt(args)) &&
+            args[0] == "item" && args[1] == "give" && IsItemDataId(args[6]))
         { key = "data_id"; value = args[6]; }
         else return result;
         Dictionary<string, string> data = result.Data.Take(15).ToDictionary(pair => pair.Key, pair => pair.Value);

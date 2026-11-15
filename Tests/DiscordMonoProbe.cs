@@ -837,7 +837,7 @@ namespace ServerManager.Tests
                 .Invoke(actor("Complete", "player"), new object[] { "steamworks:76561198000000001" });
             var kinds = new[] { "server.ready", "server.shutdown", "server.saved", "player.login", "player.leave", "player.death", "boss.killed",
                 "raid.started", "raid.ended", "server.announcement" };
-            string[] filters = { "server.status", "server.saved", "player.connection", "player.death", "boss.killed",
+            string[] filters = { "server.status", "server.saved", "player.connection", "player.first_join", "player.death", "boss.killed",
                 "raid.status", "server.announcement" };
             foreach (bool anonymous in new[] { false, true })
             foreach (string language in new[] { "", "English", "Korean", "Unknown_Public_Language" })
@@ -896,13 +896,13 @@ namespace ServerManager.Tests
                                 break;
                         }
                     }
-                    foreach (string removed in new[] { "server.started", "player.first_join" })
-                        Check(!(bool)sender.GetMethod("Enqueue").Invoke(webhooks, new[] { ReloadEvent(eventType, Guid.NewGuid().ToString("N"), removed, "removed") }),
-                            "Actual Mono never dispatches removed webhook kind " + removed);
+                    foreach (string raw in new[] { "server.started", "player.first_join" })
+                        Check(!(bool)sender.GetMethod("Enqueue").Invoke(webhooks, new[] { ReloadEvent(eventType, Guid.NewGuid().ToString("N"), raw, "audit only") }),
+                            "Actual Mono never dispatches the standalone audit kind " + raw);
                     Task running = (Task)sender.GetMethod("RunAsync").Invoke(webhooks, new object[] { CancellationToken.None });
                     await ((Task)sender.GetMethod("StopAsync").Invoke(webhooks, new object[] { TimeSpan.FromSeconds(3) })).ConfigureAwait(false);
                     await running.ConfigureAwait(false);
-                    Check(handler.Calls == kinds.Length, "Actual Mono keeps the partial-save warning in the same single delivery");
+                    Check(handler.Calls == kinds.Length, "Actual Mono sends one card per source even when both login selectors match");
                     for (int index = 0; index < kinds.Length; index++)
                     {
                         string body = handler.Bodies[index]; object payload = parseJson.Invoke(null, new object[] { body });
@@ -1381,16 +1381,18 @@ namespace ServerManager.Tests
             MethodInfo parse = settingsType.GetMethod("ParseForReload", BindingFlags.Static | BindingFlags.NonPublic);
             MethodInfo filterFor = settingsType.GetMethod("GetWebhookEventFilter", BindingFlags.Static | BindingFlags.NonPublic);
             var selectable = (HashSet<string>)settingsType.GetField("PublicEvents", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
-            Check(selectable.Count == 17, "Actual Mono exposes the 17 grouped webhook selectors");
+            Check(selectable.Count == 19 && selectable.Contains("player.first_join"), "Actual Mono exposes the first-join filter in the nineteen-selector catalog");
             const string securityUrl = "https://discord.com/api/webhooks/123/grouped-security-offline";
             const string validationUrl = "https://discord.com/api/webhooks/456/grouped-validation-offline";
             const string serverUrl = "https://discord.com/api/webhooks/789/grouped-server-offline";
             const string connectionUrl = "https://discord.com/api/webhooks/987/grouped-connection-offline";
+            const string firstJoinUrl = "https://discord.com/api/webhooks/432/first-join-offline";
             const string raidUrl = "https://discord.com/api/webhooks/654/grouped-raid-offline";
             string groupedYaml = "webhooks:\n  - name: security\n    url: " + securityUrl + "\n    events: [security.alert]\n" +
                 "  - name: validation\n    url: " + validationUrl + "\n    events: [character.validation]\n" +
                 "  - name: server\n    url: " + serverUrl + "\n    events: [server.status]\n" +
                 "  - name: connection\n    url: " + connectionUrl + "\n    events: [player.connection]\n" +
+                "  - name: newcomers\n    url: " + firstJoinUrl + "\n    events: [player.first_join]\n    include_steam_id: true\n" +
                 "  - name: raid\n    url: " + raidUrl + "\n    events: [raid.status]\n";
             foreach (string old in new[] { "server.ready", "server.shutdown", "player.login", "player.leave", "raid.started", "raid.ended",
                 "combat.pvp_kill", "security.detection", "security.response",
@@ -1431,16 +1433,32 @@ namespace ServerManager.Tests
                         (string)eventType.GetProperty("Kind").GetValue(value, null) == sources[index],
                         "Grouped routing preserves the original source event " + sources[index]);
                 }
-                foreach (string synthetic in new[] { "server.status", "player.connection", "raid.status", "security.alert", "character.validation", "cron.executed", "unknown.event" })
+                const string steamId = "76561198000000001";
+                const BindingFlags instance = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                Type actorType = plugin.GetType("ServerManager.Events.ServerManagerActor", true);
+                object newcomer = actorType.GetMethod("WithPlayerAccount", instance).Invoke(
+                    Activator.CreateInstance(actorType, instance, null, new object[] { "internal-id", "New Viking", "player" }, null),
+                    new object[] { "steamworks:" + steamId });
+                object firstLogin = Activator.CreateInstance(eventType, instance,
+                    null, new object[] { "first-login-mono", DateTime.UtcNow, "mono-probe", "player.login", "authoritative", newcomer, null,
+                        new Dictionary<string, string> { ["first_join"] = "true" } }, null);
+                Check((bool)sender.GetMethod("Enqueue").Invoke(webhooks, new[] { firstLogin }),
+                    "Actual Mono admits a marked login on both independently configured routes");
+                foreach (string synthetic in new[] { "server.status", "player.connection", "player.first_join", "raid.status", "security.alert", "character.validation", "cron.executed", "unknown.event" })
                     Check(filterFor.Invoke(null, new object[] { synthetic }) == null &&
                         !(bool)sender.GetMethod("Enqueue").Invoke(webhooks, new[] { ReloadEvent(eventType, Guid.NewGuid().ToString("N"), synthetic, "not a source") }),
-                        "Selectors are not synthetic source events and unknown sources cannot dispatch");
+                        "Neither a raw first-join audit event nor a synthetic or unknown kind can directly dispatch");
                 Task running = (Task)sender.GetMethod("RunAsync").Invoke(webhooks, new object[] { CancellationToken.None });
                 await ((Task)sender.GetMethod("StopAsync").Invoke(webhooks, new object[] { TimeSpan.FromSeconds(3) })).ConfigureAwait(false);
                 await running.ConfigureAwait(false);
-                Check(handler.Calls == 10 && new[] { securityUrl, validationUrl, serverUrl, connectionUrl, raidUrl }
-                    .All(destination => handler.Urls.Count(url => url == destination + "?wait=true") == 2),
-                    "Each grouped route delivers only its two distinct source events, once each");
+                string privateCard = handler.Bodies.Where((body, index) => handler.Urls[index] == firstJoinUrl + "?wait=true").Single();
+                Check(handler.Calls == 12 && new[] { securityUrl, validationUrl, serverUrl, raidUrl }
+                    .All(destination => handler.Urls.Count(url => url == destination + "?wait=true") == 2) &&
+                    handler.Urls.Count(url => url == connectionUrl + "?wait=true") == 3 &&
+                    handler.Bodies.Count(body => body.Contains("New Viking joined for the first time")) == 2 &&
+                    privateCard.Contains("New Viking joined for the first time") && privateCard.Contains("Steam ID: " + steamId) &&
+                    handler.Bodies.Count(body => body.Contains(steamId)) == 1,
+                    "Only the first-join destination opts into the verified ID; the broad route also receives ordinary joins and leaves");
                 foreach (string title in new[] { "Security observation", "Security response", "Character save rejected", "Character validation notice",
                     "Server ready", "Server shutdown", "Unknown player joined", "Unknown player left", "Raid started", "Raid ended" })
                     Check(handler.Bodies.Count(body => body.Contains(title)) == 1,

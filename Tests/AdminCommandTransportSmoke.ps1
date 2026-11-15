@@ -90,6 +90,9 @@ foreach ($fixture in @(
     @{ Kind = 'Request'; Args = [string[]]@('sm:chat "hello \"world\""') },
     @{ Kind = 'Result'; Args = [string[]]@('1', 'save_requested', 'Not a disk completion.', 'save-operation-23') },
     @{ Kind = 'PlayerAction'; Args = [string[]]@('item', 'give', 'Wood', '10', '1') },
+    @{ Kind = 'PlayerAction'; Args = [string[]]@('item', 'give-silent', 'Wood', '10', '1') },
+    @{ Kind = 'PlayerAction'; Args = [string[]]@('item', 'give-silent', 'ShieldWood', '1', '2', '{"mod#preserved":"yes"}') },
+    @{ Kind = 'PlayerAction'; Args = [string[]]@('skill', 'set-silent', 'all', '50') },
     @{ Kind = 'PlayerAction'; Args = [string[]]@('item', 'give', 'ShieldWood', '1', '2', '{"mod#lock":"","mod#value":"a\\b\n\u0085\u2028\u2029"}') },
     @{ Kind = 'PlayerResult'; Args = [string[]]@('1', 'ram_accepted', 'RAM accepted, checkpoint pending.') },
     @{ Kind = 'Shout'; Args = [string[]]@('Server', ('Unicode: ' + [char]0xD55C + [char]0xAE00)) },
@@ -327,6 +330,42 @@ $clientTick = Method-IL 'TickClientAdminAction'
 $captureCall = @(Calls $clientTick 'CaptureProfileToBytes')
 $ackCall = @(Calls $clientTick 'HasAcknowledgedCapture')
 Assert-True ($captureCall.Count -eq 1 -and $ackCall.Count -eq 1 -and $captureCall[0].Offset -lt $ackCall[0].Offset) 'Client action must capture then wait for the specific save acknowledgement.'
+# Verify both outcomes of the actual owner-side RAM confirmation gate without running Unity.
+# Temporarily substitute the gate result in the in-memory Cecil inspection copy only.
+. (Join-Path $PSScriptRoot 'CecilControlFlow.ps1')
+foreach ($path in @(
+    @{ Tick = $clientTick; Gate = 'HasAcknowledgedCapture'; Pending = '_clientAdminAction' },
+    @{ Tick = (Method-IL 'TickHostAdminAction'); Gate = 'CaptureForWorldCheckpoint'; Pending = '_hostAdminAction' }
+)) {
+    $tick = $path.Tick
+    $gates = @(Calls $tick $path.Gate)
+    $show = @(Calls $tick 'Show' | Where-Object { $_.Operand.DeclaringType.Name -eq 'CharacterAdminReceipt' })
+    Assert-True ($gates.Count -eq 1 -and $show.Count -eq 1) "Missing unique $($path.Gate) and owner receipt in $($tick.Name)."
+    $gate = $gates[0]
+    $pendingClears = @($tick.Body.Instructions | Where-Object { $_.OpCode.Name -eq 'stsfld' -and
+        $_.Operand.Name -eq $path.Pending -and $_.Previous.OpCode.Name -eq 'ldnull' })
+    Assert-True ($pendingClears.Count -gt 0 -and
+        -not (Test-CecilReachable $tick.Body.Instructions[0] $show[0] $pendingClears)) 'A pending action can display its receipt again on the next tick.'
+    $opcode = $gate.OpCode; $operand = $gate.Operand
+    try {
+        $gate.Operand = $null
+        $gate.OpCode = [Mono.Cecil.Cil.OpCodes]::Ldc_I4_0
+        Assert-True (-not (Test-CecilReachable $gate $show[0])) "Unconfirmed $($path.Gate) can display a receipt."
+        $gate.OpCode = [Mono.Cecil.Cil.OpCodes]::Ldc_I4_1
+        Assert-True (Test-CecilReachable $gate $show[0]) "Confirmed $($path.Gate) lost its receipt path."
+    } finally { $gate.OpCode = $opcode; $gate.Operand = $operand }
+}
+$presenter = $definition.MainModule.GetType('ServerManager.CharacterAdminReceipt')
+$showReceipt = $presenter.Methods | Where-Object Name -eq 'Show'
+$append = @(Calls $showReceipt 'AddString')
+Assert-True ($append.Count -eq 1 -and $append[0].Operand.DeclaringType.Name -eq 'Terminal' -and
+    $append[0].Operand.Parameters.Count -eq 1 -and (Calls $showReceipt 'WakeChat').Count -eq 1) 'A receipt must append one plain line to the local chat and wake it without typing.'
+foreach ($method in $presenter.Methods) {
+    $worldCalls = @($method.Body.Instructions | Where-Object { $_.Operand -is [Mono.Cecil.MethodReference] -and
+        ($_.Operand.DeclaringType.Name -in @('EffectList', 'ZDOMan', 'ZNetView', 'ZRoutedRpc', 'ZRpc', 'MessageHud', 'AudioSource') -or
+        $_.Operand.Name -in @('Instantiate', 'SendAdminPacket', 'OnNewChatMessage', 'ActivateInputField', 'TryBroadcastServerShout', 'ShowServerShout')) })
+    Assert-True ($worldCalls.Count -eq 0) 'A private chat receipt must not send speech, take focus, broadcast, play audio, or produce a HUD/world effect.'
+}
 $complete = Method-IL 'CompletePlayerAdminAction'
 Assert-True ((Calls $complete 'TryGetServerSession').Count -ge 1 -and (Calls $complete 'get_CurrentRevision').Count -ge 1) 'Server must independently verify an accepted character revision before success.'
 Assert-True ((Calls $complete 'get_IsAuthorized').Count -gt 0 -and (Calls $complete 'IsAdminSession').Count -gt 0) 'Incoming action completion must recheck the current caller and target session, not race the next tick.'
@@ -398,7 +437,9 @@ Assert-True ($showChat.Parameters.Count -eq 2) 'Server display must accept only 
 $boxedStyle = @($showChat.Body.Instructions | Where-Object { $_.OpCode.Name -eq 'box' -and $_.Operand.FullName -eq 'Talker/Type' })
 $shoutValue = [int][Enum]::Parse($talkerKind, 'Shout')
 Assert-True ($boxedStyle.Count -eq 1 -and $boxedStyle[0].Previous.OpCode.Name -eq "ldc.i4.$shoutValue") 'The one server display style must be the native Shout enum value.'
-Assert-True (Has-Text $showChat 'm_hideTimer') 'Incoming server chat must reset visibility, not only append to a hidden buffer.'
+$wake = Method-IL 'WakeChat'
+Assert-True ((Calls $showChat 'WakeChat').Count -eq 1 -and (Calls $wake 'SetValue').Count -eq 1 -and
+    (Has-Text (Method-IL '.cctor') 'm_hideTimer') -and (Calls $wake 'ActivateInputField').Count -eq 0) 'Local chat display must wake the window through its timer, not activate chat input.'
 Assert-True ((Calls $showChat 'ActivateInputField').Count -eq 0 -and (Calls $showChat 'AddInworldText').Count -eq 0) 'Discord shout must not steal input focus or manufacture world text.'
 $definition.Dispose()
 Write-Output 'Admin transport codec, malformed packets, capture ACKs, target identity, and compiled guard smoke tests passed.'

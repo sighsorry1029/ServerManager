@@ -57,6 +57,7 @@ internal static class DiscordTransportSmoke
         await RoutesPrivacyAndDedupe();
         await GroupedWebhookFilters();
         await GroupedLifecycleFilters();
+        await FirstJoinRouteSelection();
         await SteamIdRoutePrivacy();
         await SteamIdTrustedSourceAndBounds();
         await SteamIdSnapshotAndReload();
@@ -303,14 +304,16 @@ internal static class DiscordTransportSmoke
         string[] retiredSelectors = { "combat.pvp_kill", "character.save_rejected", "character.validation_observed",
             "security.detection", "security.response", "server.ready", "server.shutdown", "player.login", "player.leave",
             "raid.started", "raid.ended" };
-        Check(DiscordSettings.PublicEvents.Count == 18 && DiscordSettings.PublicEvents.SetEquals(
-                SourceEventKinds.Select(ExpectedWebhookFilter).Concat(new[] { "cron.executed", "discord.shout" })),
-            "Eighteen selectable filters cover game, Discord and final cron events.");
+        Check(DiscordSettings.PublicEvents.SetEquals(
+                SourceEventKinds.Select(ExpectedWebhookFilter).Concat(new[] { "player.first_join", "cron.executed", "discord.shout" })),
+            "The selectable filters cover ordinary sources, marked first logins, Discord and final cron events.");
         foreach (string kind in SourceEventKinds)
             Check(DiscordSettings.GetWebhookEventFilter(kind) == ExpectedWebhookFilter(kind), "Exact source-to-filter mapping: " + kind);
         foreach (string kind in new[] { "character.validation", "security.alert", "server.status", "player.connection", "raid.status", "cron.executed",
             "player.death.extra", "security.*", "chat.normal", "unknown" })
             Check(DiscordSettings.GetWebhookEventFilter(kind) == null, "Group selectors and unknown kinds are not source events: " + kind);
+        Check(DiscordSettings.GetWebhookEventFilter("player.first_join") == null,
+            "The standalone first-join audit/API event is not a webhook source.");
 
         using (FakeHandler handler = new FakeHandler())
         using (DiscordHttp http = new DiscordHttp("", delegate { }, handler))
@@ -462,6 +465,62 @@ internal static class DiscordTransportSmoke
                 Check(!payload.ToString().Contains("PRIVATE") && !payload.ToString().Contains("100,200,300") &&
                     !payload.ToString().Contains("Steam ID:"), "Grouped lifecycle cards retain fixed metadata exclusions and default identity privacy.");
             }
+        }
+    }
+
+    private static async Task FirstJoinRouteSelection()
+    {
+        const string anonymousUrl = "https://discord.com/api/webhooks/333333/offline-first-join-anonymous";
+        const string steam = "76561198000000001";
+        DiscordSettings settings = Settings("player.connection");
+        settings.WebhookRoutes.Add(new DiscordWebhookRoute { Name = "Private first joins", Url = ReloadedWebhook,
+            IncludeSteamId = true, Events = new HashSet<string> { "player.first_join" } });
+        settings.WebhookRoutes.Add(new DiscordWebhookRoute { Name = "Anonymous first joins", Url = anonymousUrl,
+            IncludeSteamId = true, AnonymousPrefix = "Guest", Events = new HashSet<string> { "player.first_join" } });
+        using (FakeHandler handler = new FakeHandler())
+        using (DiscordHttp http = new DiscordHttp("", delegate { }, handler))
+        using (DiscordWebhooks webhooks = new DiscordWebhooks(settings, http, delegate { }))
+        {
+            foreach (string kind in new[] { "player.first_join", "server.saved" })
+            {
+                ServerManagerEvent other = SteamIdentityEvent(kind, "steamworks:" + steam);
+                other.Fields["first_join"] = "true";
+                Check(!webhooks.Enqueue(other), "The login marker cannot promote a raw audit or unrelated event: " + kind);
+            }
+            var publicTitles = new List<string>();
+            foreach (string? flag in new string?[] { null, "false", "TRUE", " true", "1", "true" })
+            {
+                ServerManagerEvent login = SteamIdentityEvent("player.login", "steamworks:" + steam);
+                if (flag != null) login.Fields["first_join"] = flag;
+                Check(webhooks.Enqueue(login) && !webhooks.Enqueue(login), "Each login fans out only on first admission.");
+                publicTitles.Add(flag == "true" ? "Complete joined for the first time" : "Complete joined");
+            }
+            ServerManagerEvent leave = SteamIdentityEvent("player.leave", "steamworks:" + steam);
+            leave.Fields["first_join"] = "true";
+            Check(webhooks.Enqueue(leave), "Even a marked leave is still an ordinary connection event.");
+            publicTitles.Add("Complete left");
+            ServerManagerEvent crossplay = SteamIdentityEvent("player.login", "playfab:offline-account", "Crossplay");
+            crossplay.Fields["first_join"] = "true";
+            Check(webhooks.Enqueue(crossplay), "First-join routing does not require a Steam identity.");
+            publicTitles.Add("Crossplay joined for the first time");
+
+            Task run = webhooks.RunAsync(CancellationToken.None);
+            await webhooks.StopAsync(TimeSpan.FromSeconds(3)); await run;
+            JObject[] At(string url) => handler.Requests.Where(request => request.Url == url + "?wait=true")
+                .Select(request => JObject.Parse(request.Body!)).ToArray();
+            JObject[] publicCards = At(Webhook), privateCards = At(ReloadedWebhook), anonymousCards = At(anonymousUrl);
+            Check(publicCards.Length == publicTitles.Count && privateCards.Length == 2 && anonymousCards.Length == 2,
+                "The public route receives all connections once; each first-only route receives only the two exact marked logins.");
+            for (int index = 0; index < publicCards.Length; ++index)
+                CheckCompactEmbed((JObject)publicCards[index]["embeds"]![0]!, publicTitles[index], null, "Public connection without ID");
+            CheckCompactEmbed((JObject)privateCards[0]["embeds"]![0]!, "Complete joined for the first time", "Steam ID: " + steam, "Private Steam first join");
+            CheckCompactEmbed((JObject)privateCards[1]["embeds"]![0]!, "Crossplay joined for the first time", null, "Private non-Steam first join");
+            for (int index = 0; index < anonymousCards.Length; ++index)
+                CheckCompactEmbed((JObject)anonymousCards[index]["embeds"]![0]!, "Guest " + (index + 1) + " joined for the first time",
+                    null, "Anonymous first join suppresses the opted-in ID");
+            Check(publicCards.Concat(anonymousCards).All(card => !card.ToString().Contains(steam)) &&
+                anonymousCards.All(card => !card.ToString().Contains("Complete") && !card.ToString().Contains("Crossplay")),
+                "Neither public nor anonymous payloads inherit the private route's Steam ID; anonymous cards also omit player names.");
         }
     }
 
@@ -698,7 +757,7 @@ internal static class DiscordTransportSmoke
         using (DiscordWebhooks webhooks = new DiscordWebhooks(Settings(kinds.Concat(new[] { "server.started", "player.first_join" }).ToArray()), http, delegate { }))
         {
             Check(!webhooks.Enqueue(Event("server.started")) && !webhooks.Enqueue(Event("player.first_join")),
-                "Removed lifecycle/first-join kinds cannot enter webhook delivery, even through a directly constructed route DTO.");
+                "A retired lifecycle kind and the standalone first-join audit event cannot enter webhook delivery.");
             var cases = new List<Tuple<ServerManagerEvent, string, string?>>();
             foreach (var entry in new[] { Tuple.Create("server.ready", "Server ready"), Tuple.Create("server.shutdown", "Server shutdown"),
                 Tuple.Create("server.saved", "World saved") })
@@ -735,7 +794,7 @@ internal static class DiscordTransportSmoke
             foreach (var test in cases) Check(webhooks.Enqueue(test.Item1), "Compact event is admitted: " + test.Item2);
             Task running = webhooks.RunAsync(CancellationToken.None);
             await webhooks.StopAsync(TimeSpan.FromSeconds(3)); await running;
-            Check(handler.Requests.Count == cases.Count, "Every compact event sends one message, with no duplicate first-join delivery.");
+            Check(handler.Requests.Count == cases.Count, "Each source sends once, including first logins matching both selectors on this route.");
             for (int i = 0; i < cases.Count; i++)
             {
                 JObject payload = JObject.Parse(handler.Requests[i].Body!);

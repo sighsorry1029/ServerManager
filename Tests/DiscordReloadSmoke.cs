@@ -442,7 +442,7 @@ internal static class DiscordReloadSmoke
             Config("lastgood").Replace("token: '" + Secret + "_A'", "token: 'bad " + Secret + "'"),
             Config("lastgood").Replace("https://discord.com/api/webhooks/123/", "https://invalid.example/"),
             Config("lastgood").Replace("['server.status']", "['server.status','server.started']"),
-            Config("lastgood").Replace("['server.status']", "['player.first_join']"),
+            Config("lastgood").Replace("['server.status']", "['player.first_joins']"),
             Config("badlimit") + "rcon: {minimum_interval_seconds: 1}\n",
             Config("badlimit") + "rcon: {maximum_output_characters: 1800}\n",
             Config("badlimit") + "rcon: {}\n",
@@ -503,16 +503,16 @@ internal static class DiscordReloadSmoke
             ["character.save_rejected"] = "character.validation", ["character.validation_observed"] = "character.validation",
             ["player.death"] = "player.death", ["combat.pvp_kill"] = "player.death"
         };
-        string[] synthetic = { "server.status", "player.connection", "raid.status", "security.alert", "character.validation" };
+        string[] nonDispatchable = { "server.status", "player.connection", "player.first_join", "raid.status", "security.alert", "character.validation" };
         // Runtime and parsing are real here; the inert sender uses the production
         // source-to-filter projection. Actual sender queues/dedup have separate tests.
-        foreach (string filter in new[] { "server.status", "player.connection", "raid.status", "security.alert", "character.validation", "player.death" })
+        foreach (string filter in new[] { "server.status", "player.connection", "player.first_join", "raid.status", "security.alert", "character.validation", "player.death" })
         {
             Apply(ConfigFor(filter));
             Check(ReferenceEquals(Session, session) && ReferenceEquals(Hooks, hooks) && ReferenceEquals(Commands, commands) &&
                 ReferenceEquals(Gateway, gateway) && hooks.Settings.WebhookRoutes.Single().Events.SetEquals(new[] { filter }),
                 "Grouped filter switch replaces selection without restarting the bot or retaining a previous group");
-            foreach (string kind in sources.Keys.Concat(synthetic))
+            foreach (string kind in sources.Keys.Concat(nonDispatchable))
             {
                 int queued = hooks.Queued;
                 var source = new ServerManagerEvent { Kind = kind };

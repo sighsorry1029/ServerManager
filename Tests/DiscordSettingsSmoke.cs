@@ -26,9 +26,11 @@ internal static class DiscordSettingsSmoke
         "combat.pvp_kill", "character.save_rejected", "character.validation_observed",
         "security.detection", "security.response"
     };
-    private static readonly string[] SyntheticEventFilters =
+    // These are valid selectors, but dispatch never admits a raw kind with
+    // one of these names (including the separate player.first_join audit event).
+    private static readonly string[] SelectorOnlyFilters =
     {
-        "server.status", "player.connection", "raid.status", "character.validation", "security.alert", "cron.executed"
+        "server.status", "player.connection", "player.first_join", "raid.status", "character.validation", "security.alert", "cron.executed"
     };
     private static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, true);
     private static string _root = "";
@@ -44,7 +46,7 @@ internal static class DiscordSettingsSmoke
             Environment.SetEnvironmentVariable(EnvA, null);
             Environment.SetEnvironmentVariable(EnvB, null);
             for (int i = 1; i <= 10; i++) Environment.SetEnvironmentVariable("SERVERMANAGER_DISCORD_WEBHOOK_" + i, null);
-            Defaults(); Valid(); AnonymousPrefixes(); WebhookLanguages(); SteamIdOptions(); GuildSettings(); RemovedBotSchema(); OperatorRoutes(); SourceEventFilters(); RemovedWebhookEvents(); ChatSettings(); BadBot(); RemovedAuthorizationKeys(); RemovedCommandLimits(); BadRoutes(); RemovedWebhookEnvironments(); RemovedPrivacyAndCollections(); Syntax(); EnvironmentOverrides();
+            Defaults(); Valid(); AnonymousPrefixes(); WebhookLanguages(); SteamIdOptions(); GuildSettings(); RemovedBotSchema(); OperatorRoutes(); SourceEventFilters(); UnsupportedWebhookEvents(); ChatSettings(); BadBot(); RemovedAuthorizationKeys(); RemovedCommandLimits(); BadRoutes(); RemovedWebhookEnvironments(); RemovedPrivacyAndCollections(); Syntax(); EnvironmentOverrides();
             StrictReload(); PartialReload(); ReloadReads(); Comparators();
             Console.WriteLine("PASS: DiscordSettings startup/strict reload/comparators (" + _checks + " assertions, " + _cases + " isolated configs).");
             return 0;
@@ -111,9 +113,10 @@ internal static class DiscordSettingsSmoke
             generated.Contains("Duplicate routes to one destination can duplicate notifications") &&
             generated.Contains("Fill enabled bot credentials/guild IDs and every enabled webhook URL before reloading"),
             "Generated comments explain duplicate delivery and credential-free inactivity without relaxing reload requirements");
-        Check(!generated.Contains("server.started") && !generated.Contains("player.first_join") &&
-            new[] { "server.status", "player.connection", "raid.status" }.All(generated.Contains),
-            "Generated defaults advertise the three grouped lifecycle filters and no removed lifecycle selectors");
+        Check(!generated.Contains("server.started") &&
+            new[] { "server.status", "player.connection", "player.first_join", "raid.status" }.All(generated.Contains) &&
+            generated.Contains("events: [player.first_join] and include_steam_id: true"),
+            "Generated comments distinguish grouped lifecycle filters from a first-join-only route with opt-in Steam IDs");
         Check(GroupedSourceKinds.All(kind => !generated.Contains("#   " + kind + " - ")) && generated.Contains("character.validation") &&
             generated.Contains("security.alert"), "Generated YAML uses grouped selectors without advertising removed raw-kind aliases");
         Check(generated.Contains("bot:") && generated.Contains("webhooks:") && generated.Contains("#") &&
@@ -197,8 +200,8 @@ internal static class DiscordSettingsSmoke
             "Generated comments describe every supported webhook event exactly once, with an English description");
         string[] eventLines = generated.Replace("\r\n", "\n").Split('\n')
             .Where(line => line.StartsWith("#   ", StringComparison.Ordinal)).ToArray();
-        Check(eventLines.Length == 18 && eventLines.Length == DiscordSettings.PublicEvents.Count,
-            "Generated comments list all eighteen actual selectable webhook filters");
+        Check(eventLines.Length == 19 && eventLines.Length == DiscordSettings.PublicEvents.Count,
+            "Generated comments list all nineteen selectable webhook filters");
         foreach (string line in eventLines)
         {
             Check(!HasCompleteEventCatalog(generated.Replace(line, "")), "Catalog checker detects a missing selectable event");
@@ -265,8 +268,8 @@ internal static class DiscordSettingsSmoke
                 "Each route contains exactly its approved required and optional settings");
         }
         Check(!actualEvents[0].Overlaps(actualEvents[1]) &&
-            new HashSet<string>(actualEvents[0].Concat(actualEvents[1]), StringComparer.Ordinal).SetEquals(DiscordSettings.PublicEvents.Except(new[] { "discord.shout" })),
-            "Default routes retain their filters; Discord-origin chat remains explicitly opt-in");
+            new HashSet<string>(actualEvents[0].Concat(actualEvents[1]), StringComparer.Ordinal).SetEquals(DiscordSettings.PublicEvents.Except(new[] { "discord.shout", "player.first_join" })),
+            "Default routes retain their filters; Discord-origin chat and the narrower first-join selector remain explicitly opt-in");
         Check(OperatorKinds.All(actualEvents[1].Contains) && !OperatorKinds.Any(actualEvents[0].Contains),
             "All sensitive operator filters are grouped into Moderation");
         Check(!actualEvents[1].Contains("player.connection") && actualEvents[1].Count == 10,
@@ -565,7 +568,7 @@ internal static class DiscordSettingsSmoke
 
     private static void OperatorRoutes()
     {
-        Check(DiscordSettings.PublicEvents.Count == 18 && OperatorKinds.All(DiscordSettings.PublicEvents.Contains),
+        Check(OperatorKinds.All(DiscordSettings.PublicEvents.Contains),
             "One supported webhook catalog includes all six exact operator selectors");
         foreach (string kind in OperatorKinds)
         {
@@ -603,7 +606,7 @@ internal static class DiscordSettingsSmoke
         foreach (var pair in grouped)
             Check(DiscordSettings.GetWebhookEventFilter(pair.Key) == pair.Value && !DiscordSettings.PublicEvents.Contains(pair.Key),
                 "Raw internal event maps to its grouped selector without becoming a selectable alias: " + pair.Key);
-        foreach (string filter in SyntheticEventFilters)
+        foreach (string filter in SelectorOnlyFilters)
         {
             var fixture = new Fixture(); fixture.Routes[0]["events"] = "['" + filter + "']";
             Check(Load(fixture.Render()).WebhookRoutes[0].Events.SetEquals(new[] { filter }) &&
@@ -612,28 +615,38 @@ internal static class DiscordSettingsSmoke
         }
         foreach (string kind in DiscordSettings.PublicEvents)
         {
-            bool synthetic = SyntheticEventFilters.Contains(kind);
-            Check(DiscordSettings.GetWebhookEventFilter(kind) == (synthetic ? null : kind),
-                "Real source kind retains identity while a synthetic selector cannot be published as an event: " + kind);
+            bool selectorOnly = SelectorOnlyFilters.Contains(kind);
+            Check(DiscordSettings.GetWebhookEventFilter(kind) == (selectorOnly ? null : kind),
+                "A selector-only name cannot produce a webhook directly from an identically named source event: " + kind);
         }
-        foreach (string kind in new[] { "", "server.started", "player.first_join", "security.unknown", "character.unknown",
+        var privateFeed = new Fixture();
+        privateFeed.Routes[0]["events"] = "[player.first_join]";
+        privateFeed.Routes[0]["include_steam_id"] = "true";
+        privateFeed.Routes[1]["events"] = "[player.connection, player.first_join]";
+        foreach (var settings in new[] { Load(privateFeed.Render()), DiscordSettings.ParseForReload(privateFeed.Render()) })
+            Check(settings.WebhookRoutes.Count == 2 && settings.WebhookRoutes[0].Events.SetEquals(new[] { "player.first_join" }) &&
+                settings.WebhookRoutes[0].IncludeSteamId && !settings.WebhookRoutes[1].IncludeSteamId &&
+                settings.WebhookRoutes[1].Events.SetEquals(new[] { "player.connection", "player.first_join" }),
+                "A first-join-only private route and a route with both selectors preserve independent Steam-ID preferences");
+        foreach (string kind in new[] { "", "server.started", "security.unknown", "character.unknown",
             "security.*", "SECURITY.DETECTION", "PLAYER.DEATH", "player.death ", " security.response" })
             Check(DiscordSettings.GetWebhookEventFilter(kind) == null, "Unknown/removed/noncanonical source cannot enter grouped routing: " + kind);
-        var projected = new HashSet<string>(DiscordSettings.PublicEvents.Where(kind => !SyntheticEventFilters.Contains(kind))
+        var projected = new HashSet<string>(DiscordSettings.PublicEvents.Where(kind => !SelectorOnlyFilters.Contains(kind))
             .Concat(grouped.Keys).Select(kind => DiscordSettings.GetWebhookEventFilter(kind)!), StringComparer.Ordinal);
         projected.Add("cron.executed"); // Selected from final source=cron command results by the dispatcher.
-        Check(projected.SetEquals(DiscordSettings.PublicEvents), "All eighteen selectors correspond to supported real source events or the final cron projection");
+        projected.Add("player.first_join"); // Selected from player.login with first_join=true by the dispatcher.
+        Check(projected.SetEquals(DiscordSettings.PublicEvents), "Every selector has a source-kind or field-dependent projection");
     }
 
-    private static void RemovedWebhookEvents()
+    private static void UnsupportedWebhookEvents()
     {
-        foreach (string kind in new[] { "server.started", "player.first_join" }.Concat(GroupedSourceKinds))
+        foreach (string kind in new[] { "server.started", "player.first_joins", "PLAYER.FIRST_JOIN" }.Concat(GroupedSourceKinds))
         {
-            Check(!DiscordSettings.PublicEvents.Contains(kind), "Removed webhook selector is not supported: " + kind);
+            Check(!DiscordSettings.PublicEvents.Contains(kind), "Unsupported selector is absent from the webhook catalog: " + kind);
             var fixture = new Fixture(); fixture.Routes[0]["events"] = "['server.status','" + kind + "']";
-            RouteRejected(fixture.Render(), "Removed selector cannot silently expand or translate: " + kind);
+            RouteRejected(fixture.Render(), "Unsupported selector cannot silently expand or translate: " + kind);
             fixture.Routes[0]["enabled"] = "false";
-            RouteRejected(fixture.Render(), "Disabled route also rejects removed selector: " + kind);
+            RouteRejected(fixture.Render(), "Disabled route also rejects unsupported selector: " + kind);
         }
     }
 
