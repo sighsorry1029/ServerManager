@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Configuration = 'Debug',
     [string]$GamePath = 'C:\Program Files (x86)\Steam\steamapps\common\Valheim'
 )
