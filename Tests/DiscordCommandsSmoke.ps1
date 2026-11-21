@@ -99,6 +99,7 @@ public sealed class DiscordCommandSmokeHandler : HttpMessageHandler
     public string FailedGuild = "";
     public int Reads;
     public int Callbacks;
+    public string LastCallbackBody;
     public int UnexpectedAuthorization;
     public static void Log(string value) { }
     public static void Audit(object value) { Audits.Enqueue(value); }
@@ -113,6 +114,7 @@ public sealed class DiscordCommandSmokeHandler : HttpMessageHandler
         if (FailedGuild.Length != 0 && path.Contains("/guilds/" + FailedGuild + "/commands"))
             return new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{}") };
         if (path.Contains("/callback")) {
+            LastCallbackBody = body;
             Interlocked.Increment(ref Callbacks);
             if (request.Headers.Authorization != null) Interlocked.Increment(ref UnexpectedAuthorization);
             return new HttpResponseMessage(FailAcknowledgement ? HttpStatusCode.BadRequest : HttpStatusCode.NoContent) {
@@ -301,7 +303,8 @@ try {
     Wait-Until { (Field $fixture.Commands '_queue').Count -eq 1 } 'Successful defer must queue the command.'
     Assert-True ($fixture.Handler.Callbacks -eq 1) 'Exactly one acknowledgement expected.'
     Assert-True ($fixture.Handler.UnexpectedAuthorization -eq 0) 'Interaction callback must not carry the bot credential.'
-    Assert-True (($fixture.Handler.Bodies.ToArray() -match '"type":5').Count -eq 1) 'Accepted command must defer before game execution.'
+    $callback = $fixture.Handler.LastCallbackBody | ConvertFrom-Json
+    Assert-True ($callback.type -eq 5 -and $callback.data.flags -eq 64) 'Accepted command must defer ephemerally before game execution.'
     Dispatch $fixture.Commands 'INTERACTION_CREATE' (Interaction '1001')
     Assert-True ($fixture.Handler.Callbacks -eq 1) 'Duplicate interaction must not be acknowledged or replayed.'
     $fixture.Commands.Dispose()
