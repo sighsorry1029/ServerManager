@@ -2102,6 +2102,42 @@ Assert-True (
     [bool]$isDrained.Invoke($pipeline, [object[]]@($captureD))) `
     "The acknowledged final capture did not satisfy the drain target."
 
+# Cancelling future captures for exit must not close the in-flight pipeline or
+# discard its pending full profile. Those belong to the surrounding lifecycle.
+$connectionType = $plugin.GetType('ServerManager.ServerManagerRuntime+ClientConnection', $true)
+$captureSession = [Runtime.Serialization.FormatterServices]::GetUninitializedObject($connectionType)
+$capturePipeline = New-Pipeline -Window 10 -AcknowledgementTimeout 50
+Set-InstanceField $captureSession '<SavePipeline>k__BackingField' $capturePipeline
+$scheduledProperties = @('FullProfileSafetySaveDueTimestamp', 'NextFullProfileSafetySaveAllowedTimestamp',
+    'NextFullProfileHeartbeatTimestamp', 'InventoryFastSaveDueTimestamp', 'NextInventoryFastSaveAllowedTimestamp')
+foreach ($name in $scheduledProperties) {
+    $connectionType.GetProperty($name, $instanceFlags).SetValue($captureSession, [long]123)
+}
+$connectionType.GetProperty('ReadyAcknowledgementSent', $instanceFlags).SetValue($captureSession, $true)
+$connectionType.GetProperty('AcknowledgedProfileRevision', $instanceFlags).SetValue($captureSession, [long]40)
+$null = Offer-Snapshot $capturePipeline 71 $inventoryReason
+Assert-True (Try-Start $capturePipeline 40 0).Started 'Capture cancellation fixture must have an in-flight save.'
+$pendingExitCapture = Offer-Snapshot $capturePipeline 72 $finalReason
+$cancelCaptures = Get-InstanceMethod $connectionType 'CancelScheduledCaptures' 0
+$cancelCaptures.Invoke($captureSession, @()) | Out-Null
+$cancelCaptures.Invoke($captureSession, @()) | Out-Null
+foreach ($name in $scheduledProperties) {
+    Assert-True ((Get-InstanceProperty $captureSession $name) -eq 0) "Capture cancellation left a live timer: $name."
+}
+Assert-True ((Get-InstanceProperty $captureSession 'ReadyAcknowledgementSent') -and
+    (Get-InstanceProperty $captureSession 'AcknowledgedProfileRevision') -eq 40 -and
+    -not (Get-InstanceProperty $capturePipeline 'Closed')) 'Cancelling capture timers altered admission, accepted revision or pipeline lifetime.'
+Assert-True (Complete-Ack $capturePipeline 40 41).Valid 'Cancelling capture timers discarded an in-flight acknowledgement.'
+$exitAfterCancellation = Try-Start $capturePipeline 41 1
+Assert-True ($exitAfterCancellation.Started -and
+    (Get-InstanceProperty $exitAfterCancellation.Dispatch 'CaptureId') -eq $pendingExitCapture) `
+    'Cancelling capture timers discarded the pending final snapshot.'
+foreach ($name in @('TryBeginDeferredClientExit', 'ResumeDeferredClientExit', 'RestoreClientProfile')) {
+    $lifecycleMethod = Get-PluginMethodDefinition 'ServerManager.ServerManagerRuntime' $name
+    Assert-True ($null -ne (Get-CecilCall $lifecycleMethod 'ServerManager.ServerManagerRuntime/ClientConnection' 'CancelScheduledCaptures')) `
+        "The $name lifecycle no longer cancels scheduled captures."
+}
+
 # The pipeline owns one pending slot. A full profile absorbs an older pending
 # inventory, while a later inventory cannot evict that full profile. The
 # runtime's dirty bit supplies the coalesced inventory again after the full

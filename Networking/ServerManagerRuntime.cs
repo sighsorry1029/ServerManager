@@ -745,6 +745,15 @@ internal static partial class ServerManagerRuntime
 
         internal long NextInventoryFastSaveAllowedTimestamp { get; set; }
 
+        internal void CancelScheduledCaptures()
+        {
+            FullProfileSafetySaveDueTimestamp = 0;
+            NextFullProfileSafetySaveAllowedTimestamp = 0;
+            NextFullProfileHeartbeatTimestamp = 0;
+            InventoryFastSaveDueTimestamp = 0;
+            NextInventoryFastSaveAllowedTimestamp = 0;
+        }
+
         internal bool InventoryFastPathReady { get; set; }
 
         internal byte[]? AcknowledgedProfileBytes { get; set; }
@@ -8214,11 +8223,7 @@ internal static partial class ServerManagerRuntime
         }
 
         _deferredClientExit = requested;
-        session.FullProfileSafetySaveDueTimestamp = 0;
-        session.NextFullProfileSafetySaveAllowedTimestamp = 0;
-        session.NextFullProfileHeartbeatTimestamp = 0;
-        session.InventoryFastSaveDueTimestamp = 0;
-        session.NextInventoryFastSaveAllowedTimestamp = 0;
+        session.CancelScheduledCaptures();
         try
         {
             BeginClientGameplayQuiescence(player);
@@ -8503,11 +8508,7 @@ internal static partial class ServerManagerRuntime
         _deferredClientExit = null;
         if (_client != null)
         {
-            _client.FullProfileSafetySaveDueTimestamp = 0;
-            _client.NextFullProfileSafetySaveAllowedTimestamp = 0;
-            _client.NextFullProfileHeartbeatTimestamp = 0;
-            _client.InventoryFastSaveDueTimestamp = 0;
-            _client.NextInventoryFastSaveAllowedTimestamp = 0;
+            _client.CancelScheduledCaptures();
             _client.SavePipeline.Close();
         }
 
@@ -9951,11 +9952,7 @@ internal static partial class ServerManagerRuntime
         session.ManagedProfile = null;
         session.OriginalProfile = null;
         session.CharacterState = null;
-        session.FullProfileSafetySaveDueTimestamp = 0;
-        session.NextFullProfileSafetySaveAllowedTimestamp = 0;
-        session.NextFullProfileHeartbeatTimestamp = 0;
-        session.InventoryFastSaveDueTimestamp = 0;
-        session.NextInventoryFastSaveAllowedTimestamp = 0;
+        session.CancelScheduledCaptures();
         session.InventoryFastPathReady = false;
         session.AcknowledgedProfileBytes = null;
         session.AcknowledgedProfileRevision = 0;
