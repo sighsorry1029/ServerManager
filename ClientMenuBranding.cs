@@ -137,13 +137,13 @@ internal static class ClientMenuBranding
     private static MenuGuide? _menuGuide;
     private static bool _menuGuideFailed;
     private static bool _customMenuActive;
+    private static readonly ConfigDefinition CustomMenuEnabledKey = new("General", "Enabled");
 
     private static bool IsCustomMenuActive()
     {
         if (!Chainloader.PluginInfos.TryGetValue("rdmods.custommainmenu", out var plugin) ||
             plugin.Instance == null) return false;
-        return !plugin.Instance.Config.TryGetEntry<bool>(
-            new ConfigDefinition("General", "Enabled"), out var enabled) || enabled.Value;
+        return !plugin.Instance.Config.TryGetEntry<bool>(CustomMenuEnabledKey, out var enabled) || enabled.Value;
     }
 
     private static void RefreshMenuCompatibility(FejdStartup startup)

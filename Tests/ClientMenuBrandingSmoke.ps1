@@ -783,8 +783,12 @@ $customMenuDetection = $brandingType.Methods | Where-Object Name -eq 'IsCustomMe
 $detectionStrings = @($customMenuDetection.Body.Instructions | Where-Object {
     $_.OpCode.Code -eq [Mono.Cecil.Cil.Code]::Ldstr
 } | ForEach-Object { $_.Operand })
+$brandingInitializer = $brandingType.Methods | Where-Object Name -eq '.cctor'
+$enabledKey = Get-MethodCall $brandingInitializer 'BepInEx.Configuration.ConfigDefinition' '.ctor'
 Assert-True ($detectionStrings -contains 'rdmods.custommainmenu' -and
-    $detectionStrings -contains 'General' -and $detectionStrings -contains 'Enabled') `
+    $enabledKey.Previous.Previous.Operand -ceq 'General' -and $enabledKey.Previous.Operand -ceq 'Enabled' -and
+    ($customMenuDetection.Body.Instructions.Operand -contains $enabledKey.Next.Operand) -and
+    $null -ne (Get-MethodCall $customMenuDetection 'BepInEx.Configuration.ConfigFile' 'TryGetEntry')) `
     'Compatibility detection lost the installed plugin GUID or enable setting.'
 Assert-True (@($customMenuDetection.Body.Instructions | Where-Object {
     $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -in @('Bind', 'Save', 'set_Value')
