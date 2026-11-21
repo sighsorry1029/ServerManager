@@ -29,7 +29,6 @@ internal sealed class DiscordCommands : IDisposable
     private const long DiscordEpochMilliseconds = 1420070400000L;
     private static readonly HttpMethod Patch = new("PATCH");
     private static readonly Dictionary<string, CommandSpec> Catalog = BuildCatalog();
-    private static readonly string[] Names = Catalog.Keys.ToArray();
     private static readonly HashSet<string> ObsoleteNames = new(StringComparer.Ordinal)
     {
         "sm", "save", "kick", "ban", "unban", "importstatus", "playerinfo", "skilladd", "skillreset",
@@ -166,7 +165,7 @@ internal sealed class DiscordCommands : IDisposable
     internal bool IsAuthorized(string name, string guildId, string channelId,
         string userId)
     {
-        if (!_settings.BotEnabled || !Names.Contains(name) ||
+        if (!_settings.BotEnabled || name == null || !Catalog.ContainsKey(name) ||
             !IsSnowflake(userId) || !IsSnowflake(guildId) ||
             !_settings.GuildIds.Contains(guildId) ||
             !_settings.CommandChannelIds.Contains(channelId)) return false;
@@ -245,7 +244,7 @@ internal sealed class DiscordCommands : IDisposable
                 catch (DiscordHttpException exception) when (exception.StatusCode == 404)
                 { /* Already removed: this confirmed absence is not a retry. */ }
             }
-            foreach (string name in Names)
+            foreach (string name in Catalog.Keys)
             {
                 JObject definition = Definition(name);
                 JObject? previous = existing.OfType<JObject>().FirstOrDefault(item =>
@@ -781,14 +780,14 @@ internal sealed class DiscordCommands : IDisposable
         string name = Text(data["data"]?["name"]), user = Text(data["member"]?["user"]?["id"]);
         if (!IsSnowflake(id) || !IsSnowflake(app) || !IsSnowflake(user) ||
             token.Length < 1 || token.Length > 512 || token.Any(char.IsControl) ||
-            !Names.Contains(name) || (int?)data["data"]?["type"] != 1) return null;
+            !Catalog.TryGetValue(name, out CommandSpec command) || (int?)data["data"]?["type"] != 1) return null;
         Dictionary<string, string> args = new(StringComparer.Ordinal);
         JToken? options = data["data"]?["options"];
         if (options != null && options.Type != JTokenType.Array) return null;
         foreach (JToken option in options as JArray ?? new JArray())
         {
             string key = Text(option["name"]);
-            OptionSpec? spec = Catalog[name].Options.FirstOrDefault(value => value.Name == key);
+            OptionSpec? spec = command.Options.FirstOrDefault(value => value.Name == key);
             if (spec == null || args.ContainsKey(key) ||
                 (int?)option["type"] != spec.Type || !spec.TryRead(option["value"], out string value)) return null;
             args.Add(key, value);

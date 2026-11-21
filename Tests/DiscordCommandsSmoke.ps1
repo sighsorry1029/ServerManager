@@ -35,7 +35,7 @@ foreach ($limit in @{ RconMinimumIntervalSeconds = 1; MaximumRconOutputCharacter
     $field = $commandsType.GetField($limit.Key, $staticFlags)
     Assert-True ($field.IsLiteral -and $field.GetRawConstantValue() -eq $limit.Value) "Execution limit must be a fixed constant: $($limit.Key)"
 }
-$catalogNames = @($commandsType.GetField('Names', $staticFlags).GetValue($null))
+$catalogNames = @($commandsType.GetField('Catalog', $staticFlags).GetValue($null).Keys)
 $flatNames = @($commonType.GetProperty('FlatCommandNames', $staticFlags).GetValue($null, $null))
 Assert-True ($flatNames.Count -eq 33 -and $catalogNames.Count -eq 34 -and
     $flatNames -notcontains 'importstatus' -and $catalogNames -notcontains 'importstatus') 'Shared flat feature and Discord catalog sizes drifted or importstatus remains supported.'

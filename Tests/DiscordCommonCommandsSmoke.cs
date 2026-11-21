@@ -82,7 +82,8 @@ internal static class DiscordCommonCommandsSmoke
         catch (Exception exception) { Console.Error.WriteLine(exception); return 1; }
     }
     private static JObject Definition(string name) => (JObject)typeof(DiscordCommands).GetMethod("Definition", Static)!.Invoke(null, new object[] { name })!;
-    private static string[] Names => (string[])typeof(DiscordCommands).GetField("Names", Static)!.GetValue(null)!;
+    private static string[] Names => ((System.Collections.IDictionary)typeof(DiscordCommands)
+        .GetField("Catalog", Static)!.GetValue(null)!).Keys.Cast<string>().ToArray();
     private static bool IsAsciiEnglish(string text) => !string.IsNullOrWhiteSpace(text) &&
         text.All(character => character <= 0x7f) && text.Any(character =>
             (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z'));

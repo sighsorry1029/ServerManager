@@ -226,7 +226,7 @@ namespace ServerManager.Tests
             MethodInfo shutdown = commands.GetMethod("Shutdown", methods);
             string[] flatNames = ((IEnumerable)commands.GetProperty("FlatCommandNames", methods).GetValue(null, null)).Cast<string>().ToArray();
             Type discordCommands = plugin.GetType("ServerManager.Discord.DiscordCommands", true);
-            string[] slashNames = ((IEnumerable)discordCommands.GetField("Names", methods).GetValue(null)).Cast<string>().ToArray();
+            string[] slashNames = ((IDictionary)discordCommands.GetField("Catalog", methods).GetValue(null)).Keys.Cast<string>().ToArray();
             Check(flatNames.Length == 33 && slashNames.Length == 34 && flatNames.Contains("banlist") &&
                 flatNames.Contains("cronstatus") && flatNames.Contains("cronack") && slashNames.All(name => !name.Contains("-")) &&
                 flatNames.OrderBy(value => value).SequenceEqual(slashNames.Where(value => value != "rcon").OrderBy(value => value)),
