@@ -40,6 +40,9 @@ for ($g = 0; $g -lt 10; ++$g) {
 }
 [byte[]]$populated = Invoke-Codec 'SerializeProfileToBytes' @($profile)
 $roundtrip = Invoke-Codec 'DeserializeProfileFromBytes' @($populated, $null, $source)
+$liveCreated = $createdField.GetValue($roundtrip)
+Assert-True ($liveCreated.Kind -eq [DateTimeKind]::Local -and $liveCreated.Ticks -eq $created.ToLocalTime().Ticks) `
+    'Live creation time differs from vanilla; display and the initial item upgrade seed depend on local ticks.'
 Assert-True (Test-Bytes $populated (Invoke-Codec 'SerializeProfileToBytes' @($roundtrip))) `
     'A statistic group, table or non-midnight UTC creation time changed during profile round-trip.'
 Invoke-Codec 'ValidateSnapshot' @($identity, $populated) | Out-Null

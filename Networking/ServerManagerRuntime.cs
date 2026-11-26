@@ -3526,15 +3526,15 @@ internal static partial class ServerManagerRuntime
     }
 
     /// <summary>
-    /// Injected at the exact Valheim primary DB/metadata success branch. The
-    /// method is intentionally thread-local and allocation-free.
+    /// Called on the save worker after the primary commit, and again on entry
+    /// to vanilla's rollback handler if that commit is subsequently invalidated.
     /// </summary>
-    internal static void MarkWorldSaveWorkerSucceeded()
+    internal static void SetWorldSaveWorkerSuccess(bool succeeded)
     {
         WorldSaveAttempt? attempt = _activeWorldSaveWorkerAttempt;
         if (attempt != null)
         {
-            attempt.PrimaryWorldSaveSucceeded = true;
+            attempt.PrimaryWorldSaveSucceeded = succeeded;
         }
     }
 
@@ -3611,8 +3611,7 @@ internal static partial class ServerManagerRuntime
             {
                 DiscardCharacterCheckpoint(
                     attempt,
-                    "Valheim's primary world save did not reach its verified " +
-                    "success branch.");
+                    "The primary world save was not confirmed or entered rollback.");
                 TryWriteCheckpointLog(
                     () => ServerManagerPlugin.Log.LogError(
                         "VerifiedWorldSaveFailed operation=" +
@@ -3622,9 +3621,8 @@ internal static partial class ServerManagerRuntime
                 {
                     ServerEventRuntime.OnWorldSaveCheckpointFailed(
                         attempt.OperationId,
-                        "Valheim's primary world DB/metadata save did not reach " +
-                        "its verified success branch. Character disk state was " +
-                        "left unchanged.");
+                        "The primary world save was not confirmed or entered rollback. " +
+                        "Character disk state was left unchanged.");
                 }
                 catch (Exception exception) when (
                     !IntegrityCanonical.IsFatal(exception))

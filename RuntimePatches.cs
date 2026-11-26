@@ -898,8 +898,6 @@ internal static class ServerEventWorldSavePatch
 [HarmonyPatch(typeof(ZNet), "SaveWorldThread")]
 internal static class VerifiedWorldSaveWorkerPatch
 {
-    private const string PrimarySaveSuccessLogPrefix = "World save (5/5) done. Total time [";
-
     private static void Prefix()
     {
         try
@@ -946,68 +944,62 @@ internal static class VerifiedWorldSaveWorkerPatch
 
     /// <summary>
     /// Valheim catches SaveWorldThread exceptions internally, so a Harmony
-    /// finalizer cannot distinguish a successful primary save from the catch
-    /// path. Mark success only after the chunk/DB2/FWL writes and EndSave(true)
-    /// reached the game's success branch. Backups now precede the primary save.
+    /// finalizer cannot distinguish normal completion from rollback. In 1.0.30
+    /// auto-backup runs after EndSave(true), still inside the rollback boundary.
     /// </summary>
     private static IEnumerable<CodeInstruction> Transpiler(
         IEnumerable<CodeInstruction> instructions)
     {
         List<CodeInstruction> code = new(instructions);
-        MethodInfo? successMarker = AccessTools.Method(
-            typeof(ServerManagerRuntime),
-            nameof(ServerManagerRuntime.MarkWorldSaveWorkerSucceeded));
-        if (successMarker == null)
-        {
-            throw new MissingMethodException(
-                typeof(ServerManagerRuntime).FullName,
-                nameof(ServerManagerRuntime.MarkWorldSaveWorkerSucceeded));
-        }
-
-        int anchorCount = 0;
-        int insertionIndex = -1;
+        MethodInfo endSave = ((Action<FileHelpers.FileSource, bool>)SaveSystem.EndSave).Method;
+        MethodInfo recordOutcome = ((Action<bool>)ServerManagerRuntime.SetWorldSaveWorkerSuccess).Method;
+        List<CodeInstruction> patched = new(code.Count + 4);
+        int commits = 0, rollbacks = 0;
         for (int index = 0; index < code.Count; ++index)
         {
-            if (code[index].opcode != OpCodes.Ldstr ||
-                !string.Equals(
-                    code[index].operand as string,
-                    PrimarySaveSuccessLogPrefix,
-                    StringComparison.Ordinal))
+            CodeInstruction instruction = code[index];
+            patched.Add(instruction);
+            bool committed = index > 0 && code[index - 1].LoadsConstant(1L) && instruction.Calls(endSave);
+            if (committed)
+            {
+                ++commits;
+            }
+            else if (commits == 1 && IsWorldSaveRollbackHandler(code, index, endSave))
+            {
+                ++rollbacks;
+            }
+            else
             {
                 continue;
             }
 
-            ++anchorCount;
-            for (int scan = index + 1; scan < code.Count; ++scan)
-            {
-                if ((code[scan].opcode == OpCodes.Call ||
-                     code[scan].opcode == OpCodes.Callvirt) &&
-                    code[scan].operand is MethodInfo method &&
-                    method.DeclaringType == typeof(ZLog) &&
-                    string.Equals(method.Name, "Log", StringComparison.Ordinal))
-                {
-                    // The primary DB/metadata replacement has succeeded before
-                    // Valheim builds this log message. Mark immediately before
-                    // ZLog.Log so a logging patch failure cannot turn an
-                    // already-durable world into a false negative.
-                    insertionIndex = scan;
-                    break;
-                }
-            }
+            // Insert on fall-through only. Keep labels and EH boundaries on
+            // the original instructions; the catch has already stored its exception.
+            patched.Add(new CodeInstruction(committed ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0));
+            patched.Add(new CodeInstruction(OpCodes.Call, recordOutcome));
         }
 
-        if (anchorCount != 1 || insertionIndex < 0)
+        if (commits != 1 || rollbacks != 1)
         {
             throw new InvalidOperationException(
-                "ServerManager could not locate the verified Valheim world-save " +
-                "success seam. This game build is not compatible with the " +
-                "checkpoint patch.");
+                "ServerManager could not locate the verified Valheim world-save success seam " +
+                "and rollback handler. Refusing to apply the checkpoint patch.");
         }
+        return patched;
+    }
 
-        code.Insert(
-            insertionIndex,
-            new CodeInstruction(OpCodes.Call, successMarker));
-        return code;
+    private static bool IsWorldSaveRollbackHandler(List<CodeInstruction> code, int start, MethodInfo endSave)
+    {
+        if (!code[start].IsStloc() || !code[start].blocks.Exists(block =>
+                block.blockType == ExceptionBlockType.BeginCatchBlock && block.catchType == typeof(Exception)))
+            return false;
+
+        // Identify the handler by EndSave(false), not its log text. Revoke at
+        // entry: even its logging or rollback I/O can throw before EndSave.
+        for (int i = start + 1; i < code.Count && code[i].blocks.Count == 0; ++i)
+            if (code[i].Calls(endSave) && code[i - 1].LoadsConstant(0L))
+                return true;
+        return false;
     }
 }
 

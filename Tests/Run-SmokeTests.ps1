@@ -283,6 +283,11 @@ $smokeTests = @(
         NeedsGamePath = $true
     },
     [pscustomobject]@{
+        Name = "World-save outcome across the native rollback boundary"
+        File = "WorldSaveOutcomeSmoke.ps1"
+        NeedsGamePath = $true
+    },
+    [pscustomobject]@{
         Name = "Character shadow checkpoint"
         File = "CharacterShadowCheckpointSmoke.ps1"
         NeedsGamePath = $true
@@ -411,7 +416,7 @@ foreach ($smokeTest in $smokeTests) {
         $arguments += @("-GamePath", $GamePath)
     }
 
-    $shellPath = if ($smokeTest.File -in @("CommonCommandsSmoke.ps1", "ChatLoggingSmoke.ps1", "ClientMenuBrandingSmoke.ps1", "MaintenanceSaveSmoke.ps1", "PatcherIntegritySmoke.ps1")) {
+    $shellPath = if ($smokeTest.File -in @("CommonCommandsSmoke.ps1", "ChatLoggingSmoke.ps1", "ClientMenuBrandingSmoke.ps1", "MaintenanceSaveSmoke.ps1", "PatcherIntegritySmoke.ps1", "Valheim107CompatibilitySmoke.ps1", "Valheim120CompatibilitySmoke.ps1")) {
         $powerShell7.Source
     }
     else { "powershell.exe" }

@@ -630,20 +630,8 @@ Assert-True (
         'Preserve the worker''s original result and exception',
         [Text.RegularExpressions.RegexOptions]::Singleline)) `
     "SaveWorldThread observation hooks can escape into vanilla, completion regressed to a success-only postfix, or the original exception is no longer preserved."
-Assert-True (
-    $patchSource.Contains('PrimarySaveSuccessLogPrefix = "World save (5/5) done. Total time [";') -and
-    $patchSource.Contains("nameof(ServerManagerRuntime.MarkWorldSaveWorkerSucceeded)") -and
-    $patchSource.Contains("anchorCount != 1 || insertionIndex < 0") -and
-    [Text.RegularExpressions.Regex]::IsMatch(
-        $workerPatchSource,
-        'method\.DeclaringType\s*==\s*typeof\(ZLog\).*?' +
-        'string\.Equals\(method\.Name,\s*"Log".*?' +
-        'insertionIndex\s*=\s*scan;.*?' +
-        'code\.Insert\(\s*insertionIndex,\s*' +
-        'new CodeInstruction\(OpCodes\.Call,\s*successMarker\)\);',
-        [Text.RegularExpressions.RegexOptions]::Singleline) -and
-    -not $workerPatchSource.Contains("insertionIndex = scan + 1;")) `
-    "The worker success marker is no longer inserted immediately before the exact primary-success ZLog.Log call."
+# WorldSaveOutcomeSmoke executes the compiled transpiler on the original worker
+# and checks both the commit and rollback paths rather than matching its source.
 
 $beforePrepare = Get-CecilMethod `
     "ServerManager.ServerManagerRuntime" `

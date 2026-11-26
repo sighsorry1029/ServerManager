@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.9
+
+- Updated world-save handling for Valheim 1.0.30. If the game rolls back a world save after an automatic backup error, ServerManager no longer commits the matching character saves or reports `server.saved`. Skipping a backup that is not due is still a successful save.
+- Server characters now use the same local creation time as vanilla. This fixes the displayed time outside UTC and matches vanilla's initial upgrade seed for items without a saved seed. Existing `.fch` files need no conversion.
+- Removed a repeated settings-key allocation in the lobby when CustomMainMenu is installed. Its settings still take effect immediately.
+
 ## 1.2.8
 
 - Added the `player.first_join` Discord webhook filter for the first login of a new server character. Use it on a private route with `include_steam_id: true` to see Steam IDs only for new characters there. Existing `player.connection` routes still include all remote joins and leaves. Selecting both filters on one route sends only one message per first join.

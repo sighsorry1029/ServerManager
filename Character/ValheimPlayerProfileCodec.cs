@@ -604,10 +604,10 @@ namespace ServerManager
                 profile.m_usedCheats = package.ReadBool();
 
                 long creationSeconds = package.ReadLong();
-                // Preserve the stored instant. Date would discard the time and
-                // reinterpret UTC midnight in the local timezone when saved.
+                // Match vanilla's live profile (including its initial upgrade
+                // seed); the on-disk value remains the same Unix timestamp.
                 profile.m_dateCreated =
-                    DateTimeOffset.FromUnixTimeSeconds(creationSeconds).UtcDateTime;
+                    DateTimeOffset.FromUnixTimeSeconds(creationSeconds).LocalDateTime;
 
                 if (package.ReadBool())
                 {

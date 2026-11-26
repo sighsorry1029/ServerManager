@@ -67,7 +67,7 @@ try {
     $disk = $files.Methods | Where-Object Name -eq 'CheckDiskSpace'
     $constants = @($disk.Body.Instructions | ForEach-Object { if ($_.Operand -is [int]) { $_.Operand } })
     Check ($constants -contains 104857600 -and $constants -contains 2097152) 'Original disk reserve baseline changed; inspect dedicated guard.'
-    foreach ($forbidden in @('BeforeWorldSnapshotPrepared(', 'MarkWorldSaveWorkerSucceeded(', 'OnWorldSaveCheckpointCompleted(')) {
+    foreach ($forbidden in @('BeforeWorldSnapshotPrepared(', 'SetWorldSaveWorkerSuccess(', 'OnWorldSaveCheckpointCompleted(')) {
         Check (-not $execution.Contains($forbidden)) "Maintenance dispatch must not synthesize $forbidden."
     }
     Write-Output 'PASS: original public game signatures, save/block call paths, disk baseline and absence of synthetic completions.'
